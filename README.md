@@ -278,6 +278,22 @@ auto rel = cnet.add(new Crelu(InSize(512)), {inp});
 
 ## Gelu Layer
 
+This activation function is the equivalent of Gelu:
+
+$CGelu : \mathbb{C}^N \times \mathbb{C}^{N} \to \mathbb{C}^N \text{ given by } CGelu(x + iy)_k \mapsto Gelu(x_k) + iGelu(y_k)$.
+
+You can read more about $Gelu$ in the paer [Gaussian Error Linear Units (GELUs)](https://arxiv.org/abs/1606.08415).
+You can see an example of using the CGelu layer `rel` in the following code snippet:
+
+```c++
+#include "impl/relu.h"
+
+CNet cnet;
+// ...
+auto inp = cnet.add(new CInput(OutSize(512)));
+auto rel = cnet.add(new CGelu(InSize(512)), {inp});
+```
+
 ## L2 Loss function
 
 ## Cross Entropy Loss function
