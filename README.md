@@ -260,6 +260,22 @@ auto outp = cnet.add(new CrossEntropy(InSize(10)), {lin});
 
 ## CRelu Layer
 
+This activation function is the equivalent of Relu:
+
+$CRelu : \mathbb{C}^N \times \mathbb{C}^{N} \to \mathbb{C}^N \text{ given by } 
+CRelu(x + iy)_k \mapsto x_k + iy_k \text{ if } x_k,y_k >0, \space 0 \text{ otherwise}$.
+
+You can see an example of using the CRelu layer `rel` in the following code snippet:
+
+```c++
+#include "impl/relu.h"
+
+CNet cnet;
+// ...
+auto inp = cnet.add(new CInput(OutSize(512)));
+auto rel = cnet.add(new Crelu(InSize(512)), {inp});
+```
+
 ## Gelu Layer
 
 ## L2 Loss function
