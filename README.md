@@ -27,7 +27,7 @@ Please see the file cnet.cpp for how to train on CPU/GPU the above complex value
 
 ## Adding Custom Complex Valued Functions / NN Layers
 
-
+Let's add a new layer, say $Sigmoid : \mathbb C^n \to \mathbb C^n$ given by $Sigmoid(z)_i \mapsto 1 / (1 + e^{-z_i}).$
 
 # Building
 
