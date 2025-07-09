@@ -55,7 +55,7 @@ write implementations for the `dz()` and the `dz_star()` methods instead.
 
 For example for the Sigmoid function 
 $Sigmoid\big(\textbf{z} = (z_0,\dots, z_i, \dots)\big)=\big(S_0(\textbf{z}),\dots,S_j(\textbf{z}),\dots\big)$
-we have that the conjugate derivatives are all null because the sigmoid function is defined only in terms of $\textbf{z}$ and not of the conjugate $z^\star$:
+we have that the conjugate derivatives are all null because the sigmoid function is defined only in terms of $\textbf{z}=x+iy$ and not of the conjugate $z^\star=x-iy$:
 <p align="center">
 $\frac{d}{d z_i^\star}S_j=0 \text{ for all } 0\leq i,j \lt n$ 
 </p>
