@@ -205,7 +205,8 @@ This layer implements the Hadamard function which is simply the element-wise mul
  $Hadamard : \mathbb{C}^N \times \mathbb{C}^N \to \mathbb{C}^N \text{ given by } Hadamard(u, v)_p \mapsto u_p * v_p$.
 
  In the complex valued neural network world, the Hadamard Layer is equivalent with the Convolution layer, because
- the Fourier Transform famously commutes with the convolution: $FFT\big(Conv(u, v)\big)=Hadamard\big(FFT(u), FFT(v)\big).$
+ the Fourier Transform famously commutes with the convolution: $FFT\big(Conv(u, v)\big)=Hadamard\big(FFT(u), FFT(v)\big).$ 
+ See also [On the Equivalence of Convolutional and Hadamard Networks using DFT](https://arxiv.org/abs/1810.11650).
 
  You can see an example of using the Hadamard layer `hdm` with some parameters provided by an Input Layer `h_data` in the following code snippet:
  ```c++
