@@ -27,7 +27,29 @@ Please see the file cnet.cpp for how to train on CPU/GPU the above complex value
 
 ## Adding Custom Complex Valued Functions / NN Layers
 
-Let's add a new layer, say $Sigmoid : \mathbb C^n \to \mathbb C^n$ given by $Sigmoid(z)_i \mapsto 1 / (1 + e^{-z_i}).$
+Let's add a new complex valued function, say $Sigmoid : \mathbb C^n \to \mathbb C^n$ given by $Sigmoid(z)_i \mapsto 1 / (1 + e^{-z_i}).$
+
+All you need to do in principle is to extend the `CFunc` class and provide implementations for the `forward()` and the `backward()` methods.
+
+```c++
+class CSigmoid: public CFunc {
+
+public:
+  CSigmoid(InSize in_size) : CFunc(in_size, OutSize(in_size.value())) {
+  }
+};
+```
+While providing an implementation for the forward method should be straightforward:
+```c++
+virtual void forward() {
+  for (int in_indx = 0; in_indx < input().length_; ++in_indx) {
+    auto g = 1.0f / (1.0f + std::exp(input().z(in_indx)));
+    output().real_[in_indx] = g.real();
+    output().imag_[in_indx] = g.imag();
+  }
+}
+```
+providing an implementation for the `backward()` method is usually more difficult. The CNet framework makes things easier 
 
 # Building
 
