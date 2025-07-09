@@ -49,7 +49,7 @@ virtual void forward() {
 }
 ```
 providing an implementation for the `backward()` method is in general more difficult. The CNet framework makes things easier whenever you can compute
-the [Wirtinger derivatives](https://en.wikipedia.org/wiki/Wirtinger_derivatives) for the corresponding multivariable functions: you can
+the [Wirtinger derivatives](https://en.wikipedia.org/wiki/Wirtinger_derivatives) for the corresponding multivariable functions as you can
 write implementations for the `dz()` and the `dz_star()` methods instead.
 
 For example for the Sigmoid function 
@@ -119,6 +119,24 @@ Depth 2: L2Out_3 3096,
 ```
 
 Please see the file examples/sigmoid.h for additional details.
+
+# Complex Layers
+
+## Input Layer
+
+## Embedded Layer
+
+## Fourier Transform Layer
+
+## Hadamard Layer
+
+## CRelu Layer
+
+## Gelu Layer
+
+## L2 Loss function
+
+## Cross Entropy Loss function
 
 # Building
 
