@@ -39,7 +39,7 @@ public:
   }
 };
 ```
-While writing an implementation for the `forward()` method is usaually straightforward:
+While writing an implementation for the `forward()` method is usually straightforward:
 ```c++
 virtual void forward() {
     for (int in_indx = 0; in_indx < input().length_; ++in_indx) {
@@ -82,7 +82,7 @@ From the above observations we can easily implement the `dz()` and the `dz_star(
     }
 ```
 
-We can easily test that the implementation is correct by minimizing the `Sigmoid` using a small neural net and Wirtinger gradient descent as you can see in the 
+We can test that the implementation is correct by minimizing the `Sigmoid` using a small neural net and Wirtinger gradient descent as you can see in the 
 following snippet of code:
 
 ```c++
