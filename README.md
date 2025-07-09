@@ -158,16 +158,31 @@ or are restored from a model via `net.restore(std::string file)`.
 See  the file cnet.cpp for more details.
 
 ## Embedding Layer
-The Embedding Layer is used only as the main input for the neural network. 
+The Embedding Layer is used only as the main input for the neural network. The main vaiables of an embedding layer are
+the embedding dimension, the number of embedings and the maximum number of input tokens. For example, in the following 
+code snippet we create an embedding consisting of `no_embedings = 100` tokens of dimension `emb_dim = 300` that has an input
+of maximum `max_in_tokens = 64` tokens and has an output of `emb_dim * max_no_tokens = 300 * 64` complex numbers. Note that the output is 
+padded with zeros if necessary.
 
 ```c++
+#include "impl/embed.h"
+
 int emb_dim = 300;
-int no_tokens = 64;
-int no_embedings = 28;
+int max_in_tokens = 64;
+int no_embedings = 100;
 CNet cnet;
-auto emb = cnet.add(new CEmbedding(emb_dim, no_tokens, no_embedings));
-auto fft = cnet.add(new FourierTrans(InSize(emb_dim * no_tokens)), {emb});
+auto emb = cnet.add(new CEmbedding(emb_dim, max_in_tokens, no_embedings));
+auto fft = cnet.add(new FourierTrans(InSize(emb_dim * max_in_tokens)), {emb});
 ```
+On a CPU you can set the embedding values using a `vector<int>` data structure, e.g.,
+```c++
+emb.setInput({2, 1, 1, 3});
+```
+while on GPU you can do it via the 
+```c ++
+net.batchToGpu(InputFunc *inp, OutputFunc *outp, Batch *batch);
+```
+method.
 
 ## Fourier Transform Layer
 
