@@ -2,7 +2,26 @@
 
 CNet is a C++/CUDA framework for building and researching deep complex valued networks, as well as for optimization of complex valued functions using  gradient descent with Wirtinger derivatives. In the current version it should be relatively straighforward to implement CPU-only functions / layers.
 
-# 
+# Examples
+
+## A Simple Hadamard Neural Net for MNIST
+
+The following code shows how to build a minimal neural net for the MNIST/Fashion MNIST datasets, using a Fourier Transform and Hadamard layers with a Gelu activation function:
+```c++
+  CNet cnet;
+  auto inp = cnet.add(new CInput(OutSize(28 * 28)));
+  auto fft = cnet.add(new FourierTrans(InSize(28 * 28)), {inp});
+
+  auto h_data = cnet.add(new CInput(OutSize(28 * 28)));
+  auto hdm = cnet.add(new Hadamard(InSize(28 * 28), InSize(28 * 28)), {fft, h_data});
+
+  auto gelu = cnet.add(new CGelu(InSize(28 * 28)), {hdm});
+
+  auto l_data = cnet.add(new CInput(OutSize(28 * 28 * 10)));
+  auto lin = cnet.add(new Linear(InSize(28 * 28), InSize(28 * 28 * 10)), {gelu, l_data});
+  auto outp = cnet.add(new CrossEntropy(InSize(10)), {lin});
+
+```
 
 # Building
 
