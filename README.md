@@ -101,7 +101,13 @@ for (int var = 0; var < 1000; ++var) {
 }
 ```
 
-Running the above code one can observe that the loss is decreasing:
+Running the above code above
+
+```
+~/cnet -test_sigmoid true
+```
+
+one can observe that the loss is decreasing:
 
 ```
 Depth 0: Input_1 3072, 
@@ -126,6 +132,8 @@ Please see the file examples/sigmoid.h for additional details.
 # Complex Layers
 
 ## Input Layer
+
+
 
 ## Embedded Layer
 
