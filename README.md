@@ -300,7 +300,7 @@ This loss function is simply the square of the $L2$ norm:
 
 $L2Out : \mathbb{C}^N \to \mathbb{R} \text{ given by } L2Out(z) \mapsto \sum_k {z_k * z_k^{\star}} = \sum_k |z_k|^2$.
 
-You can see an example of using the 'L2Out' loss function `l2` in the following code snippet:
+You can see an example of using the `L2Out` loss function `l2` in the following code snippet:
 
 ```c++
 #include "impl/l2out.h"
@@ -312,6 +312,24 @@ auto l2 = net.add(new L2Out(InSize(128)), {sigm});
 ```
 
 ## Cross Entropy Loss function
+
+The CroossEntropy loss implements the multivariable function
+
+$CroossEntropy : \mathbb{C}^N \times \mathbb{R}^N \to \mathbb{R} \text{ given by } CroossEntropy(z, y) \mapsto 
+\sum_k -y_k \log({z_k * z_k^{\star}}/ \|z\|^2)$.
+
+You can read more on it in the [On the Equivalence of Convolutional and Hadamard Networks using DFT](https://arxiv.org/abs/1810.11650) research paper.
+You can see an example of using the `CroossEntropy` loss function `ce` in the following code snippet, as well as in the cnet.cpp file:
+
+```c++
+#include "impl/crossent.h"
+
+CNet cnet;
+// ...
+auto l_data = cnet.add(new CInput(OutSize(28 * 28 * 10)));
+auto lin = cnet.add(new Linear(InSize(28 * 28), InSize(28 * 28 * 10)), {gelu, l_data});
+auto ce = cnet.add(new CrossEntropy(InSize(10)), {lin});
+```
 
 # Saving and Restoring Models
 
