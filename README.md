@@ -21,7 +21,6 @@ The following code shows how to build a minimal neural net for the MNIST/Fashion
   auto l_data = cnet.add(new CInput(OutSize(28 * 28 * 10)));
   auto lin = cnet.add(new Linear(InSize(28 * 28), InSize(28 * 28 * 10)), {gelu, l_data});
   auto outp = cnet.add(new CrossEntropy(InSize(10)), {lin});
-
 ```
 
 Please see the file cnet.cpp for how to train on CPU/GPU the above complex valued neural net with the MNIST/Fashion MNIST datasets.
@@ -224,7 +223,38 @@ auto hdm = cnet.add(new Hadamard(InSize(28 * 28), InSize(28 * 28)), {fft, h_data
 
 ## Residual Layer
 
+This layer implements the Residual function which computes the element-wise addition:
+
+$Residual : \mathbb{C}^N \times \mathbb{C}^N \to \mathbb{C}^N \text{ given by } Residual(u, v)_p \mapsto u_p + v_p$.
+
+You can see an example of using the Residual layer `res` in the following code snippet:
+ 
+ ```c++
+#include "impl/residual.h"
+
+CNet cnet;
+//...
+auto fft = cnet.add(new FourierTrans(InSize(28 * 28)), {inp});
+//...
+auto hdm = cnet.add(new Hadamard(InSize(28 * 28), InSize(28 * 28)), {fft, h_data});
+
+auto res = cnet.add(new Residual(InSize(28 * 28), InSize(28 * 28)), {fft, hdm});
+```
+
 ## Linear Layer
+This layer is the equivalent of the fully connected / dense layer and is performing a matrix multiplication:
+
+$Linear : \mathbb{C}^N \times \mathbb{C}^{N*M} \to \mathbb{C}^M \text{ given by } Linear(u, W) \mapsto u * M$.
+
+You can see an example of using the Linear layer `lin` in the following code snippet:
+
+```c++
+CNet cnet;
+// ...
+auto l_data = cnet.add(new CInput(OutSize(512 * 10)));
+auto lin = cnet.add(new Linear(InSize(512), InSize(512 * 10)), {gelu, l_data});
+auto outp = cnet.add(new CrossEntropy(InSize(10)), {lin});
+```
 
 ## CRelu Layer
 
