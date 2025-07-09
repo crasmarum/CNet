@@ -1,6 +1,6 @@
 # CNet
 
-CNet is a C++/CUDA framework for building and researching deep complex valued networks, as well as for optimization of complex valued functions using  gradient descent with Wirtinger derivatives. In the current version it should be relatively straighforward to implement CPU-only functions / layers.
+CNet is a C++/CUDA framework for building and researching deep complex valued networks, as well as for optimization of complex valued functions using  gradient descent with Wirtinger derivatives. In the current version it should be relatively straighforward to implement new CPU-only functions / layers.
 
 # Examples
 
@@ -130,6 +130,8 @@ Please see the file examples/sigmoid.h for additional details.
 
 ## Hadamard Layer
 
+## Residual Layer
+
 ## CRelu Layer
 
 ## Gelu Layer
@@ -138,7 +140,7 @@ Please see the file examples/sigmoid.h for additional details.
 
 ## Cross Entropy Loss function
 
-# Building
+# Building the Software
 
 CNet is currently supported only on Linux/MacOS and you can build it using make. 
 The Makefile checks for the presence of the NVIDIA CUDA Compiler (nvcc) and if nvcc is found, it compiles the project with CUDA support.
