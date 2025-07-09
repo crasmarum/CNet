@@ -176,13 +176,14 @@ auto fft = cnet.add(new FourierTrans(InSize(emb_dim * max_in_tokens)), {emb});
 ```
 On a CPU you can set the embedding values using a `vector<int>` data structure, e.g.,
 ```c++
-emb.setInput({2, 1, 1, 3});
+embedding.setInput({2, 1, 1, 3});
 ```
 while on GPU you can do it via the 
 ```c ++
 net.batchToGpu(InputFunc *inp, OutputFunc *outp, Batch *batch);
 ```
-method.
+method. The initial complex values for the embeddings are either randomly set at the beginning of training a network, e.g., `net.init_inputs()`, 
+or are restored from a model via `net.restore(std::string file)`.
 
 ## Fourier Transform Layer
 
