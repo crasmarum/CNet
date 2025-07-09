@@ -262,7 +262,7 @@ auto outp = cnet.add(new CrossEntropy(InSize(10)), {lin});
 
 This activation function is the equivalent of Relu:
 
-$CRelu : \mathbb{C}^N \times \mathbb{C}^{N} \to \mathbb{C}^N \text{ given by } 
+$CRelu : \mathbb{C}^N \to \mathbb{C}^N \text{ given by } 
 CRelu(x + iy)_k \mapsto x_k + iy_k \text{ if } x_k,y_k >0, \space 0 \text{ otherwise}$.
 
 You can see an example of using the CRelu layer `rel` in the following code snippet:
@@ -280,9 +280,9 @@ auto rel = cnet.add(new Crelu(InSize(512)), {inp});
 
 This activation function is the equivalent of Gelu:
 
-$CGelu : \mathbb{C}^N \times \mathbb{C}^{N} \to \mathbb{C}^N \text{ given by } CGelu(x + iy)_k \mapsto Gelu(x_k) + iGelu(y_k)$.
+$CGelu : \mathbb{C}^N \to \mathbb{C}^N \text{ given by } CGelu(x + iy)_k \mapsto Gelu(x_k) + iGelu(y_k)$.
 
-You can read more about $Gelu$ in the paer [Gaussian Error Linear Units (GELUs)](https://arxiv.org/abs/1606.08415).
+You can read more about $Gelu$ in the paper [Gaussian Error Linear Units (GELUs)](https://arxiv.org/abs/1606.08415).
 You can see an example of using the CGelu layer `rel` in the following code snippet:
 
 ```c++
@@ -294,7 +294,22 @@ auto inp = cnet.add(new CInput(OutSize(512)));
 auto rel = cnet.add(new CGelu(InSize(512)), {inp});
 ```
 
-## L2 Loss function
+## L2Out Loss function
+
+This loss function is simply the square of the $L2$ norm:
+
+$L2Out : \mathbb{C}^N \to \mathbb{R} \text{ given by } L2Out(z) \mapsto \sum_k {z_k * z_k^{\star}} = \sum_k |z_k|^2$.
+
+You can see an example of using the 'L2Out' loss function `l2` in the following code snippet:
+
+```c++
+#include "impl/l2out.h"
+
+CNet net;
+auto inp = net.add(new CInput(OutSize(128)));
+auto sigm = net.add(new CSigmoid(InSize(128)), {inp});
+auto l2 = net.add(new L2Out(InSize(128)), {sigm});
+```
 
 ## Cross Entropy Loss function
 
