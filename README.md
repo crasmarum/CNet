@@ -27,9 +27,8 @@ Please see the file cnet.cpp for how to train on CPU/GPU the above complex value
 
 ## Adding Custom Complex Valued Functions / NN Layers
 
-Let's add a new complex valued function, say $Sigmoid : \mathbb C^n \to \mathbb C^n$ given by $Sigmoid(z)_i \mapsto 1 / (1 + e^{-z_i}).$
-
-All you need to do in principle is to extend the `CFunc` class and provide implementations for the `forward()` and the `backward()` methods.
+In order to add a new complex valued function, say $Sigmoid : \mathbb C^n \to \mathbb C^n$ given by $Sigmoid(z)_i \mapsto 1 / (1 + e^{-z_i}),$
+all you need to do in principle is to extend the `CFunc` class and provide implementations for the `forward()` and the `backward()` methods.
 
 ```c++
 class CSigmoid: public CFunc {
@@ -39,7 +38,7 @@ public:
   }
 };
 ```
-While providing an implementation for the forward method should be straightforward:
+While providing an implementation for the `forward()` method should be straightforward:
 ```c++
 virtual void forward() {
     for (int in_indx = 0; in_indx < input().length_; ++in_indx) {
@@ -94,7 +93,7 @@ following snippet of code:
 	net.init_exec_graph(true);
 	for (int var = 0; var < 1000; ++var) {
 		net.forward();
-		std::cout << ((L2Out*)net[l2])->loss() << std::endl;
+		cout << var << "\tLoss: " << ((L2Out*)net[l2])->loss() << endl;
 		net.backward(0);
 		net.updateInputs(0.1);
 	}
@@ -115,7 +114,10 @@ Depth 2: L2Out_3 3096,
 ...
 798	Loss: 0.100
 799	Loss: 0.099
+...
 ```
+
+Please see the file examples/sigmoid.h for additional details.
 
 # Building
 
