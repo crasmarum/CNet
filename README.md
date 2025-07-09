@@ -133,8 +133,8 @@ Please see the file examples/sigmoid.h for additional details.
 
 ## Input Layer
 
-The Input Layer is used as the main input for the neural network as well as parameters for other layers, e.g., Linear or Hadamard layers.
-For example, in the following code snippet `inp` is the mai input and ah_data` are the parameters for the Hadamard function.
+The Input Layer can be used as the main input for the neural network as well as the input parameters for other layers, e.g., Linear or Hadamard layers.
+For example, in the following code snippet `inp` is the mai input and the `h_data` is the parameter for the Hadamard function.
 
 ```c++
 #include "impl/cinput.h"
@@ -146,7 +146,20 @@ auto hdm = cnet.add(new Hadamard(InSize(28 * 28), InSize(28 * 28)), {inp, h_data
 
 ```
 
+The main variable for this layer is the output size, e.g.,  `CInput(OutSize(1024))`. As the main input of a neural net, on CPU you can set its complex values
+from a batch using this method:
+
+```c++
+setInput(InputBatch& batch, int b_indx)
+```
+As the input parameter for other layers, its values are either randomly set at the beginning of training a network, e.g., `net.init_inputs()`, 
+or are restored from a model via `net.restore(std::string file)`.
+
+See  the file cnet.cpp for more details.
+
 ## Embedded Layer
+
+
 
 ## Fourier Transform Layer
 
