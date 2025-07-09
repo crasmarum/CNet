@@ -1,6 +1,7 @@
 # CNet
 
 CNet is a C++/CUDA framework for building and researching deep complex valued networks, as well as for optimization of complex valued functions using  gradient descent with Wirtinger derivatives. In the current version it should be relatively straighforward to implement new CPU-only functions / layers.
+TODO: why.
 
 # Examples
 
@@ -81,7 +82,7 @@ From the above observations we can easily implement the `dz()` and the `dz_star(
     }
 ```
 
-We can easily test that the implementation is correct by minimizing the `Sigmoid` using a small neural net and Wirtinger gradient descent like in the 
+We can easily test that the implementation is correct by minimizing the `Sigmoid` using a small neural net and Wirtinger gradient descent as you can see in the 
 following snippet of code:
 
 ```c++
@@ -119,6 +120,8 @@ Depth 2: L2Out_3 3096,
 ```
 
 Please see the file examples/sigmoid.h for additional details.
+
+# Computation Graph on CUDA
 
 # Complex Layers
 
