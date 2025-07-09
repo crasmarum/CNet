@@ -174,7 +174,7 @@ CNet cnet;
 auto emb = cnet.add(new CEmbedding(emb_dim, max_in_tokens, no_embedings));
 auto fft = cnet.add(new FourierTrans(InSize(emb_dim * max_in_tokens)), {emb});
 ```
-On a CPU you can set the embedding values using a `vector<int>` data structure, e.g.,
+On a CPU you can set the output embedding values using a `vector<int>` data structure, e.g.,
 ```c++
 embedding.setInput({2, 1, 1, 3});
 ```
@@ -187,7 +187,35 @@ or are restored from a model via `net.restore(std::string file)`.
 
 ## Fourier Transform Layer
 
+This layer implements the [Discrete Fourier Transform](https://en.wikipedia.org/wiki/Discrete_Fourier_transform) function
+
+ $FFT : \mathbb{C}^N \to \mathbb{C}^N \text{ given by } FFT(z)_p \mapsto \sum_q z_q e^{i2{\pi}pq / N} / \sqrt{N}$.
+
+The main variable of this function is its input/output size. Example of its usage:
+ ```c++
+  CNet cnet;
+  auto inp = cnet.add(new CInput(OutSize(28 * 28)));
+  auto fft = cnet.add(new FourierTrans(InSize(28 * 28)), {inp});
+```
+
 ## Hadamard Layer
+
+This layer implements the Hadamard function which is simply the element-wise multiplication:
+
+ $Hadamard : \mathbb{C}^N \times \mathbb{C}^N \to \mathbb{C}^N \text{ given by } Hadamard(u, v)_p \mapsto u_p * v_p$.
+
+ In the complex valued neural network world, the Hadamard Layer is equivalent with the Convolution layer, because
+ the Fourier Transform famously commutes with the convolution: $FFT\big(Conv(u, v)\big)=Hadamard\big(FFT(u), FFT(v)\big).$
+
+ You can see an example of using the Hadamard layer `hdm` with some parameters provided by an Input Layer `h_data` in the following code snippet:
+ ```c++
+  CNet cnet;
+  auto inp = cnet.add(new CInput(OutSize(28 * 28)));
+  auto fft = cnet.add(new FourierTrans(InSize(28 * 28)), {inp});
+
+  auto h_data = cnet.add(new CInput(OutSize(28 * 28)));
+  auto hdm = cnet.add(new Hadamard(InSize(28 * 28), InSize(28 * 28)), {fft, h_data});
+```
 
 ## Residual Layer
 
