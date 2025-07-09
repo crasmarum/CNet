@@ -333,6 +333,8 @@ auto ce = cnet.add(new CrossEntropy(InSize(10)), {lin});
 
 # Saving and Restoring Models
 
+
+
 # Building the Software
 
 CNet is currently supported only on Linux/MacOS and you can build it using make. 
