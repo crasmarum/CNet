@@ -43,8 +43,8 @@ While providing an implementation for the `forward()` method should be straightf
 virtual void forward() {
     for (int in_indx = 0; in_indx < input().length_; ++in_indx) {
         complex<float> g = 1.0f / (1.0f + exp(-input().z(in_indx)));
-        mutable_output()->real_[offset(i) + in_indx] = g.real();
-        mutable_output()->imag_[offset(i) + in_indx] = g.imag();
+        mutable_output()->real_[in_indx] = g.real();
+        mutable_output()->imag_[in_indx] = g.imag();
     }
 }
 ```
