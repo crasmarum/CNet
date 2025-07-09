@@ -249,6 +249,8 @@ $Linear : \mathbb{C}^N \times \mathbb{C}^{N*M} \to \mathbb{C}^M \text{ given by 
 You can see an example of using the Linear layer `lin` in the following code snippet:
 
 ```c++
+#include "impl/linear.h"
+
 CNet cnet;
 // ...
 auto l_data = cnet.add(new CInput(OutSize(512 * 10)));
