@@ -42,14 +42,61 @@ public:
 While providing an implementation for the forward method should be straightforward:
 ```c++
 virtual void forward() {
-  for (int in_indx = 0; in_indx < input().length_; ++in_indx) {
-    auto g = 1.0f / (1.0f + std::exp(input().z(in_indx)));
-    output().real_[in_indx] = g.real();
-    output().imag_[in_indx] = g.imag();
-  }
+    for (int in_indx = 0; in_indx < input().length_; ++in_indx) {
+        complex<float> g = 1.0f / (1.0f + exp(-input().z(in_indx)));
+        mutable_output()->real_[offset(i) + in_indx] = g.real();
+        mutable_output()->imag_[offset(i) + in_indx] = g.imag();
+    }
 }
 ```
-providing an implementation for the `backward()` method is usually more difficult. The CNet framework makes things easier 
+providing an implementation for the `backward()` method is usually more difficult. The CNet framework makes things easier whenever you can compute
+the [Wirtinger derivatives](https://en.wikipedia.org/wiki/Wirtinger_derivatives) for the corresponding multivariable functions. 
+
+For example for the Sigmoid function 
+$Sigmoid\big(\textbf{z} = (z_0,\dots, z_i, \dots)\big)=\big(S_0(\textbf{z}),\dots,S_j(\textbf{z}),\dots\big)$
+we have that the conjugate derivatives are all null because the sigmoid function is defined only in terms of $z$ and not of the conjugate $z^\star$:
+<p align="center">
+$\frac{d}{d z_i^\star}S_j=0 \text{ for all } 0\leq i,j \lt n$ 
+</p>
+while the $z$ derivatives are easily computed as 
+<p align="center">
+$\frac{d}{d z_i}S_i=g(z)(1−g(z)) \text{ for all } 0\leq i = j \lt n \text{ where } g(z) \mapsto 1 / (1 + e^{-z}).$ 
+</p>
+
+From the above observations we can easily implement the `dz()` and the `dz_star()` methods:
+
+```c++
+    virtual complex<float> dz(int out_indx, int in_indx) {
+        if (out_indx != in_indx) {
+            return 0;
+        }
+        auto g = 1.0f / (1.0f + exp(-input().z(in_indx)));
+        return g * (1.0f - g);
+    }
+
+    virtual complex<float> dz_star(int out_indx, int in_indx) {
+        return 0;
+    }
+```
+
+We can easily test that the implementation is correct by minimizing the `Sigmoid` using a small neural net and Wirtinger gradient descent like in the 
+following snippet of code:
+
+```c++
+	CNet net;
+	auto inp = net.add(new CInput(OutSize(128)));
+	auto sigm = net.add(new CSigmoid(InSize(128)), {inp});
+	auto l2 = net.add(new L2Out(InSize(128)), {sigm});
+
+	net.init_inputs();
+	net.init_exec_graph(true);
+	for (int var = 0; var < 1000; ++var) {
+		net.forward();
+		std::cout << ((L2Out*)net[l2])->loss() << std::endl;
+		net.backward(0);
+		net.updateInputs(0.1);
+	}
+```
 
 # Building
 
