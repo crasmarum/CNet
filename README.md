@@ -193,9 +193,11 @@ This layer implements the [Discrete Fourier Transform](https://en.wikipedia.org/
 
 The main variable of this function is its input/output size. Example of its usage:
  ```c++
-  CNet cnet;
-  auto inp = cnet.add(new CInput(OutSize(28 * 28)));
-  auto fft = cnet.add(new FourierTrans(InSize(28 * 28)), {inp});
+#include "impl/ft.h"
+
+CNet cnet;
+auto inp = cnet.add(new CInput(OutSize(28 * 28)));
+auto fft = cnet.add(new FourierTrans(InSize(28 * 28)), {inp});
 ```
 
 ## Hadamard Layer
@@ -210,15 +212,19 @@ This layer implements the Hadamard function which is simply the element-wise mul
 
  You can see an example of using the Hadamard layer `hdm` with some parameters provided by an Input Layer `h_data` in the following code snippet:
  ```c++
-  CNet cnet;
-  auto inp = cnet.add(new CInput(OutSize(28 * 28)));
-  auto fft = cnet.add(new FourierTrans(InSize(28 * 28)), {inp});
+#include "impl/hadamard.h"
 
-  auto h_data = cnet.add(new CInput(OutSize(28 * 28)));
-  auto hdm = cnet.add(new Hadamard(InSize(28 * 28), InSize(28 * 28)), {fft, h_data});
+CNet cnet;
+auto inp = cnet.add(new CInput(OutSize(28 * 28)));
+auto fft = cnet.add(new FourierTrans(InSize(28 * 28)), {inp});
+
+auto h_data = cnet.add(new CInput(OutSize(28 * 28)));
+auto hdm = cnet.add(new Hadamard(InSize(28 * 28), InSize(28 * 28)), {fft, h_data});
 ```
 
 ## Residual Layer
+
+## Linear Layer
 
 ## CRelu Layer
 
