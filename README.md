@@ -4,7 +4,7 @@ CNet is a C++/CUDA framework for building and researching deep complex valued ne
 
 # Examples
 
-## A Simple Hadamard Neural Net for MNIST
+## A Simple Complex Neural Net for MNIST
 
 The following code shows how to build a minimal neural net for the MNIST/Fashion MNIST datasets, using a Fourier Transform and Hadamard layers with a Gelu activation function:
 ```c++
