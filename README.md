@@ -58,9 +58,11 @@ we have that the conjugate derivatives are all null because the sigmoid function
 <p align="center">
 $\frac{d}{d z_i^\star}S_j=0 \text{ for all } 0\leq i,j \lt n$ 
 </p>
+
 while the $z$ derivatives are easily computed as 
+
 <p align="center">
-$\frac{d}{d z_i}S_i=g(z)(1−g(z)) \text{ for all } 0\leq i = j \lt n \text{ where } g(z) \mapsto 1 / (1 + e^{-z}).$ 
+$\frac{d}{d z_i}S_j=g(z_i)(1−g(z_i)) \text{ for all } 0\leq i = j \lt n \text{ where } g(z) \mapsto 1 / (1 + e^{-z}).$ 
 </p>
 
 From the above observations we can easily implement the `dz()` and the `dz_star()` methods:
@@ -96,6 +98,23 @@ following snippet of code:
 		net.backward(0);
 		net.updateInputs(0.1);
 	}
+```
+
+Running the above code you can see that the loss is decreasing:
+
+```
+Depth 0: Input_1 3072, 
+Depth 1: CSigmoid_2 3072, 
+Depth 2: L2Out_3 3096, 
+0	Loss: 32.008
+1	Loss: 28.512
+2	Loss: 25.425
+3	Loss: 22.725
+4	Loss: 20.377
+5	Loss: 18.341
+...
+798	Loss: 0.100
+799	Loss: 0.099
 ```
 
 # Building
