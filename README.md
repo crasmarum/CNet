@@ -69,39 +69,39 @@ $\frac{d}{d z_i}S_j=g(z_i)(1−g(z_i)) \text{ for all } 0\leq i = j \lt n \text{
 From the above observations we can easily implement the `dz()` and the `dz_star()` methods:
 
 ```c++
-    virtual complex<float> dz(int out_indx, int in_indx) {
-        if (out_indx != in_indx) {
-            return 0;
-        }
-        auto g = 1.0f / (1.0f + exp(-input().z(in_indx)));
-        return g * (1.0f - g);
+virtual complex<float> dz(int out_indx, int in_indx) {
+    if (out_indx != in_indx) {
+	return 0;
     }
+    auto g = 1.0f / (1.0f + exp(-input().z(in_indx)));
+    return g * (1.0f - g);
+}
 
-    virtual complex<float> dz_star(int out_indx, int in_indx) {
-        return 0;
-    }
+virtual complex<float> dz_star(int out_indx, int in_indx) {
+    return 0;
+}
 ```
 
 We can test that the implementation is correct by minimizing the `Sigmoid` using a small neural net and Wirtinger gradient descent as you can see in the 
 following snippet of code:
 
 ```c++
-	CNet net;
-	auto inp = net.add(new CInput(OutSize(128)));
-	auto sigm = net.add(new CSigmoid(InSize(128)), {inp});
-	auto l2 = net.add(new L2Out(InSize(128)), {sigm});
+CNet net;
+auto inp = net.add(new CInput(OutSize(128)));
+auto sigm = net.add(new CSigmoid(InSize(128)), {inp});
+auto l2 = net.add(new L2Out(InSize(128)), {sigm});
 
-	net.init_inputs();
-	net.init_exec_graph(true);
-	for (int var = 0; var < 1000; ++var) {
-		net.forward();
-		cout << var << "\tLoss: " << ((L2Out*)net[l2])->loss() << endl;
-		net.backward(0);
-		net.updateInputs(0.1);
-	}
+net.init_inputs();
+net.init_exec_graph(true);
+for (int var = 0; var < 1000; ++var) {
+net.forward();
+    cout << var << "\tLoss: " << ((L2Out*)net[l2])->loss() << endl;
+    net.backward(0);
+    net.updateInputs(0.1);
+}
 ```
 
-Running the above code you can see that the loss is decreasing:
+Running the above code one can observe that the loss is decreasing:
 
 ```
 Depth 0: Input_1 3072, 
