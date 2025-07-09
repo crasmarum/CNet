@@ -23,6 +23,12 @@ The following code shows how to build a minimal neural net for the MNIST/Fashion
 
 ```
 
+Please see the file cnet.cpp for how to train on CPU/GPU the above complex valued neural net with the MNIST/Fashion MNIST datasets.
+
+## Adding Custom Complex Valued Functions / NN Layers
+
+
+
 # Building
 
 CNet is currently supported only on Linux/MacOS and you can build it using make. 
