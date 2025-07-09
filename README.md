@@ -94,7 +94,7 @@ auto l2 = net.add(new L2Out(InSize(128)), {sigm});
 net.init_inputs();
 net.init_exec_graph(true);
 for (int var = 0; var < 1000; ++var) {
-net.forward();
+    net.forward();
     cout << var << "\tLoss: " << ((L2Out*)net[l2])->loss() << endl;
     net.backward(0);
     net.updateInputs(0.1);
@@ -142,6 +142,8 @@ Please see the file examples/sigmoid.h for additional details.
 ## L2 Loss function
 
 ## Cross Entropy Loss function
+
+# Saving and Restoring Models
 
 # Building the Software
 
