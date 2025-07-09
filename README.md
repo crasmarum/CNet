@@ -38,7 +38,7 @@ public:
   }
 };
 ```
-While providing an implementation for the `forward()` method should be straightforward:
+While writing an implementation for the `forward()` method is usaually straightforward:
 ```c++
 virtual void forward() {
     for (int in_indx = 0; in_indx < input().length_; ++in_indx) {
@@ -48,12 +48,13 @@ virtual void forward() {
     }
 }
 ```
-providing an implementation for the `backward()` method is usually more difficult. The CNet framework makes things easier whenever you can compute
-the [Wirtinger derivatives](https://en.wikipedia.org/wiki/Wirtinger_derivatives) for the corresponding multivariable functions. 
+providing an implementation for the `backward()` method is in general more difficult. The CNet framework makes things easier whenever you can compute
+the [Wirtinger derivatives](https://en.wikipedia.org/wiki/Wirtinger_derivatives) for the corresponding multivariable functions: you can
+write implementations for the `dz()` and the `dz_star()` methods instead.
 
 For example for the Sigmoid function 
 $Sigmoid\big(\textbf{z} = (z_0,\dots, z_i, \dots)\big)=\big(S_0(\textbf{z}),\dots,S_j(\textbf{z}),\dots\big)$
-we have that the conjugate derivatives are all null because the sigmoid function is defined only in terms of $z$ and not of the conjugate $z^\star$:
+we have that the conjugate derivatives are all null because the sigmoid function is defined only in terms of $\textbf{z}$ and not of the conjugate $z^\star$:
 <p align="center">
 $\frac{d}{d z_i^\star}S_j=0 \text{ for all } 0\leq i,j \lt n$ 
 </p>
