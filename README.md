@@ -101,7 +101,7 @@ for (int var = 0; var < 1000; ++var) {
 }
 ```
 
-Running the above code above
+Running the above code from the command line:
 
 ```
 ~/cnet -test_sigmoid true
@@ -133,7 +133,18 @@ Please see the file examples/sigmoid.h for additional details.
 
 ## Input Layer
 
+The Input Layer is used as the main input for the neural network as well as parameters for other layers, e.g., Linear or Hadamard layers.
+For example, in the following code snippet `inp` is the mai input and ah_data` are the parameters for the Hadamard function.
 
+```c++
+#include "impl/cinput.h"
+
+CNet cnet;
+auto inp = cnet.add(new CInput(OutSize(28 * 28)));
+auto h_data = cnet.add(new CInput(OutSize(28 * 28)));
+auto hdm = cnet.add(new Hadamard(InSize(28 * 28), InSize(28 * 28)), {inp, h_data});
+
+```
 
 ## Embedded Layer
 
