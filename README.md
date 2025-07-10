@@ -1,13 +1,16 @@
 # CNet
 
-CNet is a C++/CUDA framework for building and researching deep complex valued networks, as well as for optimization of complex valued functions using  gradient descent with Wirtinger derivatives. In the current version it should be relatively straighforward to implement new CPU-only functions / layers.
+CNet is a C++/CUDA framework for building and researching deep complex valued networks, as well as for optimization of complex valued functions using  gradient descent with Wirtinger derivatives. In the current version it should be relatively straighforward to implement new CPU-only functions / layers. In subsequent releases will add support
+to easily implement CUDA layers, too.
+
+ 
 TODO: why.
 
 # Examples
 
 ## A Simple Complex Neural Net for MNIST
 
-The following code shows how to build a minimal neural net for the MNIST/Fashion MNIST datasets, using a Fourier Transform and Hadamard layers with a Gelu activation function:
+The following code shows how to build a minimal neural net for the MNIST/Fashion MNIST datasets, using the Fourier Transform and Hadamard layers with a Gelu activation function:
 ```c++
   CNet cnet;
   auto inp = cnet.add(new CInput(OutSize(28 * 28)));
