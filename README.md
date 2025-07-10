@@ -26,7 +26,7 @@ The following code shows how to build a minimal neural net for the MNIST/Fashion
   auto outp = cnet.add(new CrossEntropy(InSize(10)), {lin});
 ```
 
-Please see the file cnet.cpp for how to train on CPU/GPU the above complex valued neural net with the MNIST/Fashion MNIST datasets.
+Please see the file [cnet.cpp](https://github.com/crasmarum/CNet/blob/b55439ee22e8cea045aa714630da25a6cad081e9/cnet.cpp) for how to train on CPU/GPU the above complex valued neural net with the MNIST/Fashion MNIST datasets.
 
 ## Adding Custom Complex Valued Functions / NN Layers
 
@@ -157,7 +157,7 @@ setInput(InputBatch& batch, int b_indx)
 As the input parameter for other layers, its values are either randomly set at the beginning of training a network, e.g., `net.init_inputs()`, 
 or are restored from a model via `net.restore(std::string file)`.
 
-See  the file cnet.cpp for more details.
+See  the file [cnet.cpp](https://github.com/crasmarum/CNet/blob/b55439ee22e8cea045aa714630da25a6cad081e9/cnet.cpp)  for more details.
 
 ## Embedding Layer
 The Embedding Layer is used only as the main input for the neural network. The main vaiables of an embedding layer are
@@ -322,7 +322,8 @@ $CroossEntropy : \mathbb{C}^N \times \mathbb{R}^N \to \mathbb{R} \text{ given by
 \sum_k -y_k \log({z_k * z_k^{\star}}/ \|z\|^2)$.
 
 You can read more on it in the [On the Equivalence of Convolutional and Hadamard Networks using DFT](https://arxiv.org/abs/1810.11650) research paper.
-You can see an example of using the `CroossEntropy` loss function `ce` in the following code snippet, as well as in the cnet.cpp file:
+You can see an example of using the `CroossEntropy` loss function `ce` in the following code snippet, as well as in the 
+[cnet.cpp](https://github.com/crasmarum/CNet/blob/b55439ee22e8cea045aa714630da25a6cad081e9/cnet.cpp) file:
 
 ```c++
 #include "impl/crossent.h"
