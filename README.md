@@ -127,7 +127,7 @@ Depth 2: L2Out_3 3096,
 ...
 ```
 
-Please see the file examples/sigmoid.h for additional details.
+Please see the file [examples/sigmoid.h](https://github.com/crasmarum/CNet/blob/84ff9f20457c6fab2306f39b840b7f6aa1da813f/examples/sigmoid.h) for additional details.
 
 # Computation Graph on CUDA
 
