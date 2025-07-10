@@ -346,7 +346,7 @@ Otherwise, it falls back to using g++.
 
 ```
 git clone https://github.com/crasmarum/CNet.git
-cd src
+cd CNet
 make
 ```
 
