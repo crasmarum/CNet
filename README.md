@@ -1,3 +1,4 @@
+![logo](https://github.com/crasmarum/CNet/blob/main/docs/logo.png)
 # CNet
 
 CNet is a C++/CUDA framework for building and researching deep complex valued networks, as well as for optimization of complex valued functions using  gradient descent with [Wirtinger derivatives.](https://en.wikipedia.org/wiki/Wirtinger_derivatives) 
