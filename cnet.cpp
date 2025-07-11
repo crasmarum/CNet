@@ -24,14 +24,12 @@ FLAG_BOOL(mnist_gpu_train, false)
 FLAG_BOOL(mnist_model_accuracy, false)
 FLAG_BOOL(test_sigmoid, false)
 
-FLAG_STRING(model_path, "")
+FLAG_STRING(model_path, "~/cnet_mnist.mod")
 
-FLAG_INT(batch_size, 32)
+FLAG_INT(batch_size, 16)
 FLAG_FLOAT(l_rate, 0.0001)
-FLAG_FLOAT(beta, 0.9)
 FLAG_INT(no_epochs, 10);
 
-FLAG_INT(no_segments, 2);
 FLAG_STRING(log_level, "INFO")
 
 const char compile_date[] =
@@ -52,14 +50,8 @@ void createMnistNet(CNet& cnet, int *inp, int *outp) {
 	auto gelu1 = cnet.add(new CGelu(InSize(28 * 28)), {hdm1});
 	auto res1 = cnet.add(new Residual(InSize(28 * 28), InSize(28 * 28)), {res, gelu1});
 
-	auto fft3 = cnet.add(new FourierTrans(InSize(28 * 28)), {res1});
-	auto hdata3 = cnet.add(new CInput(OutSize(28 * 28)));
-	auto hdm3 = cnet.add(new Hadamard(InSize(28 * 28), InSize(28 * 28)), {fft3, hdata3});
-	auto gelu3 = cnet.add(new CGelu(InSize(28 * 28)), {hdm3});
-	auto res3 = cnet.add(new Residual(InSize(28 * 28), InSize(28 * 28)), {res1, gelu3});
-
 	auto ldata = cnet.add(new CInput(OutSize(28 * 28 * 10)));
-	auto lin = cnet.add(new Linear(InSize(28 * 28), InSize(28 * 28 * 10)), {res3, ldata});
+	auto lin = cnet.add(new Linear(InSize(28 * 28), InSize(28 * 28 * 10)), {res1, ldata});
 	*outp = cnet.add(new CrossEntropy(InSize(10)), {lin});
 }
 
@@ -78,6 +70,9 @@ void trainMnistCPU() {
 	CInput *inp = (CInput*)cnet[cinp];
 	CrossEntropy *cen = (CrossEntropy*)cnet[coutp];
 
+	std::cout << std::setprecision(4) << "L_rate: " << l_rate
+			  << "\t batch_size: " << batch_size << std::endl;
+
 	float avg_loss = 0;
 	for (int epoch = 0; epoch < no_epochs; ++epoch) {
 		reader.shuffle();
@@ -94,11 +89,11 @@ void trainMnistCPU() {
 			}
 			cnet.backward(batch.label(0));
 
-			if (time % 8 == 7) {
-				cnet.updateInputs(0.0003);
+			if (time % 16 == 15) {
+				cnet.updateInputs(l_rate);
 			}
 
-			if (time % 10000 == 9999) {
+			if (time % 1000 == 999) {
 				assert(cnet.save(model_path));
 				std::cout << "Model saved at: " << model_path << std::endl;
 			}
@@ -121,6 +116,8 @@ void trainMnistGPU() {
 	cnet.init_inputs();
 
 	assert(cnet.allocateOnGpu(batch_size));
+	std::cout << std::setprecision(4) << "L_rate: " << l_rate
+			  << "\t batch_size: " << batch_size << std::endl;
 
 	float avg_loss = 0;
 	for (int epoch = 0; epoch < no_epochs; ++epoch) {
@@ -136,17 +133,17 @@ void trainMnistGPU() {
 				avg_loss = 0;
 			}
 
-			if (time % 800 == 799) {
+			if (time % 1000 == 999) {
 				if (!cnet.getInputsFromGpu()) {
 					std::cerr << "Warning: could get data from GPU." << std::endl;
 				} else {
-					assert(cnet.save(model_path));
+					cnet.save(model_path);
 					std::cout << "Model saved at: " << model_path << std::endl;
 				}
 			}
 
 			cnet.gpuBackward();
-			cnet.updateInputs(l_rate / batch.size());
+			cnet.gpuUpdateInputs(l_rate / batch.size());
 		}
 	}
 }
