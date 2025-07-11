@@ -334,9 +334,6 @@ auto lin = cnet.add(new Linear(InSize(28 * 28), InSize(28 * 28 * 10)), {gelu, l_
 auto ce = cnet.add(new CrossEntropy(InSize(10)), {lin});
 ```
 
-# Saving and Restoring Models
-
-
 
 # Building the Software
 
@@ -349,5 +346,66 @@ git clone https://github.com/crasmarum/CNet.git
 cd CNet
 make
 ```
+# Training on GPU
 
+If the  NVIDIA CUDA Compiler is found, the make file will automatically compile CNet with CUDA support. For example, once you
+download locally the MNIST/Fashion MNIST datasets, you can train the example neural network from the command line like follows.
 
+```
+~/cnet -mnist_images ~/train-images.idx3-ubyte -mnist_labels ~/train-labels.idx1-ubyte \
+       -model_path ~/test.mod  -mnist_gpu_train true
+```
+
+You can change the default learning rate and the GPU batch size via the `l_rate` and `batch_size` command line flags:
+```
+~/cnet -mnist_images ~/train-images.idx3-ubyte -mnist_labels ~/train-labels.idx1-ubyte \
+       -model_path ~/test.mod  -mnist_gpu_train true -l_rate 0.001 -batch_size 40
+```
+You can find the example training code in the [cnet.cpp](https://github.com/crasmarum/CNet/blob/a31b701317c5aa98da7dc59ca7bf928fcc53af8c/cnet.cpp) file:
+```c++
+MnistDataReader reader;
+assert(reader.Open(mnist_images, mnist_labels, 60000));
+assert(reader.readData());
+
+CNet cnet;
+assert(cnet.hasGPU());
+int cinp, coutp;
+createMnistNet(cnet, &cinp, &coutp);
+std::cout << cnet.cpuNet().toString() << std::endl;
+
+CInput *inp = (CInput*)cnet[cinp];
+CrossEntropy *cen = (CrossEntropy*)cnet[coutp];
+cnet.init_inputs();
+
+assert(cnet.allocateOnGpu(batch_size));
+std::cout << std::setprecision(4) << "L_rate: " << l_rate
+          << "\t batch_size: " << batch_size << std::endl;
+
+float avg_loss = 0;
+for (int epoch = 0; epoch < no_epochs; ++epoch) {
+	reader.shuffle();
+	for (int time = 0; time < reader.size() / batch_size; ++time) {
+		auto batch = reader.nextBatch(batch_size);
+
+		cnet.gpuForward(inp, cen, batch);
+		avg_loss += cnet.getLoss(cen, &batch);
+
+		if (time % 100 == 99) {
+			std::cout << epoch << "\t" << time << "\t loss: " << (avg_loss / 100) << std::endl;
+			avg_loss = 0;
+		}
+
+		if (time % 1000 == 999) {
+			if (!cnet.getInputsFromGpu()) {
+				std::cerr << "Warning: could get data from GPU." << std::endl;
+			} else {
+				cnet.save(model_path);
+				std::cout << "Model saved at: " << model_path << std::endl;
+			}
+		}
+
+		cnet.gpuBackward();
+		cnet.gpuUpdateInputs(l_rate / batch.size());
+	}
+}
+```
