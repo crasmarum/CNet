@@ -1,7 +1,7 @@
 # CNet
 
-CNet is a C++/CUDA framework for building and researching deep complex valued networks, as well as for optimization of complex valued functions using  gradient descent with Wirtinger derivatives. In the current version it should be relatively straighforward to implement new CPU-only functions / layers. In subsequent releases will add support
-to easily implement CUDA layers, too.
+CNet is a C++/CUDA framework for building and researching deep complex valued networks, as well as for optimization of complex valued functions using  gradient descent with [Wirtinger derivatives.](https://en.wikipedia.org/wiki/Wirtinger_derivatives) 
+In the current version it should be relatively straighforward to implement new CPU-only functions / layers. In subsequent releases will add support to easily implement CUDA layers, too.
 
 
 
@@ -130,7 +130,10 @@ Please see the file [examples/sigmoid.h](https://github.com/crasmarum/CNet/blob/
 
 # Computation Graph on CUDA
 
+In order to execute th
+![Computation Graph](https://github.com/crasmarum/CNet/blob/main/docs/depth.png)
 
+![GPU clones](https://github.com/crasmarum/CNet/blob/main/docs/clones.png)
 
 # Complex Layers
 
