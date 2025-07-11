@@ -2,7 +2,7 @@
 # CNet
 
 CNet is a C++/CUDA framework for building and researching deep complex valued neural networks, as well as for optimization of complex valued functions using  gradient descent with [Wirtinger derivatives.](https://en.wikipedia.org/wiki/Wirtinger_derivatives) 
-In the current version it should be relatively straighforward to implement new CPU-only functions / layers. In subsequent releases will add support to easily implement CUDA layers, too.
+In the current version it should be relatively straighforward to implement new CPU-only functions / layers. In subsequent releases support will be added to easily implement CUDA layers, too.
 
 Why are the complex valued neural network (CVNN) interesting? For once, it is a research area that it is currently neglected due to the huge commercial success of
 the real valued ones.  This [Medium article](https://machine-learning-made-simple.medium.com/complex-valued-neural-networks-might-be-the-future-of-deep-learning-c51f71f4c835) summarizes well why CVNN might be the future of Deep Learning: _"complex numbers work very well for phasic data... The fields where these can be implemented most readily are: Signal Communications; Healthcare (both medical image and ECG); Deep Fake Detections; and Acoustic Analysis for Industrial Maintenance and expansion."_  
