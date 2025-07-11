@@ -1509,6 +1509,9 @@ void testBatch() {
 }
 
 void runAllTests() {
+	CNet cnet;
+	assert(cnet.hasGPU());
+
 	testL2();
 	testSoftmax();
 	testCE();

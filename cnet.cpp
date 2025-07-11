@@ -107,6 +107,7 @@ void trainMnistGPU() {
 	assert(reader.readData());
 
 	CNet cnet;
+	assert(cnet.hasGPU());
 	int cinp, coutp;
 	createMnistNet(cnet, &cinp, &coutp);
 	std::cout << cnet.cpuNet().toString() << std::endl;
