@@ -429,5 +429,6 @@ The current version of the CNet framework has certain limitations:
 * certain CUDA layer implementations are not optimized, e.g., the Linear layer;
 * there is no support for multiple GPUs;
 * the ADAM optimizer is a work in progress;
+* APIs to create new functions / layers are for CPU-only. Support for APIs for implementing CUDA layers, to follow.
 * supported only on Linux/MacOS. 
 
