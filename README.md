@@ -130,6 +130,8 @@ Please see the file [examples/sigmoid.h](https://github.com/crasmarum/CNet/blob/
 
 # Computation Graph on CUDA
 
+
+
 # Complex Layers
 
 ## Input Layer
