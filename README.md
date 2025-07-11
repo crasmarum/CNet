@@ -149,7 +149,7 @@ In the following image you can see how a batch of size 32 is deployed on a GPU:
 ## Input Layer
 
 The Input Layer is used as the main input for the neural network as well as the input parameters for other layers, e.g., Linear or Hadamard layers.
-For example, in the following code snippet `inp` is the mai input and the `h_data` is the parameter for the Hadamard function.
+For example, in the following code snippet `inp` is the main input and the `h_data` is the parameter for the Hadamard function.
 
 ```c++
 #include "impl/cinput.h"
@@ -173,8 +173,8 @@ or are restored from a model via `net.restore(std::string file)`.
 See  the file [cnet.cpp](https://github.com/crasmarum/CNet/blob/a31b701317c5aa98da7dc59ca7bf928fcc53af8c/cnet.cpp)  for more details.
 
 ## Embedding Layer
-The Embedding Layer is used only as the main input for the neural network. The main vaiables of an embedding layer are
-the embedding dimension, the number of embedings and the maximum number of input tokens. For example, in the following 
+The Embedding Layer is used only as the main input for the neural network. The main variables of an embedding layer are
+the embedding dimension, the number of embeddings and the maximum number of input tokens. For example, in the following 
 code snippet we create an embedding consisting of `no_embedings = 100` tokens of dimension `emb_dim = 300` that has an input
 of maximum `max_in_tokens = 64` tokens and has an output of `emb_dim * max_no_tokens = 300 * 64` complex numbers. Note that the output is 
 padded with zeros if necessary.
