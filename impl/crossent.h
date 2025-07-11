@@ -21,6 +21,9 @@ public:
 		is_output_ = true;
 	}
 
+	virtual ~CrossEntropy() {
+	}
+
 	virtual CFunc* clone(Uid uid) override {
 		return new CrossEntropy(uid, InSize(input().length_));
 	}

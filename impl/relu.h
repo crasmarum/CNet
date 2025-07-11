@@ -18,6 +18,9 @@ public:
 	CRelu(InSize in_size) : CFunc(in_size, OutSize(in_size.value())) {
 	}
 
+	virtual ~CRelu() {
+	}
+
 	virtual CFunc* clone(Uid uid) {
 		return new CRelu(uid, InSize(input().length_));
 	}
@@ -100,6 +103,9 @@ public:
 	}
 
 	CGelu(InSize in_size) : CFunc(in_size, OutSize(in_size.value())) {
+	}
+
+	virtual ~CGelu() {
 	}
 
 	virtual CFunc* clone(Uid uid) {

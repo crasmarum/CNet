@@ -28,6 +28,9 @@ public:
 		in2_len = in2.value();
 	}
 
+	virtual ~Linear() {
+	}
+
 	virtual CFunc* clone(Uid uid) {
 		return new Linear(uid, InSize(in1_len), InSize(in2_len));
 	}

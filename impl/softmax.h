@@ -19,6 +19,9 @@ public:
 		square_norm_(0), norm_2_3(0) {
 	}
 
+	virtual ~SoftMax() {
+	}
+
 	virtual CFunc* clone(Uid uid) {
 		return new SoftMax(uid, InSize(input().length_));
 	}

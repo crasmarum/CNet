@@ -23,6 +23,9 @@ public:
 			u_roots_(in_size.value()), buff_(in_size.value()) {
 	}
 
+	virtual ~FourierTrans() {
+	}
+
 	virtual CFunc* clone(Uid uid) {
 		return new FourierTrans(uid, InSize(input().length_));
 	}
@@ -120,6 +123,9 @@ public:
 
 	TriangFourier(InSize in_size) : CFunc(in_size, OutSize(in_size.value())),
 			u_roots_(in_size.value()) {
+	}
+
+	virtual ~TriangFourier() {
 	}
 
 	virtual CFunc* clone(Uid uid) {

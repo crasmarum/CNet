@@ -20,6 +20,9 @@ public:
 		assert(in2.value() == in1.value());
 	}
 
+	virtual ~Hadamard() {
+	}
+
 	virtual CFunc* clone(Uid uid) {
 		return new Hadamard(uid, InSize(out_size_), InSize(out_size_));
 	}

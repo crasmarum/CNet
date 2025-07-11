@@ -26,6 +26,9 @@ public:
 		assert(in1.value() == in2.value());
 	}
 
+	virtual ~Residual() {
+	}
+
 	virtual CFunc* clone(Uid uid) {
 		return new Residual(uid, InSize(out_size_), InSize(out_size_));
 	}

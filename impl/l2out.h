@@ -19,6 +19,9 @@ public:
 		is_output_ = true;
 	}
 
+	virtual ~L2Out() {
+	}
+
 	virtual CFunc* clone(Uid uid) override {
 		return new L2Out(uid, InSize(input().length_));
 	}

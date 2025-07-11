@@ -46,6 +46,9 @@ public:
 		is_input_ = true;
 	}
 
+	virtual ~CEmbedding() {
+	}
+
 	virtual CFunc* clone(Uid uid) {
 		return new CEmbedding(uid, embedding_dim_, no_out_tokens_, no_embeddings_);
 	}
