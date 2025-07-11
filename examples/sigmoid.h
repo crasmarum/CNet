@@ -22,6 +22,9 @@ public:
 			CFunc(in_size, OutSize(in_size.value())) {
 	}
 
+	virtual ~CSigmoid() {
+	}
+
 	virtual CFunc* clone(Uid uid) {
 		return new CSigmoid(uid, InSize(input().length_));
 	}
