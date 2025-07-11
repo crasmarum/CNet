@@ -331,11 +331,11 @@ auto l2 = net.add(new L2Out(InSize(128)), {sigm});
 
 The CroossEntropy loss implements the multivariable function
 
-$CroossEntropy : \mathbb{C}^N \times \mathbb{R}^N \to \mathbb{R} \text{ given by } CroossEntropy(z, y) \mapsto 
+$CrossEntropy : \mathbb{C}^N \times \mathbb{R}^N \to \mathbb{R} \text{ given by } CrossEntropy(z, y) \mapsto 
 \sum_k -y_k \log({z_k * z_k^{\star}}/ \|z\|^2)$.
 
 You can read more on it in the [On the Equivalence of Convolutional and Hadamard Networks using DFT](https://arxiv.org/abs/1810.11650) research paper.
-You can see an example of using the `CroossEntropy` loss function `ce` in the following code snippet, as well as in the 
+You can see an example of using the `CrossEntropy` loss function `ce` in the following code snippet, as well as in the 
 [cnet.cpp](https://github.com/crasmarum/CNet/blob/a31b701317c5aa98da7dc59ca7bf928fcc53af8c/cnet.cpp) file:
 
 ```c++
