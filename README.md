@@ -3,7 +3,7 @@
 CNet is a C++/CUDA framework for building and researching deep complex valued networks, as well as for optimization of complex valued functions using  gradient descent with [Wirtinger derivatives.](https://en.wikipedia.org/wiki/Wirtinger_derivatives) 
 In the current version it should be relatively straighforward to implement new CPU-only functions / layers. In subsequent releases will add support to easily implement CUDA layers, too.
 
-W. Rudin noted that "in spite of the well-known and obvious identification of $ℂ$ with $ℝ^2$, these two are entirely different as far as their vector space structure is concerned."
+W. Rudin noted that "in spite of the well-known and obvious identification of $\mathbb{ℂ}$ with $\mathbb{ℝ}^2$, these two are entirely different as far as their vector space structure is concerned."
 
 # Examples
 
