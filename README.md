@@ -130,8 +130,12 @@ Please see the file [examples/sigmoid.h](https://github.com/crasmarum/CNet/blob/
 
 # Computation Graph on CUDA
 
-In order to execute th
+In order to execute the forward and the backward passes on a CNet complex valued neural net, the functional graph is ordered by depth, as shown in the
+following diagram:
 ![Computation Graph](https://github.com/crasmarum/CNet/blob/main/docs/depth.png)
+
+On an NVIDIA GPU the CNet framework will try to clone the CPU net and execute the forward and the backward passes in parallel following the graph computation depth. 
+In the following image you can see how a batch of size 32 is deployed on a GPU:
 
 ![GPU clones](https://github.com/crasmarum/CNet/blob/main/docs/clones.png)
 
