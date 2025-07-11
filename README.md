@@ -329,7 +329,7 @@ auto l2 = net.add(new L2Out(InSize(128)), {sigm});
 
 ## Cross Entropy Loss function
 
-The CroossEntropy loss implements the multivariable function
+The CrossEntropy loss implements the multivariable function
 
 $CrossEntropy : \mathbb{C}^N \times \mathbb{R}^N \to \mathbb{R} \text{ given by } CrossEntropy(z, y) \mapsto 
 \sum_k -y_k \log({z_k * z_k^{\star}}/ \|z\|^2)$.
