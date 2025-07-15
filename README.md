@@ -426,9 +426,9 @@ for (int epoch = 0; epoch < no_epochs; ++epoch) {
 # Caveat
 
 The current version of the CNet framework has some limitations:
-* certain CUDA layer implementations are not optimized, e.g., the Linear layer;
-* there is no support for multiple GPUs;
+* there is no support for multiple GPUs at the moment;
 * the ADAM optimizer is a work in progress;
 * APIs to create new functions / layers are for CPU-only. Support for APIs for implementing CUDA layers, to follow.
+* certain CUDA layer implementations are not optimal;
 * supported only on Linux/MacOS. 
 
