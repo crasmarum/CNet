@@ -233,9 +233,9 @@ auto ifft = cnet.add(new InverseFourierTrans(InSize(28 * 28)), {hdm});
 
 ## Triangular (Causal) Fourier Layer
 
-This layer implements a *causal* variant of the DFT: a lower-triangular-masked Fourier sum, so output position $p$ depends only on inputs $0 \le q \le p$:
+This layer implements a *causal* variant of the DFT: a lower-triangular-masked Fourier sum, so output position $p$ depends only on inputs $0 \leq q \leq p$:
 
- $TriangFourier : \mathbb{C}^N \to \mathbb{C}^N \text{ given by } TriangFourier(z)_p \mapsto \sum_{q \le p} z_q e^{i2{\pi}pq / N} / \sqrt{N}$.
+ $\text{TriangFourier} : \mathbb{C}^N \to \mathbb{C}^N \text{ given by } \text{TriangFourier}(z)_p \mapsto \sum_{q=0}^{p} z_q e^{i2{\pi}pq / N} / \sqrt{N}$.
 
 This makes it a *parameter-free causal token mixer* — the autoregressive analogue of self-attention used in [FNet](https://aclanthology.org/2022.naacl-main.319.pdf)-style language models: it mixes information across tokens while never letting a position see its own future. With a token-major `CEmbedding` layout (token $t$ occupies a contiguous block) the triangular mask over the flattened index is exactly token-level causality. Because the mask breaks the FFT factorisation, it is computed as a direct $O(N^2)$ sum.
 
