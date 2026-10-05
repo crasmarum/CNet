@@ -10,6 +10,22 @@ the real valued ones.  This [Medium article](https://machine-learning-made-simpl
 The current mainstream ML frameworks PyTorch and JAX offer support for complex differentiation, each framework having its own limitations. However, despite the fact that mathematically the field of complex numbers $ℂ$ can be seen as a Clifford algebra and therefore one may achieve everything with only real numbers, 
 the reality is a bit more complex and nuanced. It is worth quoting W. Rudin on this: _"in spite of the well-known and obvious identification of_ $ℂ$ _with_ $ℝ^2$, _these two are entirely different as far as their vector space structure is concerned."_
 
+## Why CNet, and not PyTorch or JAX?
+
+PyTorch and JAX both support complex tensors and complex-aware autodiff, and for mainstream work they are the right tools — far more mature, faster at scale, multi-GPU, and backed by large ecosystems. CNet does not compete on that axis. It exists because, _for research on complex-valued networks specifically_, a complex-first, transparent substrate has concrete advantages:
+
+* **Complex is the default, not a bolted-on dtype.** In the mainstream frameworks complex coverage is uneven: many layers, normalizations, activations, initializers and optimizers assume real tensors, so a CVNN is assembled from real building blocks plus hand-written patches whose gradient conventions must be checked case by case. In CNet every variable, layer, loss and the optimizer are complex _by construction_.
+
+* **Wirtinger gradients are explicit, first-class objects.** Each layer manipulates the pair $(\partial L/\partial z,\ \partial L/\partial \bar z)$ directly, and the non-holomorphic case (e.g. $|z|^2$) is handled in the open rather than hidden behind a conjugation convention. Every layer ships a CPU reference and a GPU kernel checked against each other and against finite differences, so the complex gradient is _auditable_, not trusted.
+
+* **Spectral structure is built in.** The DFT, the Hadamard (spectral) product, the inverse DFT and the $\mathrm{conv} = \mathrm{IFFT}(\mathrm{FFT} \cdot \mathrm{FFT})$ equivalence are first-class layers, so problems whose natural domain is the frequency plane map onto the framework directly.
+
+* **A physics-native model and loss — the Born rule.** This is the sharpest departure from the mainstream frameworks. CNet reads a network's output as a complex _amplitude vector_ $z$ (a _state_) and defines the class probabilities by the quantum-measurement (Born) rule $p_k = |z_k|^2 / \|z\|^2$, with loss $\mathcal{L}(z, y) = -\sum_k y_k \log\big(|z_k|^2 / \|z\|^2\big)$. Classification is a _measurement_ on an amplitude produced by a cascade of complex — often unitary — operations, rather than real logits passed through a softmax. This inductive bias is natural for physical and wave/field data: an IQ baseband sample _is_ the complex envelope of a real passband signal, an MRI $k$-space sample _is_ a complex Fourier coefficient, and a wavefunction _is_ a complex amplitude. PyTorch and JAX provide no such head or loss out of the box.
+
+* **A small, auditable substrate.** The full forward/backward of every layer and its CUDA kernel is explicit and readable, and the GPU execution model — a depth-ordered graph cloned across the batch — is visible and controllable.
+
+In short: **use PyTorch or JAX to ship; use CNet to _study_ complex-valued learning itself** — to model data in its native complex / amplitude form with a Born-rule measurement head, to prototype operators whose complex gradients you need to see and control, and to work natively in the spectral domain.
+
 # Examples
 
 ## A Simple Complex Neural Net for MNIST
