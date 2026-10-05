@@ -27,6 +27,8 @@
 FLAG_INT(segment_len, 6);
 FLAG_BOOL(check_output, true)
 
+extern bool fft_fast;   // defined in gpu/reduce.cpp; the inverse GPU layer uses cuFFT
+
 void testRelu() {
 	std::cout << "\n" << __func__ << "\n\n";
 
@@ -314,6 +316,61 @@ void testCE() {
 	std::cout << "\nTest passed: " << __func__ << "\n\n";
 }
 
+// CrossEntropy backward parity: the one layer whose gradient path was never
+// checked on its own (testCE only compared the forward loss). Builds Input->CE,
+// runs a labelled backward on CPU and GPU, and compares the gradient that
+// CrossEntropy writes into its input buffer (dz / dz_star).
+void testCEGradient() {
+	std::cout << "\n" << __func__ << "\n\n";
+
+	CNet gpuLead;
+	int size = segment_len;
+
+	gpuLead.cpuNet().add(new CInput(Uid(1), OutSize(size)));
+	gpuLead.cpuNet().add(new CrossEntropy(Uid(2), InSize(size)), { 1 });
+
+	gpuLead.cpuNet().add(new CInput(Uid(3), OutSize(size)));
+	gpuLead.cpuNet().add(new CrossEntropy(Uid(4), InSize(size)), { 3 });
+
+	gpuLead.cpuNet().init_inputs();
+	gpuLead.cpuNet().init_exec_graph();
+	bool was_failure = false;
+	gpuLead.AllocateNet(1, was_failure);
+	assert(!was_failure);
+
+	gpuLead.cpuNet().forward();
+	gpuLead.GpuForward(was_failure);
+	assert(!was_failure);
+
+	auto mp = gpuLead.getMappingFor(gpuLead.cpuNet()[2]);
+
+	// Gradients must agree (both zero) before the backward pass.
+	if (check_output) {
+		assert(gpuLead.testGradientsFromGpu(*mp, 0.001));
+	}
+
+	int label = 1;
+	gpuLead.cpuNet().backward(label);
+	gpuLead.GpuBackward(label, was_failure);
+	assert(!was_failure);
+
+	// Guard against a vacuous pass: CrossEntropy must have produced a real,
+	// non-zero gradient for the parity comparison to mean anything.
+	float gmax = 0;
+	for (auto fc : mp->getCpuFun()) {
+		for (int i = 0; i < fc->input().length_; ++i) {
+			gmax = std::max(gmax, std::abs(fc->input().dz_star(i)));
+		}
+	}
+	assert(gmax > 1e-6);
+
+	if (check_output) {
+		assert(gpuLead.testGradientsFromGpu(*mp, 0.01));
+	}
+
+	std::cout << "\nTest passed: " << __func__ << " (|grad|max=" << gmax << ")\n\n";
+}
+
 void testLinear() {
 	std::cout << "\n" << __func__ << "\n\n";
 
@@ -373,6 +430,37 @@ void testLinear() {
 	}
 
 	std::cout << "Test passed: " << __func__ << "\n\n";
+}
+
+// Linear forward parity with a wide output (M >= 512) so the direct GEMV fast
+// path is exercised; the small-M tests only hit the reduction fallback.
+void testLinearWide() {
+	std::cout << "\n" << __func__ << "\n\n";
+
+	CNet gpuLead;
+	int N = 16;
+	int M = 512;   // out_size; crosses the fast-forward threshold
+	gpuLead.cpuNet().add(new CInput(Uid(1), OutSize(N)));
+	gpuLead.cpuNet().add(new CInput(Uid(2), OutSize(N * M)));
+	gpuLead.cpuNet().add(new Linear(Uid(3), InSize(N), InSize(N * M)), { 1, 2 });
+	gpuLead.cpuNet().add(new CrossEntropy(Uid(4), InSize(M)), { 3 });
+
+	gpuLead.cpuNet().init_inputs();
+	gpuLead.cpuNet().init_exec_graph();
+	bool was_failure = false;
+	gpuLead.AllocateNet(1, was_failure);
+	assert(!was_failure);
+
+	gpuLead.cpuNet().forward();
+	gpuLead.GpuForward(was_failure);
+	assert(!was_failure);
+
+	auto out = gpuLead.getMappingFor(gpuLead.cpuNet()[4]);
+	if (check_output) {
+		assert(gpuLead.testDataFromGpu(*out, 0.01));
+	}
+
+	std::cout << "\nTest passed: " << __func__ << "\n\n";
 }
 
 void testE2E() {
@@ -878,6 +966,393 @@ void testFFTGradient() {
 		assert(gpuLead.testGradientsFromGpu(*mp, 0.001));
 	}
 
+	std::cout << "Test passed: " << __func__ << "\n\n";
+}
+
+// InverseFourierTrans forward parity: GPU (cuFFT) inverse DFT vs the CPU
+// reference (FastFourierTransform::inverseTransform + 1/sqrt(N)).
+void testIFfft() {
+	std::cout << "\n" << __func__ << "\n\n";
+	bool saved = fft_fast; fft_fast = true;   // the inverse GPU layer is cuFFT-only
+	CNet gpuLead;
+	int size = segment_len;
+
+	gpuLead.cpuNet().add(new CInput(Uid(1), OutSize(size)));
+	gpuLead.cpuNet().add(new InverseFourierTrans(Uid(2), InSize(size)), {1});
+	gpuLead.cpuNet().add(new CrossEntropy(Uid(3), InSize(size)), {2});
+	gpuLead.cpuNet().add(new CInput(Uid(4), OutSize(size)));
+	gpuLead.cpuNet().add(new InverseFourierTrans(Uid(5), InSize(size)), {4});
+	gpuLead.cpuNet().add(new CrossEntropy(Uid(6), InSize(size)), {5});
+
+	gpuLead.cpuNet().init_inputs();
+	gpuLead.cpuNet().init_exec_graph();
+	bool was_failure = false;
+	gpuLead.AllocateNet(1, was_failure);
+	assert(!was_failure);
+
+	gpuLead.GpuForward(was_failure);
+	assert(!was_failure);
+	gpuLead.cpuNet().forward();
+
+	auto ret = gpuLead.getMappingFor(gpuLead.cpuNet()[5]);
+	if (check_output) {
+		assert(gpuLead.testDataFromGpu(*ret, 0.1));
+	}
+	fft_fast = saved;
+	std::cout << "\nTest passed: " << __func__ << "\n\n";
+}
+
+// InverseFourierTrans gradient parity: GPU backward vs CPU backward (the
+// adjoint = forward unitary DFT applied to the incoming gradients).
+void testIFFTGradient() {
+	std::cout << "\n" << __func__ << "\n\n";
+	bool saved = fft_fast; fft_fast = true;
+	CNet gpuLead;
+	int size = segment_len;
+
+	gpuLead.cpuNet().add(new CInput(Uid(1), OutSize(size)));
+	gpuLead.cpuNet().add(new InverseFourierTrans(Uid(2), InSize(size)), {1});
+	gpuLead.cpuNet().add(new CrossEntropy(Uid(3), InSize(size)), {2});
+	gpuLead.cpuNet().add(new CInput(Uid(4), OutSize(size)));
+	gpuLead.cpuNet().add(new InverseFourierTrans(Uid(5), InSize(size)), {4});
+	gpuLead.cpuNet().add(new CrossEntropy(Uid(6), InSize(size)), {5});
+
+	gpuLead.cpuNet().init_inputs();
+	gpuLead.cpuNet().init_exec_graph();
+	bool was_failure = false;
+	gpuLead.AllocateNet(1, was_failure);
+	assert(!was_failure);
+
+	gpuLead.cpuNet().forward();
+	gpuLead.GpuForward(was_failure);
+
+	if (check_output) {
+		float gpuLoss = gpuLead.getLoss(1)[3];
+		float cpuLoss = ((CrossEntropy*) ((gpuLead.cpuNet()[3])))->loss(1);
+		assert(abs(gpuLoss - cpuLoss) < 0.001);
+	}
+
+	auto mp = gpuLead.getMappingFor(gpuLead.cpuNet()[2]);
+	gpuLead.cpuNet().backward(1);
+	gpuLead.GpuBackward(1, was_failure);
+	if (check_output) {
+		assert(gpuLead.testGradientsFromGpu(*mp, 0.1));
+	}
+
+	gpuLead.cpuNet()[2]->mutable_input()->zero_gradients();
+	gpuLead.cpuNet()[5]->mutable_input()->zero_gradients();
+	mp->zeroGradients();
+	fft_fast = saved;
+	std::cout << "Test passed: " << __func__ << "\n\n";
+}
+
+// Reconstruction identity (CPU): InverseFourierTrans undoes FourierTrans, i.e.
+// IFFT(FFT(x)) == x, checked end-to-end through the net graph.
+void testIFFTInverse() {
+	std::cout << "\n" << __func__ << "\n\n";
+	CNet cnet;
+	int size = segment_len;
+	int ii  = cnet.cpuNet().add(new CInput(Uid(1), OutSize(size)));
+	int ff  = cnet.cpuNet().add(new FourierTrans(Uid(2), InSize(size)), {ii});
+	int inv = cnet.cpuNet().add(new InverseFourierTrans(Uid(3), InSize(size)), {ff});
+	cnet.cpuNet().add(new CrossEntropy(Uid(4), InSize(size)), {inv});
+
+	cnet.cpuNet().init_inputs(42);
+	cnet.cpuNet().init_exec_graph();
+
+	CInput *inp = (CInput*) cnet.cpuNet()[ii];
+	SimpleRand r(7);
+	for (int k = 0; k < size; ++k) {
+		inp->mutable_input()->real_[k] = (float) r.randDouble() - 0.5f;
+		inp->mutable_input()->imag_[k] = (float) r.randDouble() - 0.5f;
+	}
+
+	cnet.cpuNet().forward();
+
+	// The CrossEntropy input holds IFFT(FFT(x)); it must match x.
+	CFunc *rec = cnet.cpuNet()[inv]->next(0);
+	float err = 0;
+	for (int k = 0; k < size; ++k) {
+		err += std::abs(rec->input().z(k) - inp->input().z(k));
+	}
+	std::cout << "IFFT(FFT(x)) L1 error = " << err << "\n";
+	if (check_output) {
+		assert(err < 1e-3);
+	}
+	std::cout << "Test passed: " << __func__ << "\n\n";
+}
+
+// Finite-difference check of the CModulus2 (|z|^2) Wirtinger derivatives.
+// For a real loss, the stored grad is dz_star = dL/dz~, and
+// dL/dx = 2 Re(dz_star), dL/dy = 2 Im(dz_star); compare to central differences
+// of a real CrossEntropy loss through CInput -> CModulus2 -> CrossEntropy.
+void testModulus2Grad() {
+	std::cout << "\n" << __func__ << "\n\n";
+	CNet cnet;
+	int N = 4, label = 1;
+	int ii = cnet.cpuNet().add(new CInput(Uid(1), OutSize(N)));
+	int mm = cnet.cpuNet().add(new CModulus2(Uid(2), InSize(N)), {ii});
+	cnet.cpuNet().add(new CrossEntropy(Uid(3), InSize(N)), {mm});
+	cnet.cpuNet().init_inputs(5);
+	cnet.cpuNet().init_exec_graph();
+
+	CInput *inp = (CInput*) cnet.cpuNet()[ii];
+	CrossEntropy *cen = (CrossEntropy*) cnet.cpuNet()[3];
+	SimpleRand r(11);
+	for (int k = 0; k < N; ++k) {
+		inp->mutable_input()->real_[k] = (float) r.randDouble() - 0.5f;
+		inp->mutable_input()->imag_[k] = (float) r.randDouble() - 0.5f;
+	}
+
+	inp->mutable_input()->zero_gradients();
+	cnet.cpuNet().forward();
+	cnet.cpuNet().backward(label);
+
+	std::vector<float> ax(N), ay(N);
+	for (int k = 0; k < N; ++k) {
+		ax[k] = 2.0f * inp->input().dz_star(k).real();   // dL/dx
+		ay[k] = 2.0f * inp->input().dz_star(k).imag();   // dL/dy
+	}
+
+	float eps = 1e-3f, max_err = 0;
+	for (int k = 0; k < N; ++k) {
+		float save = inp->mutable_input()->real_[k];
+		inp->mutable_input()->real_[k] = save + eps; cnet.cpuNet().forward();
+		float Lp = cen->loss(label);
+		inp->mutable_input()->real_[k] = save - eps; cnet.cpuNet().forward();
+		float Lm = cen->loss(label);
+		inp->mutable_input()->real_[k] = save;
+		float fx = (Lp - Lm) / (2 * eps);
+
+		save = inp->mutable_input()->imag_[k];
+		inp->mutable_input()->imag_[k] = save + eps; cnet.cpuNet().forward();
+		Lp = cen->loss(label);
+		inp->mutable_input()->imag_[k] = save - eps; cnet.cpuNet().forward();
+		Lm = cen->loss(label);
+		inp->mutable_input()->imag_[k] = save;
+		float fy = (Lp - Lm) / (2 * eps);
+
+		max_err = std::max(max_err, std::max(fabsf(fx - ax[k]), fabsf(fy - ay[k])));
+	}
+	std::cout << "CModulus2 finite-diff vs analytic max error = " << max_err << "\n";
+	if (check_output) {
+		assert(max_err < 1e-2);
+	}
+	std::cout << "Test passed: " << __func__ << "\n\n";
+}
+
+// GPU vs CPU parity for CModulus2 (forward output + input gradients).
+void testModulus2Gpu() {
+	std::cout << "\n" << __func__ << "\n\n";
+	CNet gpuLead;
+	int size = segment_len;
+
+	gpuLead.cpuNet().add(new CInput(Uid(1), OutSize(size)));
+	gpuLead.cpuNet().add(new CModulus2(Uid(2), InSize(size)), {1});
+	gpuLead.cpuNet().add(new CrossEntropy(Uid(3), InSize(size)), {2});
+	gpuLead.cpuNet().add(new CInput(Uid(4), OutSize(size)));
+	gpuLead.cpuNet().add(new CModulus2(Uid(5), InSize(size)), {4});
+	gpuLead.cpuNet().add(new CrossEntropy(Uid(6), InSize(size)), {5});
+
+	gpuLead.cpuNet().init_inputs();
+	gpuLead.cpuNet().init_exec_graph();
+	bool was_failure = false;
+	gpuLead.AllocateNet(1, was_failure);
+	assert(!was_failure);
+
+	gpuLead.cpuNet().forward();
+	gpuLead.GpuForward(was_failure);
+	auto mp = gpuLead.getMappingFor(gpuLead.cpuNet()[2]);
+	if (check_output) {
+		assert(gpuLead.testDataFromGpu(*mp, 0.01));          // forward parity
+	}
+
+	gpuLead.cpuNet().backward(1);
+	gpuLead.GpuBackward(1, was_failure);
+	if (check_output) {
+		assert(gpuLead.testGradientsFromGpu(*mp, 0.01));     // gradient parity
+	}
+	std::cout << "Test passed: " << __func__ << "\n\n";
+}
+
+// Finite-difference check of the MeanPool derivatives (linear map, but verifies
+// the 1/width scaling and the pool->input routing).
+void testMeanPoolGrad() {
+	std::cout << "\n" << __func__ << "\n\n";
+	CNet cnet;
+	int L = 6, P = 3, label = 1;
+	int ii = cnet.cpuNet().add(new CInput(Uid(1), OutSize(L)));
+	int pp = cnet.cpuNet().add(new MeanPool(Uid(2), InSize(L), OutSize(P)), {ii});
+	cnet.cpuNet().add(new CrossEntropy(Uid(3), InSize(P)), {pp});
+	cnet.cpuNet().init_inputs(5);
+	cnet.cpuNet().init_exec_graph();
+
+	CInput *inp = (CInput*) cnet.cpuNet()[ii];
+	CrossEntropy *cen = (CrossEntropy*) cnet.cpuNet()[3];
+	SimpleRand r(13);
+	for (int k = 0; k < L; ++k) {
+		inp->mutable_input()->real_[k] = (float) r.randDouble() - 0.5f;
+		inp->mutable_input()->imag_[k] = (float) r.randDouble() - 0.5f;
+	}
+
+	inp->mutable_input()->zero_gradients();
+	cnet.cpuNet().forward();
+	cnet.cpuNet().backward(label);
+
+	std::vector<float> ax(L), ay(L);
+	for (int k = 0; k < L; ++k) {
+		ax[k] = 2.0f * inp->input().dz_star(k).real();
+		ay[k] = 2.0f * inp->input().dz_star(k).imag();
+	}
+
+	float eps = 1e-3f, max_err = 0;
+	for (int k = 0; k < L; ++k) {
+		float save = inp->mutable_input()->real_[k];
+		inp->mutable_input()->real_[k] = save + eps; cnet.cpuNet().forward();
+		float Lp = cen->loss(label);
+		inp->mutable_input()->real_[k] = save - eps; cnet.cpuNet().forward();
+		float Lm = cen->loss(label);
+		inp->mutable_input()->real_[k] = save;
+		float fx = (Lp - Lm) / (2 * eps);
+
+		save = inp->mutable_input()->imag_[k];
+		inp->mutable_input()->imag_[k] = save + eps; cnet.cpuNet().forward();
+		Lp = cen->loss(label);
+		inp->mutable_input()->imag_[k] = save - eps; cnet.cpuNet().forward();
+		Lm = cen->loss(label);
+		inp->mutable_input()->imag_[k] = save;
+		float fy = (Lp - Lm) / (2 * eps);
+
+		max_err = std::max(max_err, std::max(fabsf(fx - ax[k]), fabsf(fy - ay[k])));
+	}
+	std::cout << "MeanPool finite-diff vs analytic max error = " << max_err << "\n";
+	if (check_output) {
+		assert(max_err < 1e-2);
+	}
+	std::cout << "Test passed: " << __func__ << "\n\n";
+}
+
+// GPU vs CPU parity for MeanPool (forward output + input gradients).
+void testMeanPoolGpu() {
+	std::cout << "\n" << __func__ << "\n\n";
+	CNet gpuLead;
+	int L = segment_len, P = (segment_len % 3 == 0) ? 3 : 1;
+
+	gpuLead.cpuNet().add(new CInput(Uid(1), OutSize(L)));
+	gpuLead.cpuNet().add(new MeanPool(Uid(2), InSize(L), OutSize(P)), {1});
+	gpuLead.cpuNet().add(new CrossEntropy(Uid(3), InSize(P)), {2});
+	gpuLead.cpuNet().add(new CInput(Uid(4), OutSize(L)));
+	gpuLead.cpuNet().add(new MeanPool(Uid(5), InSize(L), OutSize(P)), {4});
+	gpuLead.cpuNet().add(new CrossEntropy(Uid(6), InSize(P)), {5});
+
+	gpuLead.cpuNet().init_inputs();
+	gpuLead.cpuNet().init_exec_graph();
+	bool was_failure = false;
+	gpuLead.AllocateNet(1, was_failure);
+	assert(!was_failure);
+
+	gpuLead.cpuNet().forward();
+	gpuLead.GpuForward(was_failure);
+	auto mp = gpuLead.getMappingFor(gpuLead.cpuNet()[2]);
+	if (check_output) {
+		assert(gpuLead.testDataFromGpu(*mp, 0.01));
+	}
+
+	gpuLead.cpuNet().backward(1);
+	gpuLead.GpuBackward(1, was_failure);
+	if (check_output) {
+		assert(gpuLead.testGradientsFromGpu(*mp, 0.01));
+	}
+	std::cout << "Test passed: " << __func__ << "\n\n";
+}
+
+// Finite-difference check of the CPower (z^M) Wirtinger derivatives.
+void testPowerGrad() {
+	std::cout << "\n" << __func__ << "\n\n";
+	CNet cnet;
+	int N = 4, label = 1, M = 3;
+	int ii = cnet.cpuNet().add(new CInput(Uid(1), OutSize(N)));
+	int qq = cnet.cpuNet().add(new CPower(Uid(2), InSize(N), M), {ii});
+	cnet.cpuNet().add(new CrossEntropy(Uid(3), InSize(N)), {qq});
+	cnet.cpuNet().init_inputs(5);
+	cnet.cpuNet().init_exec_graph();
+
+	CInput *inp = (CInput*) cnet.cpuNet()[ii];
+	CrossEntropy *cen = (CrossEntropy*) cnet.cpuNet()[3];
+	SimpleRand r(17);
+	for (int k = 0; k < N; ++k) {
+		inp->mutable_input()->real_[k] = (float) r.randDouble() - 0.5f;
+		inp->mutable_input()->imag_[k] = (float) r.randDouble() - 0.5f;
+	}
+
+	inp->mutable_input()->zero_gradients();
+	cnet.cpuNet().forward();
+	cnet.cpuNet().backward(label);
+
+	std::vector<float> ax(N), ay(N);
+	for (int k = 0; k < N; ++k) {
+		ax[k] = 2.0f * inp->input().dz_star(k).real();
+		ay[k] = 2.0f * inp->input().dz_star(k).imag();
+	}
+
+	float eps = 1e-3f, max_err = 0;
+	for (int k = 0; k < N; ++k) {
+		float save = inp->mutable_input()->real_[k];
+		inp->mutable_input()->real_[k] = save + eps; cnet.cpuNet().forward();
+		float Lp = cen->loss(label);
+		inp->mutable_input()->real_[k] = save - eps; cnet.cpuNet().forward();
+		float Lm = cen->loss(label);
+		inp->mutable_input()->real_[k] = save;
+		float fx = (Lp - Lm) / (2 * eps);
+
+		save = inp->mutable_input()->imag_[k];
+		inp->mutable_input()->imag_[k] = save + eps; cnet.cpuNet().forward();
+		Lp = cen->loss(label);
+		inp->mutable_input()->imag_[k] = save - eps; cnet.cpuNet().forward();
+		Lm = cen->loss(label);
+		inp->mutable_input()->imag_[k] = save;
+		float fy = (Lp - Lm) / (2 * eps);
+
+		max_err = std::max(max_err, std::max(fabsf(fx - ax[k]), fabsf(fy - ay[k])));
+	}
+	std::cout << "CPower finite-diff vs analytic max error = " << max_err << "\n";
+	if (check_output) {
+		assert(max_err < 1e-2);
+	}
+	std::cout << "Test passed: " << __func__ << "\n\n";
+}
+
+// GPU vs CPU parity for CPower (forward output + input gradients).
+void testPowerGpu() {
+	std::cout << "\n" << __func__ << "\n\n";
+	CNet gpuLead;
+	int size = segment_len, M = 3;
+
+	gpuLead.cpuNet().add(new CInput(Uid(1), OutSize(size)));
+	gpuLead.cpuNet().add(new CPower(Uid(2), InSize(size), M), {1});
+	gpuLead.cpuNet().add(new CrossEntropy(Uid(3), InSize(size)), {2});
+	gpuLead.cpuNet().add(new CInput(Uid(4), OutSize(size)));
+	gpuLead.cpuNet().add(new CPower(Uid(5), InSize(size), M), {4});
+	gpuLead.cpuNet().add(new CrossEntropy(Uid(6), InSize(size)), {5});
+
+	gpuLead.cpuNet().init_inputs();
+	gpuLead.cpuNet().init_exec_graph();
+	bool was_failure = false;
+	gpuLead.AllocateNet(1, was_failure);
+	assert(!was_failure);
+
+	gpuLead.cpuNet().forward();
+	gpuLead.GpuForward(was_failure);
+	auto mp = gpuLead.getMappingFor(gpuLead.cpuNet()[2]);
+	if (check_output) {
+		assert(gpuLead.testDataFromGpu(*mp, 0.01));
+	}
+
+	gpuLead.cpuNet().backward(1);
+	gpuLead.GpuBackward(1, was_failure);
+	if (check_output) {
+		assert(gpuLead.testGradientsFromGpu(*mp, 0.01));
+	}
 	std::cout << "Test passed: " << __func__ << "\n\n";
 }
 
@@ -1508,6 +1983,91 @@ void testBatch() {
 	std::cout << "Test passed: " << __func__ << "\n\n";
 }
 
+// Micro-benchmark for the Linear GPU forward/backward passes (not part of
+// runAllTests). Toggle the implementation with -fast_linear true|false.
+static void benchLinearShape(int N, int M, int batch, int iters) {
+	CNet gpuLead;
+	gpuLead.cpuNet().add(new CInput(Uid(1), OutSize(N)));
+	gpuLead.cpuNet().add(new CInput(Uid(2), OutSize(N * M)));
+	gpuLead.cpuNet().add(new Linear(Uid(3), InSize(N), InSize(N * M)), { 1, 2 });
+	gpuLead.cpuNet().add(new L2Out(Uid(4), InSize(M)), { 3 });
+
+	gpuLead.cpuNet().init_inputs();
+	gpuLead.cpuNet().init_exec_graph();
+	bool was_failure = false;
+	gpuLead.AllocateNet(batch, was_failure);
+	assert(!was_failure);
+
+	gpuLead.GpuForward(was_failure);    // warm-up
+	gpuLead.GpuBackward(0, was_failure);
+	assert(!was_failure);
+
+	StopWatch sw;
+	for (int i = 0; i < iters; ++i) {
+		gpuLead.GpuForward(was_failure);
+	}
+	long long fwd_us = sw.ElapsedTimeMicros();
+
+	StopWatch sw2;
+	for (int i = 0; i < iters; ++i) {
+		gpuLead.GpuBackward(0, was_failure);
+	}
+	long long bwd_us = sw2.ElapsedTimeMicros();
+
+	std::cout << "  N=" << N << " M=" << M << " batch=" << batch << " iters=" << iters
+			  << "  fwd_avg_us=" << (double) fwd_us / iters
+			  << "  bwd_avg_us=" << (double) bwd_us / iters << "\n";
+}
+
+void benchLinear() {
+	std::cout << "\n" << __func__ << "\n\n";
+	benchLinearShape(784, 10, 1, 3000);     // MNIST head, batch 1
+	benchLinearShape(784, 10, 32, 2000);    // MNIST head, batch 32
+	benchLinearShape(256, 1024, 1, 3000);   // wide output, batch 1
+	benchLinearShape(256, 1024, 32, 1000);  // wide output, batch 32
+	std::cout << "\nTest passed: " << __func__ << "\n\n";
+}
+
+static void benchFFTShape(int N, int batch, int iters) {
+	CNet gpuLead;
+	gpuLead.cpuNet().add(new CInput(Uid(1), OutSize(N)));
+	gpuLead.cpuNet().add(new FourierTrans(Uid(2), InSize(N)), { 1 });
+	gpuLead.cpuNet().add(new L2Out(Uid(3), InSize(N)), { 2 });
+
+	gpuLead.cpuNet().init_inputs();
+	gpuLead.cpuNet().init_exec_graph();
+	bool was_failure = false;
+	gpuLead.AllocateNet(batch, was_failure);
+	assert(!was_failure);
+
+	gpuLead.GpuForward(was_failure);
+	gpuLead.GpuBackward(0, was_failure);
+	assert(!was_failure);
+
+	StopWatch sw;
+	for (int i = 0; i < iters; ++i) {
+		gpuLead.GpuForward(was_failure);
+	}
+	long long fwd_us = sw.ElapsedTimeMicros();
+
+	StopWatch sw2;
+	for (int i = 0; i < iters; ++i) {
+		gpuLead.GpuBackward(0, was_failure);
+	}
+	long long bwd_us = sw2.ElapsedTimeMicros();
+
+	std::cout << "  N=" << N << " batch=" << batch << " iters=" << iters
+			  << "  fwd_avg_us=" << (double) fwd_us / iters
+			  << "  bwd_avg_us=" << (double) bwd_us / iters << "\n";
+}
+
+void benchFFT() {
+	std::cout << "\n" << __func__ << "\n\n";
+	benchFFTShape(784, 32, 2000);    // MNIST FFT size
+	benchFFTShape(4096, 32, 1000);   // large N: O(N^2) vs O(N log N) gap is huge
+	std::cout << "\nTest passed: " << __func__ << "\n\n";
+}
+
 void runAllTests() {
 	CNet cnet;
 	assert(cnet.hasGPU());
@@ -1515,6 +2075,7 @@ void runAllTests() {
 	testL2();
 	testSoftmax();
 	testCE();
+	testCEGradient();
 	testRelu();
 	testResidual();
 	testHadamard();
@@ -1522,11 +2083,21 @@ void runAllTests() {
 	testTwoOutputs();
 	testE2E();
 	testFfft();
+	testIFfft();
+	testIFFTInverse();
 	testLinear();
+	testLinearWide();
 	testEmbedding();
 	testZeroGradient();
 	testLinearMaxGradient();
 	testFFTGradient();
+	testIFFTGradient();
+	testModulus2Grad();
+	testModulus2Gpu();
+	testMeanPoolGrad();
+	testMeanPoolGpu();
+	testPowerGrad();
+	testPowerGpu();
 	testResidualGradient();
 	testHadamardGradient();
 	testGeluGradient();
@@ -1537,6 +2108,25 @@ void runAllTests() {
 	testT_FFTGradient();
 	testSoftMaxGradient();
 	testBatch();
+}
+
+// Run a single test by name, so each layer can be exercised in its own process
+// (CPU reference vs GPU) one at a time. Returns false if the name is unknown.
+bool runTestByName(const std::string& name) {
+#define RUNT(t) if (name == #t) { t(); return true; }
+	RUNT(testL2) RUNT(testSoftmax) RUNT(testCE) RUNT(testCEGradient) RUNT(testRelu)
+	RUNT(testResidual) RUNT(testHadamard) RUNT(testGelu) RUNT(testTwoOutputs)
+	RUNT(testE2E) RUNT(testFfft) RUNT(testIFfft) RUNT(testIFFTGradient) RUNT(testIFFTInverse)
+	RUNT(testModulus2Grad) RUNT(testModulus2Gpu) RUNT(testMeanPoolGrad) RUNT(testMeanPoolGpu)
+	RUNT(testPowerGrad) RUNT(testPowerGpu)
+	RUNT(testLinear) RUNT(testLinearWide) RUNT(testEmbedding)
+	RUNT(testZeroGradient) RUNT(testLinearMaxGradient) RUNT(testFFTGradient)
+	RUNT(testResidualGradient) RUNT(testHadamardGradient) RUNT(testGeluGradient)
+	RUNT(testEmbeddingGradient) RUNT(testInputGradient) RUNT(testEmbedding2)
+	RUNT(testUpdateInputs) RUNT(testT_FFTGradient) RUNT(testSoftMaxGradient)
+	RUNT(testBatch) RUNT(benchLinear) RUNT(benchFFT)
+#undef RUNT
+	return false;
 }
 
 

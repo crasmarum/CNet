@@ -38,42 +38,37 @@ public:
 		return gpu_maps_.size();
 	}
 
+	// GPU dispatch registry: type-id -> GPU-mapping factory, for the layers whose
+	// GPU class takes only (depth). The two layers with extra constructor args
+	// (CPower, CEmbedding) are handled explicitly below.
+	#define GPU_LAYER_TABLE(X)            \
+		X(isInput,          InputGpu)         \
+		X(isCrossEntropy,   CrossEntropyGpu)  \
+		X(isCrelu,          ReluGpu)          \
+		X(isLinear,         LinearGpu)        \
+		X(isTokenwise,      TokenwiseLinearGpu) \
+		X(isFourier,        FourierGpu)       \
+		X(isInverseFourier, InverseFourierGpu) \
+		X(isTrianFourier,   TrianFourierGpu)  \
+		X(isSoftMax,        SoftMaxGpu)       \
+		X(isL2Out,          L2Gpu)            \
+		X(isResidual,       ResidualGpu)      \
+		X(isHadamard,       HadamardGpu)      \
+		X(isPad,            PadGpu)           \
+		X(isGelu,           GeluGpu)          \
+		X(isModulus2,       CModulus2Gpu)     \
+		X(isMeanPool,       MeanPoolGpu)      \
+		X(isSeqCrossEntropy, SequenceCrossEntropyGpu)
+
 	void add(float **gpu_ptr, std::vector<CFunc*>& block, int depth) {
 		assert(block.size());
 		switch (ComplexNet::getType(block.front()))
 		{
-		    case isInput:
-		        add(new InputGpu(depth), gpu_ptr, block);
-		        break;
-		    case isCrossEntropy:
-		    	add(new CrossEntropyGpu(depth), gpu_ptr, block);
-		        break;
-		    case isCrelu:
-		    	add(new ReluGpu(depth), gpu_ptr, block);
-		        break;
-		    case isLinear:
-		    	add(new LinearGpu(depth), gpu_ptr, block);
-		        break;
-		    case isFourier:
-		    	add(new FourierGpu(depth), gpu_ptr, block);
-		        break;
-		    case isTrianFourier:
-		    	add(new TrianFourierGpu(depth), gpu_ptr, block);
-		        break;
-		    case isSoftMax:
-		    	add(new SoftMaxGpu(depth), gpu_ptr, block);
-		        break;
-		    case isL2Out:
-		    	add(new L2Gpu(depth), gpu_ptr, block);
-		        break;
-		    case isResidual:
-		    	add(new ResidualGpu(depth), gpu_ptr, block);
-		        break;
-		    case isHadamard:
-		    	add(new HadamardGpu(depth), gpu_ptr, block);
-		        break;
-		    case isGelu:
-		    	add(new GeluGpu(depth), gpu_ptr, block);
+		#define X(ID, G) case ID: add(new G(depth), gpu_ptr, block); break;
+		GPU_LAYER_TABLE(X)
+		#undef X
+		    case isPower:
+		    	add(new CPowerGpu(depth, ((CPower*)block[0])->power()), gpu_ptr, block);
 		        break;
 		    case isEmbedding:
 		    	add(new EmbeddingGpu(depth, ((CEmbedding*)block[0])->embedding_dim_,
@@ -86,6 +81,7 @@ public:
 		        throw std::invalid_argument("Not implemented for: " + block.front()->getName());
 		}
 	}
+	#undef GPU_LAYER_TABLE
 
 	void addGpuOuts() {
 		for (auto map : gpu_maps_) {
@@ -95,14 +91,23 @@ public:
 				if (CrossEntropyGpu *ce = dynamic_cast<CrossEntropyGpu*>(map)) {
 					GpuOutVar outVar;
 					outVar.out_ptr_ = map->in_[indx].input_ptr_
-							+ (hasGradients_ ? 6 : 2) * cpu_fun->input().length_;
+							+ (hasGradients_ ? Vars::dims_ : 2) * cpu_fun->input().length_;
+					outVar.out_length_ = cpu_fun->input().length_;
+
+					map->out_.push_back(outVar);
+				} else if (SequenceCrossEntropyGpu *sce = dynamic_cast<SequenceCrossEntropyGpu*>(map)) {
+					// terminal per-position loss: same output layout as CrossEntropy,
+					// no next() to wire.
+					GpuOutVar outVar;
+					outVar.out_ptr_ = map->in_[indx].input_ptr_
+							+ (hasGradients_ ? Vars::dims_ : 2) * cpu_fun->input().length_;
 					outVar.out_length_ = cpu_fun->input().length_;
 
 					map->out_.push_back(outVar);
 				} else if (L2Gpu *ce = dynamic_cast<L2Gpu*>(map)) {
 					GpuOutVar outVar;
 					outVar.out_ptr_ = map->in_[indx].input_ptr_
-							+ (hasGradients_ ? 6 : 2) * cpu_fun->input().length_;
+							+ (hasGradients_ ? Vars::dims_ : 2) * cpu_fun->input().length_;
 					outVar.out_length_ = cpu_fun->input().length_;
 					map->out_.push_back(outVar);
 				} else {

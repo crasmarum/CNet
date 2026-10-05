@@ -8,6 +8,11 @@
 // Flags.
 extern int reduce_block_size;
 
+// Compares argmax_k |z_k|^2 to the label for each batch element; writes 1/0 into
+// out_correct[0..no_mappings). Used for cheap in-training accuracy.
+void gpu_argmax_correct(GpuInVar *in, int *labels, int *out_correct, int N, int no_mappings);
+void gpu_argmax_predict(GpuInVar *in, int *out_pred, int N, int no_mappings);
+
 class LinearGpu;
 class FourierGpu;
 class L2Gpu;
@@ -67,14 +72,47 @@ public:
 	}
 };
 
+// Position-wise linear: one shared e_in x e_out weight applied to each of
+// n_tokens contiguous e_in slices. Direct kernels (the contraction e_in and the
+// output width e_out are small); the weight gradient is accumulated over tokens.
+class TokenwiseLinearGpu : public GpuMapping {
+
+public:
+	TokenwiseLinearGpu(int depth) : GpuMapping(depth) {
+	}
+	virtual ~TokenwiseLinearGpu() {
+	}
+
+	void gpu_tokenwise_forward();
+	void gpu_tokenwise_backward();
+
+	virtual void forward() override {
+		gpu_tokenwise_forward();
+	}
+
+	virtual void backward(int label) override {
+		gpu_tokenwise_backward();
+	}
+};
+
 class FourierGpu : public GpuMapping {
+protected:
+	int fft_plan_ = -1;        // cufftHandle (an int); -1 = not created
+	cmplx_ *fft_buf_ = NULL;   // interleaved batched scratch (N*M) for the fast path
+	int fft_N_ = 0;
+	int fft_M_ = 0;
 
 public:
 	FourierGpu(int depth) : GpuMapping(depth) {
 	}
 
 	virtual ~FourierGpu() {
+		free_fft();
 	}
+
+	// cuFFT plan + scratch management for the fast (fft_fast) path.
+	void ensure_fft_plan(int N, int M);
+	void free_fft();
 
 	void gpu_fft_forward(int block_size);
 
@@ -86,6 +124,33 @@ public:
 
 	virtual void backward(int label) override {
 		gpu_fft_backward(label, reduce_block_size);
+	}
+};
+
+// Inverse (unitary) DFT on GPU. Reuses FourierGpu's cuFFT plan/buffer and the
+// shared gather/scatter kernels; only the transform DIRECTION differs:
+//   forward  = cuFFT INVERSE (+ 1/sqrt(N)),
+//   backward = FourierGpu's backward with the two directions swapped (the
+//              adjoint of the inverse map is the forward unitary DFT).
+// One batched plan of size N over M = getNoMappings() clones covers the whole
+// layer, so per-batch cloning works exactly as for FourierGpu.
+class InverseFourierGpu : public FourierGpu {
+public:
+	InverseFourierGpu(int depth) : FourierGpu(depth) {
+	}
+
+	virtual ~InverseFourierGpu() {
+	}
+
+	void gpu_ifft_forward(int block_size);
+	void gpu_ifft_backward(int label, int block_size);
+
+	virtual void forward() override {
+		gpu_ifft_forward(reduce_block_size);
+	}
+
+	virtual void backward(int label) override {
+		gpu_ifft_backward(label, reduce_block_size);
 	}
 };
 
@@ -159,6 +224,51 @@ public:
 		gpu_cross_ent_backward(label);
 	}
 
+};
+
+// Per-position Born-rule cross entropy on the GPU (autoregressive LM).
+// Two target sources:
+//   - batch=1 (no clones): pulls the per-position targets from its CPU twin each
+//     forward into the self-owned gpu_targets_ (no extra plumbing needed).
+//   - batched (B clones): the CNet allocates one B*n_pos targets arena, uploads
+//     all B per-position target vectors to it in batchToGpu, and hands the device
+//     pointer here via setBatchTargets(); gpu_targets_ stays unused.
+// forward() computes every clone-position's ||z_p||^2 and loss over B*n_pos; the
+// kernels index in[map_indx] and targets[map_indx*n_pos + p].
+class SequenceCrossEntropyGpu : public GpuMapping {
+	friend class GpuNet;
+	friend class CNet;
+
+	int vocab_ = 0;
+	int n_pos_ = 0;
+	int *gpu_targets_ = NULL;         // self-owned n_pos targets (batch=1, from CPU twin)
+	int *gpu_batch_targets_ = NULL;   // external B*n_pos targets (batched); NOT freed here
+	float *gpu_sqnorm_ = NULL;        // B*n_pos ||z_p||^2 (forward -> backward)
+	float *gpu_poss_loss_ = NULL;     // B*n_pos -log p (for loss readback)
+
+public:
+	SequenceCrossEntropyGpu(int depth) : GpuMapping(depth) {
+	}
+	virtual ~SequenceCrossEntropyGpu();
+
+	// Called once at allocation in the batched path: the device targets arena
+	// (owned by CNet) and the per-position count. Presence of gpu_batch_targets_
+	// switches the forward off the CPU-twin pull.
+	void setBatchTargets(int *dev, int n_pos) {
+		gpu_batch_targets_ = dev;
+		n_pos_ = n_pos;
+	}
+
+	void gpu_seq_ce_forward();
+	void gpu_seq_ce_backward();
+	float readLoss();               // mean over B*positions of -log p_{target}
+
+	virtual void forward() {
+		gpu_seq_ce_forward();
+	}
+	virtual void backward(int label) {
+		gpu_seq_ce_backward();
+	}
 };
 
 class L2Gpu : public GpuMapping {

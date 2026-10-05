@@ -5,6 +5,14 @@
 #include "../utils/stopwatch.h"
 #include "../utils/flags.h"
 
+#ifdef __CUDACC__
+#include <cufft.h>
+#endif
+
+extern bool fast_linear;    // defined in reduce.cpp
+extern bool fft_fast;       // defined in reduce.cpp
+extern bool fast_softmax;   // defined in reduce.cpp
+
 __device__ cmplx_ Fdz(int provider_id, GpuInVar in, int in_indx, GpuOutVar out, int out_indx) {
 	switch (provider_id) {
 		case SOFTMAX_DATA_PROVIDER:
@@ -85,35 +93,30 @@ __global__ void grad_reducing_kernel__(int provider_id, GpuInVar *in, int in_seg
 
     unsigned int tid = threadIdx.x;
 	size_t thread_indx = blockIdx.x * blockDim.x + threadIdx.x;
-	if (thread_indx >= max_no_threads) {
-		return;
-	}
 
 	int out_indx = thread_indx % out_seg_length;
-
-	int map_indx = thread_indx / in_seg_len / out_seg_length;
-	//int init_out_seg_length = 8;//out[map_indx].out_length_;
-
-	// we have max_no_threads = out_seg_length * in_seg_len * no_mappings;
-	// we need to do this as out_seg is the padded initial out segment.
-	if (out_indx >= init_out_seg_length) {
-		sdata[tid] = Grads();
-		return;
-	}
-	__syncthreads();
-
-	int in_indx = (thread_indx / out_seg_length) % in_seg_len;
-
     size_t buff_indx = thread_indx / blockSize;
 
-    auto dLdz = dZ_(out[map_indx], out_indx);
-    auto dLdz_star = dZ_star_(out[map_indx], out_indx);
+	// we have max_no_threads = out_seg_length * in_seg_len * no_mappings;
+	// out_seg_length is the padded initial out segment.
+	// Every lane in the block must reach each __syncthreads() below, so
+	// out-of-range and padding lanes contribute a zero element rather than
+	// returning early: a divergent __syncthreads() is undefined behaviour.
+	if (thread_indx >= max_no_threads || out_indx >= init_out_seg_length) {
+		sdata[tid] = Grads();
+	} else {
+		int map_indx = thread_indx / in_seg_len / out_seg_length;
+		int in_indx = (thread_indx / out_seg_length) % in_seg_len;
 
-    auto dz      =      Fdz(provider_id, in[map_indx], in_indx, out[map_indx], out_indx);
-    auto dz_star = Fdz_star(provider_id, in[map_indx], in_indx, out[map_indx], out_indx);
+		auto dLdz = dZ_(out[map_indx], out_indx);
+		auto dLdz_star = dZ_star_(out[map_indx], out_indx);
 
-    sdata[tid].grad_ = dLdz * dz + dLdz_star * conj_(dz_star);
-    sdata[tid].grad_star_ = dLdz * dz_star + dLdz_star * conj_(dz);
+		auto dz      =      Fdz(provider_id, in[map_indx], in_indx, out[map_indx], out_indx);
+		auto dz_star = Fdz_star(provider_id, in[map_indx], in_indx, out[map_indx], out_indx);
+
+		sdata[tid].grad_ = dLdz * dz + dLdz_star * conj_(dz_star);
+		sdata[tid].grad_star_ = dLdz * dz_star + dLdz_star * conj_(dz);
+	}
 
 //    if (!blockIdx.x) {
 //    	printf("out_l=%03d \t mid=%d \t tid=%03d \t iidx=%03d \t oidx=%03d \t bindx=%03d \t Tid=%03d\t  %f %f \n",
@@ -265,7 +268,96 @@ void grad_kernel_end(int provider_id, Grads *buff, GpuInVar *in, int seg_len, in
 
 }
 
+// ---- O(N) SoftMax backward (fast_softmax) ----
+// A(z)=z/||z||. With P = sum_j dLdz_j z_j and Q = sum_j dLdz*_j conj(z_j),
+// R = (P+Q)/||z||^3, the input gradient is
+//   dz[i]      += dLdz_i/||z||  - 0.5 conj(z_i) R
+//   dz_star[i] += dLdz*_i/||z|| - 0.5 z_i      R
+// replacing the O(N^2) dense Jacobian with two O(N) passes.
+
+// (1) One block per map: reduce P and Q over the N elements.
+__global__ void gpu_softmax_pq__(GpuInVar *in, GpuOutVar *out, cmplx_ *pq, int N, int no_mappings) {
+#ifdef __CUDACC__
+	extern __shared__ cmplx_ sh[];   // [0,bd) = P partials, [bd,2bd) = Q partials
+#else
+	cmplx_ sh[2];
+#endif
+	int map = blockIdx.x;            // uniform across the block
+	if (map >= no_mappings) {
+		return;
+	}
+	int tid = threadIdx.x;
+	cmplx_ p = cmplx(0.f, 0.f), q = cmplx(0.f, 0.f);
+	for (int j = tid; j < N; j += blockDim.x) {
+		cmplx_ zj = Z_(in[map], j);
+		p += dZ_(out[map], j) * zj;
+		q += dZ_star_(out[map], j) * conj_(zj);
+	}
+	sh[tid] = p;
+	sh[blockDim.x + tid] = q;
+	__syncthreads();
+	for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+		if (tid < stride) {
+			sh[tid] += sh[tid + stride];
+			sh[blockDim.x + tid] += sh[blockDim.x + tid + stride];
+		}
+		__syncthreads();
+	}
+	if (tid == 0) {
+		pq[2 * map] = sh[0];
+		pq[2 * map + 1] = sh[blockDim.x];
+	}
+}
+
+// (2) One thread per (map, i): apply the closed-form gradient, accumulated.
+__global__ void gpu_softmax_apply_grad__(GpuInVar *in, GpuOutVar *out, cmplx_ *pq, int N, int no_mappings) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= no_mappings * N) {
+		return;
+	}
+	int map = tid / N;
+	int i = tid % N;
+	float s = sqrtf(out[map].reduce_real_);    // ||z||
+	if (s < 1e-15f) {
+		s = 1e-15f;
+	}
+	float s3 = out[map].reduce_imag_;           // ||z||^3 (floored in forward)
+	cmplx_ R = (pq[2 * map] + pq[2 * map + 1]) / s3;
+	cmplx_ zi = Z_(in[map], i);
+	cmplx_ sum_dz = dZ_(out[map], i) / s - 0.5f * conj_(zi) * R;
+	cmplx_ sum_dz_star = dZ_star_(out[map], i) / s - 0.5f * zi * R;
+	atomicAdd(dZ_real_(in[map], i), sum_dz.real);
+	atomicAdd(dZ_imag_(in[map], i), sum_dz.imag);
+	atomicAdd(dZ_star_real_(in[map], i), sum_dz_star.real);
+	atomicAdd(dZ_star_imag_(in[map], i), sum_dz_star.imag);
+}
+
 void SoftMaxGpu::gpu_soft_max_backward(int label, int block_size) {
+	if (fast_softmax) {
+#ifdef __CUDACC__
+		int N = length();
+		int M = getNoMappings();
+
+		GpuHelper helper;
+		cmplx_ *pq = helper.cmplx_allocate_on_gpu(2 * M);   // P,Q per map
+		assert(pq);
+
+		int pqt = 256;   // power of two for the tree reduction
+		gpu_softmax_pq__ CUDA(M, pqt, 2 * pqt * sizeof(cmplx_))
+				(gpu_in_ptr_, gpu_out_ptr_, pq, N, M);
+		gpuErrchk(cudaPeekAtLastError());
+		gpuErrchk(cudaDeviceSynchronize());
+
+		int total = N * M;
+		int tb = 256;
+		unsigned grid = (total + tb - 1) / tb;
+		gpu_softmax_apply_grad__ CUDA2(grid, tb) (gpu_in_ptr_, gpu_out_ptr_, pq, N, M);
+		gpuErrchk(cudaPeekAtLastError());
+		gpuErrchk(cudaDeviceSynchronize());
+		return;
+#endif
+	}
+
 	int b_out_length = getPaddedOutLength(block_size, this);
 
 	GpuHelper helper;
@@ -273,12 +365,6 @@ void SoftMaxGpu::gpu_soft_max_backward(int label, int block_size) {
 	if (!gpu_buffer) {
 		assert(gpu_buffer);
 	}
-
-	//std::vector<Grads> output(b_out_length);
-	//	helper.cmplx_copy_from_gpu(b_out_length, gpu_buffer, &output[0]);
-	//	for (int var = 0; var < output.size(); ++var) {
-	//		std::cout << std::setfill('0') << std::setw(5) << var << "\t" << output[var] << std::endl;
-	//	}
 
 	grad_reducing_kernel(SOFTMAX_DATA_PROVIDER, gpu_in_ptr_, length(), gpu_out_ptr_, getOutputLength(),
 			gpu_buffer, getNoMappings(), block_size);
@@ -306,7 +392,120 @@ void linear_kernel_end(int provider_id, Grads *buff, GpuInVar *in, int seg_len, 
 
 }
 
+// Optimized Linear backward (used when fast_linear is set).
+//
+// Two direct kernels replace the generic reduce-then-sum path (a tree reduction
+// over rows plus a per-call scratch cudaMalloc):
+//   (1) matrix gradient  grad_W[row][col] = dLdz[row] * vec[col]   (outer product)
+//   (2) vector gradient  grad_v[col] = sum_row dLdz[row] * mat[row][col]  (reduction)
+// They write to disjoint regions of the input gradient buffer and both
+// accumulate with atomicAdd, matching the original semantics exactly.
+
+// (1) Matrix gradient: one thread per matrix entry (map, row, col).
+__global__ void gpu_linear_mat_grad__(GpuInVar *in, GpuOutVar *out,
+		int N, int M, int no_mappings) {
+	size_t tid = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+	size_t total = (size_t) no_mappings * M * N;
+	if (tid >= total) {
+		return;
+	}
+	int col = (int) (tid % N);
+	int row = (int) ((tid / N) % M);
+	int map_indx = (int) (tid / ((size_t) M * N));
+
+	cmplx_ dLdz      = dZ_(out[map_indx], row);
+	cmplx_ dLdz_star = dZ_star_(out[map_indx], row);
+	cmplx_ vec       = Z_(in[map_indx], col);
+
+	int o_index = (row + 1) * N + col;
+	cmplx_ dz      = dLdz * vec;
+	cmplx_ dz_star = dLdz_star * conj_(vec);
+
+	atomicAdd(dZ_real_(in[map_indx], o_index), dz.real);
+	atomicAdd(dZ_imag_(in[map_indx], o_index), dz.imag);
+	atomicAdd(dZ_star_real_(in[map_indx], o_index), dz_star.real);
+	atomicAdd(dZ_star_imag_(in[map_indx], o_index), dz_star.imag);
+}
+
+// (2) Vector gradient: one thread per vector position (map, col); the incoming
+// output gradient (M complex, both dz and dz_star) is cached in shared memory
+// and reused across every column the block computes.
+__global__ void gpu_linear_vec_grad__(GpuInVar *in, GpuOutVar *out,
+		int N, int M, int no_mappings, int blocks_per_map) {
+#ifdef __CUDACC__
+	extern __shared__ cmplx_ sh[];     // [0,M) = dLdz, [M,2M) = dLdz_star
+#else
+	cmplx_ sh[1];   // CPU build never executes device kernels
+#endif
+	// blockIdx.x is uniform across a block, so this early-out is uniform and
+	// can never cause a divergent __syncthreads().
+	int map_indx = blockIdx.x / blocks_per_map;
+	if (map_indx >= no_mappings) {
+		return;
+	}
+
+	for (int r = threadIdx.x; r < M; r += blockDim.x) {
+		sh[r]     = dZ_(out[map_indx], r);
+		sh[M + r] = dZ_star_(out[map_indx], r);
+	}
+	__syncthreads();
+
+	int col = (blockIdx.x % blocks_per_map) * blockDim.x + threadIdx.x;
+	if (col < N) {
+		cmplx_ sum_dz      = cmplx(0.f, 0.f);
+		cmplx_ sum_dz_star = cmplx(0.f, 0.f);
+		for (int r = 0; r < M; ++r) {
+			cmplx_ m = Z_(in[map_indx], (r + 1) * N + col);
+			sum_dz      += sh[r]     * m;
+			sum_dz_star += sh[M + r] * conj_(m);
+		}
+		atomicAdd(dZ_real_(in[map_indx], col), sum_dz.real);
+		atomicAdd(dZ_imag_(in[map_indx], col), sum_dz.imag);
+		atomicAdd(dZ_star_real_(in[map_indx], col), sum_dz_star.real);
+		atomicAdd(dZ_star_imag_(in[map_indx], col), sum_dz_star.imag);
+	}
+}
+
 void LinearGpu::gpu_linear_backward(int label, int block_size) {
+	int N = ((Linear*)getCpuFun()[0])->firstInputLength();   // vector length
+	int M = ((Linear*)getCpuFun()[0])->outSize();            // output rows
+	int no_mappings = getNoMappings();
+
+	// The direct kernels beat the generic reduction when there are few output
+	// rows M (the reduction then wastes most of each 512-wide block on padding).
+	// For large M the reduction's row-parallelism wins, so fall back to it.
+	size_t shmem = (size_t) 2 * M * sizeof(cmplx_);          // dLdz + dLdz_star
+	if (fast_linear && M <= 256 && shmem <= 48u * 1024u) {
+		// (1) matrix gradient: one thread per matrix entry.
+		size_t total = (size_t) no_mappings * M * N;
+		int mt = 256;
+		unsigned mgrid = (unsigned) ((total + mt - 1) / mt);
+		gpu_linear_mat_grad__ CUDA2(mgrid, mt)
+				(gpu_in_ptr_, gpu_out_ptr_, N, M, no_mappings);
+#ifdef __CUDACC__
+		gpuErrchk(cudaPeekAtLastError());
+		gpuErrchk(cudaDeviceSynchronize());
+#endif
+		// (2) vector gradient: one thread per column, output grad cached in shared.
+		int vt = 128;
+		if (vt > N) {
+			vt = N;
+		}
+		if (vt < 1) {
+			vt = 1;
+		}
+		int blocks_per_map = (N + vt - 1) / vt;
+		unsigned vgrid = (unsigned) no_mappings * blocks_per_map;
+		gpu_linear_vec_grad__ CUDA(vgrid, vt, shmem)
+				(gpu_in_ptr_, gpu_out_ptr_, N, M, no_mappings, blocks_per_map);
+#ifdef __CUDACC__
+		gpuErrchk(cudaPeekAtLastError());
+		gpuErrchk(cudaDeviceSynchronize());
+#endif
+		return;
+	}
+
+	// Fallback: the original reduce-then-sum path.
 	int b_out_length = getPaddedOutLength(block_size, this);
 
 	GpuHelper helper;
@@ -321,7 +520,163 @@ void LinearGpu::gpu_linear_backward(int label, int block_size) {
 	linear_kernel_end(LINEAR_DATA_PROVIDER, gpu_buffer, gpu_in_ptr_, seg_len, getOutputLength(), getNoMappings(), block_size);
 }
 
+// ======== TokenwiseLinear backward (direct kernels).
+// weight gradient: one thread per (token, out, in) entry, accumulated across
+// tokens into the shared weight (hence atomicAdd). data gradient: one thread per
+// (token, in) element, summing over the out dimension.
+
+__global__ void gpu_tokenwise_mat_grad__(GpuInVar *in, GpuOutVar *out,
+		int n_tokens, int e_in, int e_out, int no_mappings) {
+	size_t tid = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+	size_t per_map = (size_t) n_tokens * e_out * e_in;
+	if (tid >= (size_t) no_mappings * per_map) {
+		return;
+	}
+	int map_indx = (int) (tid / per_map);
+	size_t rem = tid % per_map;
+	int t = (int) (rem / ((size_t) e_out * e_in));
+	int rc = (int) (rem % ((size_t) e_out * e_in));
+	int r = rc / e_in;
+	int c = rc % e_in;
+	int w_base = n_tokens * e_in;
+
+	cmplx_ dLdz      = dZ_(out[map_indx], t * e_out + r);
+	cmplx_ dLdz_star = dZ_star_(out[map_indx], t * e_out + r);
+	cmplx_ d = Z_(in[map_indx], t * e_in + c);
+
+	int w_index = w_base + r * e_in + c;
+	cmplx_ dz      = dLdz * d;
+	cmplx_ dz_star = dLdz_star * conj_(d);
+	atomicAdd(dZ_real_(in[map_indx], w_index), dz.real);
+	atomicAdd(dZ_imag_(in[map_indx], w_index), dz.imag);
+	atomicAdd(dZ_star_real_(in[map_indx], w_index), dz_star.real);
+	atomicAdd(dZ_star_imag_(in[map_indx], w_index), dz_star.imag);
+}
+
+__global__ void gpu_tokenwise_vec_grad__(GpuInVar *in, GpuOutVar *out,
+		int n_tokens, int e_in, int e_out, int no_mappings) {
+	size_t tid = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+	size_t per_map = (size_t) n_tokens * e_in;
+	if (tid >= (size_t) no_mappings * per_map) {
+		return;
+	}
+	int map_indx = (int) (tid / per_map);
+	int dc = (int) (tid % per_map);
+	int t = dc / e_in;
+	int c = dc % e_in;
+	int w_base = n_tokens * e_in;
+
+	cmplx_ sum_dz      = cmplx(0.f, 0.f);
+	cmplx_ sum_dz_star = cmplx(0.f, 0.f);
+	for (int r = 0; r < e_out; ++r) {
+		cmplx_ dLdz      = dZ_(out[map_indx], t * e_out + r);
+		cmplx_ dLdz_star = dZ_star_(out[map_indx], t * e_out + r);
+		cmplx_ w = Z_(in[map_indx], w_base + r * e_in + c);
+		sum_dz      += dLdz * w;
+		sum_dz_star += dLdz_star * conj_(w);
+	}
+	int d_index = t * e_in + c;
+	atomicAdd(dZ_real_(in[map_indx], d_index), sum_dz.real);
+	atomicAdd(dZ_imag_(in[map_indx], d_index), sum_dz.imag);
+	atomicAdd(dZ_star_real_(in[map_indx], d_index), sum_dz_star.real);
+	atomicAdd(dZ_star_imag_(in[map_indx], d_index), sum_dz_star.imag);
+}
+
+void TokenwiseLinearGpu::gpu_tokenwise_backward() {
+	TokenwiseLinear *cpu = (TokenwiseLinear*) getCpuFun()[0];
+	int n_tokens = cpu->nTokens();
+	int e_in = cpu->inDim();
+	int e_out = cpu->outDim();
+	int no_mappings = getNoMappings();
+
+	size_t mtot = (size_t) no_mappings * n_tokens * e_out * e_in;
+	int mt = 256;
+	unsigned mgrid = (unsigned) ((mtot + mt - 1) / mt);
+	gpu_tokenwise_mat_grad__ CUDA2(mgrid, mt)
+			(gpu_in_ptr_, gpu_out_ptr_, n_tokens, e_in, e_out, no_mappings);
+#ifdef __CUDACC__
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+#endif
+
+	size_t vtot = (size_t) no_mappings * n_tokens * e_in;
+	int vt = 256;
+	unsigned vgrid = (unsigned) ((vtot + vt - 1) / vt);
+	gpu_tokenwise_vec_grad__ CUDA2(vgrid, vt)
+			(gpu_in_ptr_, gpu_out_ptr_, n_tokens, e_in, e_out, no_mappings);
+#ifdef __CUDACC__
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+#endif
+}
+
+// ---- cuFFT fast path for FourierTrans (backward) ----
+// The FFT is a unitary linear map, so its Wirtinger adjoint is itself an FFT:
+//   dz[q]      += (1/sqrt N) sum_p dLdz[p]      e^{-i 2pi pq/N} = FFT_forward(dLdz)/sqrt N
+//   dz_star[q] += (1/sqrt N) sum_p dLdz_star[p] e^{+i 2pi pq/N} = FFT_inverse(dLdz_star)/sqrt N
+// so the backward is a forward transform of the incoming dz and an inverse
+// transform of the incoming dz_star, each scaled and accumulated.
+
+// gather output gradient (dz, or dz_star when use_star) -> interleaved buffer.
+__global__ void gpu_fft_gather_grad__(GpuOutVar *out, cmplx_ *buf, int N, int no_mappings, int use_star) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= no_mappings * N) {
+		return;
+	}
+	int map = tid / N;
+	int k = tid % N;
+	buf[tid] = use_star ? dZ_star_(out[map], k) : dZ_(out[map], k);
+}
+
+// scatter transformed gradient -> accumulate into the input dz / dz_star, scaled.
+__global__ void gpu_fft_scatter_grad__(cmplx_ *buf, GpuInVar *in, int N, int no_mappings,
+		float scale, int use_star) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= no_mappings * N) {
+		return;
+	}
+	int map = tid / N;
+	int k = tid % N;
+	cmplx_ v = buf[tid];
+	if (use_star) {
+		atomicAdd(dZ_star_real_(in[map], k), v.real * scale);
+		atomicAdd(dZ_star_imag_(in[map], k), v.imag * scale);
+	} else {
+		atomicAdd(dZ_real_(in[map], k), v.real * scale);
+		atomicAdd(dZ_imag_(in[map], k), v.imag * scale);
+	}
+}
+
 void FourierGpu::gpu_fft_backward(int label, int block_size) {
+	if (fft_fast) {
+#ifdef __CUDACC__
+		int N = length();
+		int M = getNoMappings();
+		ensure_fft_plan(N, M);
+
+		int total = N * M;
+		int tb = 256;
+		unsigned grid = (total + tb - 1) / tb;
+		float scale = 1.0f / sqrtf((float) N);
+
+		// dz += FFT_forward(dLdz) / sqrt(N)
+		gpu_fft_gather_grad__ CUDA2(grid, tb) (gpu_out_ptr_, fft_buf_, N, M, 0);
+		cufftExecC2C((cufftHandle) fft_plan_, (cufftComplex*) fft_buf_,
+				(cufftComplex*) fft_buf_, CUFFT_FORWARD);
+		gpu_fft_scatter_grad__ CUDA2(grid, tb) (fft_buf_, gpu_in_ptr_, N, M, scale, 0);
+
+		// dz_star += FFT_inverse(dLdz_star) / sqrt(N)
+		gpu_fft_gather_grad__ CUDA2(grid, tb) (gpu_out_ptr_, fft_buf_, N, M, 1);
+		cufftExecC2C((cufftHandle) fft_plan_, (cufftComplex*) fft_buf_,
+				(cufftComplex*) fft_buf_, CUFFT_INVERSE);
+		gpu_fft_scatter_grad__ CUDA2(grid, tb) (fft_buf_, gpu_in_ptr_, N, M, scale, 1);
+
+		gpuErrchk(cudaPeekAtLastError());
+		gpuErrchk(cudaDeviceSynchronize());
+		return;
+#endif
+	}
+
 	int b_out_length = getPaddedOutLength(block_size, this);
 
 	GpuHelper helper;
@@ -333,6 +688,42 @@ void FourierGpu::gpu_fft_backward(int label, int block_size) {
 	grad_reducing_kernel(FFT_DATA_PROVIDER, gpu_in_ptr_, length(), gpu_out_ptr_, getOutputLength(),
 			gpu_buffer, getNoMappings(), block_size);
 	grad_kernel_end(SOFTMAX_DATA_PROVIDER, gpu_buffer, gpu_in_ptr_, length(), getNoMappings(), block_size);
+}
+
+// Inverse DFT backward: the adjoint of the inverse map is the forward unitary
+// DFT, i.e. FourierGpu::gpu_fft_backward with the two cuFFT directions swapped:
+//   dz      += FFT_inverse(dLdz)      / sqrt(N)
+//   dz_star += FFT_forward(dLdz_star) / sqrt(N)
+void InverseFourierGpu::gpu_ifft_backward(int label, int block_size) {
+	if (fft_fast) {
+#ifdef __CUDACC__
+		int N = length();
+		int M = getNoMappings();
+		ensure_fft_plan(N, M);
+
+		int total = N * M;
+		int tb = 256;
+		unsigned grid = (total + tb - 1) / tb;
+		float scale = 1.0f / sqrtf((float) N);
+
+		// dz += FFT_inverse(dLdz) / sqrt(N)
+		gpu_fft_gather_grad__ CUDA2(grid, tb) (gpu_out_ptr_, fft_buf_, N, M, 0);
+		cufftExecC2C((cufftHandle) fft_plan_, (cufftComplex*) fft_buf_,
+				(cufftComplex*) fft_buf_, CUFFT_INVERSE);
+		gpu_fft_scatter_grad__ CUDA2(grid, tb) (fft_buf_, gpu_in_ptr_, N, M, scale, 0);
+
+		// dz_star += FFT_forward(dLdz_star) / sqrt(N)
+		gpu_fft_gather_grad__ CUDA2(grid, tb) (gpu_out_ptr_, fft_buf_, N, M, 1);
+		cufftExecC2C((cufftHandle) fft_plan_, (cufftComplex*) fft_buf_,
+				(cufftComplex*) fft_buf_, CUFFT_FORWARD);
+		gpu_fft_scatter_grad__ CUDA2(grid, tb) (fft_buf_, gpu_in_ptr_, N, M, scale, 1);
+
+		gpuErrchk(cudaPeekAtLastError());
+		gpuErrchk(cudaDeviceSynchronize());
+		return;
+#endif
+	}
+	assert(fft_fast && "InverseFourierGpu requires -fft_fast true");
 }
 
 void TrianFourierGpu::gpu_T_fft_backward(int label, int block_size) {

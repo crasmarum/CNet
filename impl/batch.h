@@ -42,7 +42,7 @@ public:
 	}
 
 	float loss(int indx) {
-		assert(0 <= indx <= batch_size_);
+		assert(0 <= indx && indx <= batch_size_);
 		return losses_[indx];
 	}
 
@@ -56,7 +56,7 @@ public:
 	}
 
 	int label(int indx) {
-		assert(0 <= indx <= batch_size_);
+		assert(0 <= indx && indx <= batch_size_);
 		return labels_[indx];
 	}
 };
@@ -98,8 +98,21 @@ const int* tokensPtr() const {
 	return &token_[0];
 }
 
+// Per-position targets for an autoregressive head: append one n_pos-sized target
+// vector per sample, contiguously (sample b occupies [b*n_pos, (b+1)*n_pos)).
+std::vector<int> ptargets_;
+void addTargets(const std::vector<int>& t) {
+	ptargets_.insert(ptargets_.end(), t.begin(), t.end());
+}
+const int* pTargetsPtr() const {
+	return &ptargets_[0];
+}
+int noPTargets() const {
+	return (int) ptargets_.size();
+}
+
 std::vector<int> batch(int indx) {
-	assert(0 <= indx <= batch_size_);
+	assert(0 <= indx && indx <= batch_size_);
 	std::vector<int> ret(token_.begin() + indx * sample_dim_,
 			token_.begin() + indx * sample_dim_ + sizes_[indx]);
 	return ret;
@@ -169,14 +182,14 @@ public:
 	}
 
 	std::vector<float> realData(int indx) {
-		assert(0 <= indx <= batch_size_);
+		assert(0 <= indx && indx <= batch_size_);
 		std::vector<float> ret(real_data_.begin() + indx * sample_dim_,
 				real_data_.begin() + (indx + 1) * sample_dim_);
 		return ret;
 	}
 
 	std::vector<float> imagData(int indx) {
-		assert(0 <= indx <= batch_size_);
+		assert(0 <= indx && indx <= batch_size_);
 		std::vector<float> ret(imag_data_.begin() + indx * sample_dim_,
 				imag_data_.begin() + (indx + 1) * sample_dim_);
 		return ret;

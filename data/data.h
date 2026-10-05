@@ -165,4 +165,72 @@ public:
 };
 
 
+FLAG_STRING(radioml_train, "radioml_train.bin")
+FLAG_STRING(radioml_test, "radioml_test.bin")
+
+// Reads the synthetic RadioML-style IQ binary written by gen_radioml.py:
+//   int32 magic=0x524D4C31, N, L, C, then N records of {int32 label, 2L float32
+//   interleaved I,Q}. Each example becomes a length-L complex vector (real=I,
+//   imag=Q). seq_len / n_classes are discovered from the header.
+class RadioMLDataReader : public BatchedDataReader {
+	std::ifstream in_;
+	int count_ = 0;
+	int seq_len_ = 0;
+	int n_classes_ = 0;
+
+public:
+	RadioMLDataReader() : BatchedDataReader(0) {}
+
+	int numClasses() { return n_classes_; }
+	int seqLen() { return seq_len_; }
+
+	bool Open(std::string path) {
+		in_.open(path.c_str(), std::ios::in | std::ios::binary);
+		if (in_.fail()) {
+			L_(lError) << "Cannot open " << path;
+			return false;
+		}
+		int32_t magic = 0;
+		if (!in_.read((char*) &magic, sizeof(int32_t))
+				|| !in_.read((char*) &count_, sizeof(int32_t))
+				|| !in_.read((char*) &seq_len_, sizeof(int32_t))
+				|| !in_.read((char*) &n_classes_, sizeof(int32_t))) {
+			L_(lError) << "Cannot read header from " << path;
+			return false;
+		}
+		if (magic != 0x524D4C31) {
+			L_(lError) << "Bad magic in " << path;
+			return false;
+		}
+		sample_dim_ = seq_len_;
+		return true;
+	}
+
+	virtual bool readData() override {
+		std::vector<float> buf(2 * seq_len_);
+		for (int i = 0; i < count_; ++i) {
+			int32_t label = 0;
+			if (!in_.read((char*) &label, sizeof(int32_t))) {
+				return false;
+			}
+			if (!in_.read((char*) buf.data(), 2 * seq_len_ * sizeof(float))) {
+				return false;
+			}
+			std::vector<std::complex<float> > sample(seq_len_);
+			for (int k = 0; k < seq_len_; ++k) {
+				sample[k] = { buf[2 * k], buf[2 * k + 1] };
+			}
+			add(sample, label);
+		}
+		L_(lInfo) << "read: " << count_ << " RadioML examples (L=" << seq_len_
+				  << ", C=" << n_classes_ << ")";
+		return true;
+	}
+
+	virtual ~RadioMLDataReader() {
+		in_.close();
+	}
+};
+
+
 #endif /* TESTS_DATA_H_ */

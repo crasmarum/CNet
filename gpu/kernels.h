@@ -76,6 +76,9 @@ void gpu_update_input(CFunc *func, float l_rate);
 
 void gpu_update_adam_input(CFunc *func, float l_rate, float beta, int t);
 
+void gpu_update_true_adam_input(CFunc *func, float l_rate, float beta1,
+		float beta2, float eps, int t, float grad_clip = 0.0f);
+
 void gpu_copy_to_clones(GpuCloneVar *in, int no_ancestors, int max_input_len);
 
 void gpu_grad_from_clones(GpuCloneVar *in, int no_ancestors, int max_input_len);
@@ -114,6 +117,16 @@ __host__ __device__ inline float* dZ_star_imag_ (GpuInVar in, int pos) {
 
 __host__ __device__ inline cmplx_ dZ_star_(GpuInVar in, int pos) {
 	return {*dZ_star_real_(in, pos), *dZ_star_imag_(in, pos)};
+}
+
+// Adam second moment v (segments 6,7). The first moment reuses the dz slots
+// (2,3) via momentum_real_/imag_ above.
+__host__ __device__ inline float* v_real_ (GpuInVar in, int pos) {
+	return in.input_ptr_ + 6 * in.input_length_ + pos;
+}
+
+__host__ __device__ inline float* v_imag_ (GpuInVar in, int pos) {
+	return in.input_ptr_ + 7 * in.input_length_ + pos;
 }
 
 __host__ __device__ inline float* Z_real_ (GpuOutVar out, int pos) {
@@ -228,6 +241,34 @@ public:
 };
 
 
+// GPU counterpart of the CPU Pad layer (impl/pad.h): scatters `length()` free
+// kernel taps into an `getOutputLength()`-long zero vector at the fixed index
+// set kernel_index_, then gathers gradients back.  gpu_kernel_index_ is a device
+// copy of the CPU kernel_index_, uploaded once in GpuFunc::allocatePadKernelIndex().
+class PadGpu : public GpuMapping {
+public:
+	int *gpu_kernel_index_ = 0;   // device int array, length == length()
+
+	PadGpu(int depth) : GpuMapping(depth) {
+	}
+
+	virtual ~PadGpu() {
+	}
+
+	void gpu_pad_forward();
+
+	virtual void forward() {
+		gpu_pad_forward();
+	}
+
+	void gpu_pad_backward(int label);
+
+	virtual void backward(int label) {
+		gpu_pad_backward(label);
+	}
+};
+
+
 class ResidualGpu : public GpuMapping {
 
 public:
@@ -269,6 +310,78 @@ public:
 
 	virtual void backward(int label) {
 		gpu_gelu_backward();
+	}
+};
+
+// GPU |z|^2 magnitude nonlinearity (see CModulus2 in impl/relu.h).
+class CModulus2Gpu : public GpuMapping {
+
+public:
+	CModulus2Gpu(int depth) : GpuMapping(depth) {
+	}
+
+	virtual ~CModulus2Gpu() {
+	}
+
+	void gpu_modulus2_forward();
+
+	virtual void forward() {
+		gpu_modulus2_forward();
+	}
+
+	void gpu_modulus2_backward();
+
+	virtual void backward(int label) {
+		gpu_modulus2_backward();
+	}
+};
+
+// GPU mean pooling over time (see MeanPool in impl/pool.h). width = L / P where
+// L = length() (input length) and P = getOutputLength() (number of bins).
+class MeanPoolGpu : public GpuMapping {
+
+public:
+	MeanPoolGpu(int depth) : GpuMapping(depth) {
+	}
+
+	virtual ~MeanPoolGpu() {
+	}
+
+	void gpu_meanpool_forward();
+
+	virtual void forward() {
+		gpu_meanpool_forward();
+	}
+
+	void gpu_meanpool_backward();
+
+	virtual void backward(int label) {
+		gpu_meanpool_backward();
+	}
+};
+
+// GPU holomorphic power w = z^M (see CPower in impl/relu.h). The exponent is a
+// per-layer constant passed at construction.
+class CPowerGpu : public GpuMapping {
+	int power_;
+
+public:
+	CPowerGpu(int depth, int power) : GpuMapping(depth), power_(power) {
+	}
+
+	virtual ~CPowerGpu() {
+	}
+
+	void gpu_power_forward();
+
+	virtual void forward() {
+		gpu_power_forward();
+	}
+
+	void gpu_power_backward();
+
+	virtual void backward(int label) {
+		gpu_power_backward();
 	}
 };
 

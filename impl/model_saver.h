@@ -481,48 +481,12 @@ private:
 
 private:
 	bool WriteLayer(CFunc *layer, BinaryWriter &writer) {
-		if (CInput *input = dynamic_cast<CInput*>(layer)) {
-			return Write(input, writer);
-		}
-		if (Hadamard *hadm = dynamic_cast<Hadamard*>(layer)) {
-			return Write(hadm, writer);
-		}
-		if (Linear *linear = dynamic_cast<Linear*>(layer)) {
-			return Write(linear, writer);
-		}
-		if (CEmbedding *emb = dynamic_cast<CEmbedding*>(layer)) {
-			return Write(emb, writer);
-		}
-		if (FourierTrans *four = dynamic_cast<FourierTrans*>(layer)) {
-			return Write(four, writer);
-		}
-		if (TriangFourier *tfour = dynamic_cast<TriangFourier*>(layer)) {
-			return Write(tfour, writer);
-		}
-		if (Residual *four = dynamic_cast<Residual*>(layer)) {
-			return Write(four, writer);
-		}
-
-		if (CrossEntropy *out = dynamic_cast<CrossEntropy*>(layer)) {
-			return Write(out, writer);
-		}
-
-		if (L2Out *out = dynamic_cast<L2Out*>(layer)) {
-			return Write(out, writer);
-		}
-
-		if (SoftMax *out = dynamic_cast<SoftMax*>(layer)) {
-			return Write(out, writer);
-		}
-
-		if (CRelu *out = dynamic_cast<CRelu*>(layer)) {
-			return Write(out, writer);
-		}
-
-		if (CGelu *out = dynamic_cast<CGelu*>(layer)) {
-			return Write(out, writer);
-		}
-
+		// Dispatch generated from the single layer registry (see CNET_LAYER_TABLE).
+		// Write(...) is overloaded per layer type, so the exact byte format each
+		// layer emits is unchanged.
+		#define X(C, ID, R) if (C *p = dynamic_cast<C*>(layer)) return Write(p, writer);
+		CNET_LAYER_TABLE(X)
+		#undef X
 		L_(lError) << "Cannot save " << layer->getName();
 		return false;
 	}
@@ -623,6 +587,32 @@ private:
 		return true;
 	}
 
+	bool Write(TokenwiseLinear *tw, BinaryWriter &writer) {
+		writer.write_int32(isTokenwise);
+		writeFuncInfo(writer, tw);
+
+		writer.write_int32(tw->n_tokens_);
+		writer.write_int32(tw->e_in_);
+		writer.write_int32(tw->e_out_);
+
+		return true;
+	}
+
+	bool RestoreTokenwise(ComplexNet &net, BinaryReader &reader) {
+		L_(lDebug) << "RestoreTokenwise";
+		std::vector<int> prev;
+		readFuncInfo(reader, prev);
+
+		int n_tokens = 0, e_in = 0, e_out = 0;
+		assert(reader.read_int32(&n_tokens));
+		assert(reader.read_int32(&e_in));
+		assert(reader.read_int32(&e_out));
+
+		net.add(new TokenwiseLinear(Uid(uid), n_tokens, e_in, e_out), prev);
+
+		return true;
+	}
+
 	bool Write(CRelu *crelu, BinaryWriter &writer) {
 		writer.write_int32(isCrelu);
 
@@ -655,6 +645,22 @@ private:
 		readFuncInfo(reader, prev);
 
 		net.add(new CGelu(Uid(uid), InSize(out_size)), prev);
+
+		return true;
+	}
+
+	bool Write(CModulus2 *mod, BinaryWriter &writer) {
+		writer.write_int32(isModulus2);
+		writeFuncInfo(writer, mod);
+		return true;
+	}
+
+	bool RestoreModulus2(ComplexNet &net, BinaryReader &reader) {
+		L_(lDebug) <<  "RestoreModulus2";
+		std::vector<int> prev;
+		readFuncInfo(reader, prev);
+
+		net.add(new CModulus2(Uid(uid), InSize(out_size)), prev);
 
 		return true;
 	}
@@ -709,6 +715,21 @@ private:
 		return true;
 	}
 
+	bool Write(InverseFourierTrans *cInp, BinaryWriter &writer) {
+		writer.write_int32(isInverseFourier);
+		writeFuncInfo(writer, cInp);
+		return true;
+	}
+
+	bool RestoreInverseFourier(ComplexNet &net, BinaryReader &reader) {
+		L_(lDebug) <<  "RestoreInverseFourier";
+		std::vector<int> prev;
+		readFuncInfo(reader, prev);
+
+		net.add(new InverseFourierTrans(Uid(uid), InSize(in_size)), prev);
+		return true;
+	}
+
 	bool Write(TriangFourier *cInp, BinaryWriter &writer) {
 		writer.write_int32(isTrianFourier);
 		writeFuncInfo(writer, cInp);
@@ -723,6 +744,69 @@ private:
 		readFuncInfo(reader, prev);
 
 		net.add(new TriangFourier(Uid(uid), InSize(in_size)), prev);
+		return true;
+	}
+
+	bool Write(Pad *pad, BinaryWriter &writer) {
+		writer.write_int32(isPad);
+		writeFuncInfo(writer, pad);
+		// The kernel index set is structural (not learnable) but defines the
+		// layer, so it must be persisted.
+		const std::vector<int> &kidx = pad->kernel_index();
+		writer.write_int32((int) kidx.size());
+		for (int i = 0; i < (int) kidx.size(); ++i) {
+			writer.write_int32(kidx[i]);
+		}
+		return true;
+	}
+
+	bool RestorePad(ComplexNet &net, BinaryReader &reader) {
+		L_(lDebug) << "RestorePad";
+		std::vector<int> prev;
+		readFuncInfo(reader, prev);
+
+		int k_len = 0;
+		assert(reader.read_int32(&k_len));
+		std::vector<int> kidx(k_len);
+		for (int i = 0; i < k_len; ++i) {
+			int v = 0;
+			assert(reader.read_int32(&v));
+			kidx[i] = v;
+		}
+
+		net.add(new Pad(Uid(uid), InSize(in_size), OutSize(out_size), kidx), prev);
+		return true;
+	}
+
+	bool Write(MeanPool *pool, BinaryWriter &writer) {
+		writer.write_int32(isMeanPool);
+		writeFuncInfo(writer, pool);   // in_size / out_size carry the pool factor
+		return true;
+	}
+
+	bool RestoreMeanPool(ComplexNet &net, BinaryReader &reader) {
+		L_(lDebug) << "RestoreMeanPool";
+		std::vector<int> prev;
+		readFuncInfo(reader, prev);
+
+		net.add(new MeanPool(Uid(uid), InSize(in_size), OutSize(out_size)), prev);
+		return true;
+	}
+
+	bool Write(CPower *pw, BinaryWriter &writer) {
+		writer.write_int32(isPower);
+		writeFuncInfo(writer, pw);
+		writer.write_int32(pw->power());   // the exponent defines the layer
+		return true;
+	}
+
+	bool RestorePower(ComplexNet &net, BinaryReader &reader) {
+		L_(lDebug) << "RestorePower";
+		std::vector<int> prev;
+		readFuncInfo(reader, prev);
+		int power = 0;
+		assert(reader.read_int32(&power));
+		net.add(new CPower(Uid(uid), InSize(in_size), power), prev);
 		return true;
 	}
 
@@ -757,6 +841,23 @@ private:
 		readFuncInfo(reader, prev);
 
 		net.add(new CrossEntropy(Uid(uid), InSize(in_size)), prev);
+		return true;
+	}
+
+	bool Write(SequenceCrossEntropy *sce, BinaryWriter &writer) {
+		writer.write_int32(isSeqCrossEntropy);
+		writeFuncInfo(writer, sce);
+		writer.write_int32(sce->vocab());
+		return true;
+	}
+	bool RestoreSequenceCrossEntropy(ComplexNet &net, BinaryReader &reader) {
+		L_(lDebug) << "RestoreSequenceCrossEntropy";
+		std::vector<int> prev;
+		readFuncInfo(reader, prev);
+
+		int vocab = 0;
+		assert(reader.read_int32(&vocab));
+		net.add(new SequenceCrossEntropy(Uid(uid), InSize(in_size), vocab), prev);
 		return true;
 	}
 
@@ -856,43 +957,10 @@ public:
 			return false;
 		}
 		while (reader.read_int32(&current)) {
-			if (current == isHadamard && RestoreHadamard(net, reader)) {
-				continue;
-			}
-			if (current == isInput && RestoreInput(net, reader)) {
-				continue;
-			}
-			if (current == isEmbedding && RestoreEmbedding(net, reader)) {
-				continue;
-			}
-			if (current == isLinear && RestoreLinear(net, reader)) {
-				continue;
-			}
-			if (current == isFourier && RestoreFourierTrans(net, reader)) {
-				continue;
-			}
-			if (current == isTrianFourier && RestoreTriangFourier(net, reader)) {
-				continue;
-			}
-			if (current == isResidual && RestoreResidual(net, reader)) {
-				continue;
-			}
-			if (current == isSoftMax && RestoreSoftMax(net, reader)) {
-				continue;
-			}
-			if (current == isCrossEntropy && RestoreCrossEntropy(net, reader)) {
-				continue;
-			}
-			if (current == isL2Out && RestoreL2Out(net, reader)) {
-				continue;
-			}
-			if (current == isCrelu && RestoreRelu(net, reader)) {
-				continue;
-			}
-
-			if (current == isGelu && RestoreGelu(net, reader)) {
-				continue;
-			}
+			// Dispatch generated from the single layer registry (CNET_LAYER_TABLE).
+			#define X(C, ID, R) if (current == ID && R(net, reader)) continue;
+			CNET_LAYER_TABLE(X)
+			#undef X
 
 			L_(lError) << "Cannot restore layer of ID: " << current;
 			return false;
@@ -919,43 +987,10 @@ public:
 			return false;
 		}
 		while (reader.read_int32(&current)) {
-			if (current == isHadamard && RestoreHadamard(net, reader)) {
-				continue;
-			}
-			if (current == isInput && RestoreInput(net, reader)) {
-				continue;
-			}
-			if (current == isEmbedding && RestoreEmbedding(net, reader)) {
-				continue;
-			}
-			if (current == isLinear && RestoreLinear(net, reader)) {
-				continue;
-			}
-			if (current == isFourier && RestoreFourierTrans(net, reader)) {
-				continue;
-			}
-			if (current == isTrianFourier && RestoreTriangFourier(net, reader)) {
-				continue;
-			}
-			if (current == isResidual && RestoreResidual(net, reader)) {
-				continue;
-			}
-			if (current == isSoftMax && RestoreSoftMax(net, reader)) {
-				continue;
-			}
-			if (current == isCrossEntropy && RestoreCrossEntropy(net, reader)) {
-				continue;
-			}
-			if (current == isL2Out && RestoreL2Out(net, reader)) {
-				continue;
-			}
-			if (current == isCrelu && RestoreRelu(net, reader)) {
-				continue;
-			}
-
-			if (current == isGelu && RestoreGelu(net, reader)) {
-				continue;
-			}
+			// Dispatch generated from the single layer registry (CNET_LAYER_TABLE).
+			#define X(C, ID, R) if (current == ID && R(net, reader)) continue;
+			CNET_LAYER_TABLE(X)
+			#undef X
 
 			reader.close();
 			L_(lError) << "Cannot restore layer of ID: " << current;

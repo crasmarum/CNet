@@ -26,6 +26,10 @@
 #include "relu.h"
 #include "hadamard.h"
 #include "softmax.h"
+#include "pad.h"
+#include "pool.h"
+#include "tokenwise.h"
+#include "seqcrossent.h"
 #include "l2out.h"
 
 const int isHadamard = 1;
@@ -40,8 +44,43 @@ const int isCrelu = 9;
 const int isGelu = 10;
 const int isL2Out = 11;
 const int isTrianFourier = 12;
+const int isPad = 13;
+const int isInverseFourier = 14;
+const int isModulus2 = 15;
+const int isMeanPool = 16;
+const int isPower = 17;
+const int isTokenwise = 18;
+const int isSeqCrossEntropy = 19;
 
 const int isUnknown = INT_MAX;
+
+// Single layer registry. One X-macro entry per layer type drives type-id lookup
+// (getType), serialization dispatch (WriteLayer), and both restore loops, so a
+// new layer is registered in exactly one place. Columns: (Class, type-id const,
+// ModelSaver::Restore* method). The int ids and on-disk byte format are
+// unchanged; dispatch order is irrelevant here because no layer type derives
+// from another (all are direct CFunc subclasses) -- InverseFourierTrans is still
+// listed before FourierTrans defensively.
+#define CNET_LAYER_TABLE(X)                                      \
+	X(CInput,              isInput,          RestoreInput)        \
+	X(Hadamard,            isHadamard,       RestoreHadamard)     \
+	X(Linear,              isLinear,         RestoreLinear)       \
+	X(TokenwiseLinear,     isTokenwise,      RestoreTokenwise)    \
+	X(CEmbedding,          isEmbedding,      RestoreEmbedding)    \
+	X(InverseFourierTrans, isInverseFourier, RestoreInverseFourier) \
+	X(FourierTrans,        isFourier,        RestoreFourierTrans) \
+	X(TriangFourier,       isTrianFourier,   RestoreTriangFourier) \
+	X(Pad,                 isPad,            RestorePad)          \
+	X(MeanPool,            isMeanPool,       RestoreMeanPool)     \
+	X(Residual,            isResidual,       RestoreResidual)     \
+	X(CrossEntropy,        isCrossEntropy,   RestoreCrossEntropy) \
+	X(L2Out,               isL2Out,          RestoreL2Out)        \
+	X(SoftMax,             isSoftMax,        RestoreSoftMax)      \
+	X(CRelu,               isCrelu,          RestoreRelu)         \
+	X(CGelu,               isGelu,           RestoreGelu)         \
+	X(CModulus2,           isModulus2,       RestoreModulus2)     \
+	X(CPower,              isPower,          RestorePower)         \
+	X(SequenceCrossEntropy, isSeqCrossEntropy, RestoreSequenceCrossEntropy)
 
 
 /*
@@ -107,48 +146,10 @@ public:
 	}
 
 	static int getType(CFunc *func) {
-		if (CInput *input = dynamic_cast<CInput*>(func)) {
-			return isInput;
-		}
-		if (Hadamard *hadm = dynamic_cast<Hadamard*>(func)) {
-			return isHadamard;
-		}
-		if (Linear *linear = dynamic_cast<Linear*>(func)) {
-			return isLinear;
-		}
-		if (CEmbedding *emb = dynamic_cast<CEmbedding*>(func)) {
-			return isEmbedding;
-		}
-		if (FourierTrans *four = dynamic_cast<FourierTrans*>(func)) {
-			return isFourier;
-		}
-		if (TriangFourier *tfour = dynamic_cast<TriangFourier*>(func)) {
-			return isTrianFourier;
-		}
-		if (Residual *four = dynamic_cast<Residual*>(func)) {
-			return isResidual;
-		}
-
-		if (CrossEntropy *out = dynamic_cast<CrossEntropy*>(func)) {
-			return isCrossEntropy;
-		}
-
-		if (SoftMax *out = dynamic_cast<SoftMax*>(func)) {
-			return isSoftMax;
-		}
-
-		if (CRelu *out = dynamic_cast<CRelu*>(func)) {
-			return isCrelu;
-		}
-
-		if (CGelu *out = dynamic_cast<CGelu*>(func)) {
-			return isGelu;
-		}
-
-		if (L2Out *out = dynamic_cast<L2Out*>(func)) {
-			return isL2Out;
-		}
-
+		// Dispatch generated from the single layer registry (see CNET_LAYER_TABLE).
+		#define X(C, ID, R) if (dynamic_cast<C*>(func)) return ID;
+		CNET_LAYER_TABLE(X)
+		#undef X
 		L_(lDebug) << "Function has no GPU implementation: " << func->getName();
 		return isUnknown;
 	}
@@ -309,6 +310,18 @@ public:
 		}
 	}
 
+	void gaussInit(float scale, uint64_t seed) {
+		assert(this->func_list_.size());
+		int indx = 1;
+		for (auto in_func : inputs_) {
+			if (in_func->isGpuOnly()) {
+				continue;
+			}
+			in_func->setRandSeed(seed + indx++);
+			in_func->gaussInit(scale);
+		}
+	}
+
 	void print_inputs() {
 		for (auto fn_inpt : inputs_) {
 			std::cout << fn_inpt->getName();
@@ -402,7 +415,11 @@ public:
 			if (func_list_[var]->isGpuOnly()) {
 				continue;
 			}
-			if (dynamic_cast<CrossEntropy*>(func_list_[var])) {
+			// Loss layers consume the label (CrossEntropy) or their stored
+			// per-position targets (SequenceCrossEntropy, label ignored); every
+			// other layer takes the plain no-arg backward.
+			if (dynamic_cast<CrossEntropy*>(func_list_[var])
+					|| dynamic_cast<SequenceCrossEntropy*>(func_list_[var])) {
 				func_list_[var]->backward(label);
 			} else {
 				func_list_[var]->backward();
@@ -430,6 +447,17 @@ public:
 		}
 	}
 
+	void trueAdamUpdate(float learning_rate, int batch_size, float beta1,
+			float beta2, float eps, int t) {
+		for (auto in_func : inputs_) {
+			if (in_func->isGpuOnly()) {
+				continue;
+			}
+			in_func->trueAdamUpdate(learning_rate / batch_size, beta1, beta2, eps, t);
+			in_func->mutable_input()->zero_dZ_star();
+		}
+	}
+
 	std::vector<CFunc*>& functionList() {
 		return func_list_;
 	}
@@ -446,6 +474,9 @@ public:
 			} else if(Linear* linear = dynamic_cast<Linear*>(layer)) {
 				Linear* other = dynamic_cast<Linear*>(functionList()[indx]);
 				assert(*linear ==  *other);
+			} else if(TokenwiseLinear* tw = dynamic_cast<TokenwiseLinear*>(layer)) {
+				TokenwiseLinear* other = dynamic_cast<TokenwiseLinear*>(functionList()[indx]);
+				assert(*tw ==  *other);
 			} else if(CEmbedding* emb = dynamic_cast<CEmbedding*>(layer)) {
 				CEmbedding* other = dynamic_cast<CEmbedding*>(functionList()[indx]);
 				assert(*emb ==  *other);

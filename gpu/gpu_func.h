@@ -51,6 +51,9 @@ class CNet {
 	int no_ancestors_ = 0;
 	std::vector<int> labels_;
 	int *gpu_labels_ = NULL;
+	int *gpu_seq_targets_ = NULL;   // B*n_pos per-position targets (SequenceCrossEntropy)
+	int *gpu_correct_ = NULL;   // cached device buffer for in-training accuracy
+	int gpu_correct_cap_ = 0;
 
 	void createExecutionGraph() {
 		std::set<GpuMapping*> inputs;
@@ -174,7 +177,11 @@ class CNet {
 
 			GpuCloneVar clone_var;
 			clone_var.ancestor_ptr_ = func->gpu_var_.input_ptr_;
-			clone_var.data_len_ = func->gpu_var_.input_length_ * 4;
+			// Broadcast-to-clones length: the 4 grad/data segments during training;
+			// only the 2 data segments (z) for inference (dims_ == 2), so the copy
+			// stays in bounds when the gradient segments aren't allocated.
+			clone_var.data_len_ = func->gpu_var_.input_length_
+					* (gpu_net_.hasGradients_ ? 4 : 2);
 			max_clone_data_len_ = std::max(clone_var.data_len_, max_clone_data_len_);
 
 			assert(cpuNet().gpu_clones_of_.find(func->uid())
@@ -235,6 +242,21 @@ class CNet {
 						info += func->getName() + ", ";
 					}
 				}
+			} else if (auto cpu_sce = dynamic_cast<SequenceCrossEntropy*>(outp)) {
+				// Per-position targets for the autoregressive head: one B*n_pos
+				// device arena, filled each step in batchToGpu, read by the kernels.
+				if (cpu_sce->isGpuOnly()) {
+					continue;
+				}
+				auto sce = (SequenceCrossEntropyGpu*)getMappingFor(cpu_sce);
+				int np = cpu_sce->nPos();
+				gpu_seq_targets_ = helper_.int_allocate_on_gpu(batch_size * np);
+				if (!gpu_seq_targets_) {
+					std::cerr << "int_allocate_on_gpu (seq targets)" << std::endl;
+					return false;
+				}
+				sce->setBatchTargets(gpu_seq_targets_, np);
+				info += cpu_sce->getName() + ", ";
 			}
 		}
 
@@ -324,6 +346,39 @@ class CNet {
 		return true;
 	}
 
+	// Upload each Pad layer's (constant) kernel index set to the device. All
+	// batch replicas of a Pad share the same index set, so one array suffices.
+	bool allocatePadKernelIndex() {
+		long allocated = 0;
+		for (auto map : gpu_net_.gpu_maps_) {
+			if (auto pad = dynamic_cast<PadGpu*>(map)) {
+				Pad *cpu_pad = (Pad*) pad->getCpuFun().front();
+				const std::vector<int> &kidx = cpu_pad->kernel_index();
+				// One PadGpu mapping shares a single device index array across all
+				// its entries (channels + batch clones). That is only valid if they
+				// all use the same index set, which holds when every channel uses
+				// the same kernel placement. Fail loudly if a future net violates it.
+				for (auto f : pad->getCpuFun()) {
+					assert(((Pad*) f)->kernel_index() == kidx
+						   && "PadGpu mapping groups Pads with differing kernel_index");
+				}
+				pad->gpu_kernel_index_ = helper_.int_allocate_on_gpu(kidx.size());
+				if (!pad->gpu_kernel_index_) {
+					return false;
+				}
+				if (!helper_.int_copy_to_gpu(kidx.size(), kidx.data(),
+						pad->gpu_kernel_index_)) {
+					return false;
+				}
+				allocated += kidx.size() * sizeof(int);
+			}
+		}
+		if (allocated) {
+			std::cout << "Allocated: " << allocated << " bytes for pad kernels." << std::endl;
+		}
+		return true;
+	}
+
 
 public:
 
@@ -367,10 +422,10 @@ public:
 
 	void batchToGpu(InputFunc *inp, OutputFunc *outp, Batch *batch) {
 		assert(outp);
-		CrossEntropy* ce = dynamic_cast<CrossEntropy*>(outp);
-		if (!ce) {
+		SequenceCrossEntropy* sce = dynamic_cast<SequenceCrossEntropy*>(outp);
+		if (!dynamic_cast<CrossEntropy*>(outp) && !sce) {
 			std::cerr << "This type of output is not supported yet." << std::endl;
-			assert(ce);
+			assert(false);
 		}
 
 		assert(inp);
@@ -388,8 +443,17 @@ public:
 
 			assert(helper_.int_copy_to_gpu(batch->size() * batch->sampleDim(), emb_batch->tokensPtr(), map->gpu_tokens_));
 
-			labels_ = batch->labels_;
-			assert(helper_.int_copy_to_gpu(batch->size(), &batch->labels_[0], gpu_labels_));
+			if (sce) {
+				// Autoregressive head: upload the B per-position target vectors
+				// (one n_pos block per clone) into the shared targets arena.
+				int np = sce->nPos();
+				assert(emb_batch->noPTargets() == batch->size() * np);
+				assert(helper_.int_copy_to_gpu(batch->size() * np,
+						emb_batch->pTargetsPtr(), gpu_seq_targets_));
+			} else {
+				labels_ = batch->labels_;
+				assert(helper_.int_copy_to_gpu(batch->size(), &batch->labels_[0], gpu_labels_));
+			}
 		} else if (CInput* cinp = dynamic_cast<CInput*>(inp)) {
 			InputBatch *inp_batch = dynamic_cast<InputBatch*>(batch);
 			assert(inp_batch);
@@ -509,6 +573,18 @@ public:
 		}
 	}
 
+	// True Adam (first + second moment) on the GPU, over the ancestor inputs.
+	// grad_clip > 0 bounds each gradient component to +/- grad_clip (clip-by-value).
+	void trueAdamUpdate(float l_rate, float beta1, float beta2, float eps, int t,
+			float grad_clip = 0.0f) {
+		for (auto fun : net_->inputs()) {
+			if (fun->isGpuOnly()) {
+				continue;
+			}
+			gpu_update_true_adam_input(fun, l_rate, beta1, beta2, eps, t, grad_clip);
+		}
+	}
+
 	bool getInputsFromGpu() {
 		for (auto fun : net_->inputs()) {
 			if (fun->isGpuOnly()) {
@@ -603,6 +679,10 @@ public:
 
 		if (!allocateEmbeddingInput()) {
 			throw std::invalid_argument("AllocateNet error: allocateEmbeddingInput.");
+		}
+
+		if (!allocatePadKernelIndex()) {
+			throw std::invalid_argument("AllocateNet error: allocatePadKernelIndex.");
 		}
 
 		gpu_net_.addGpuOuts();
@@ -882,7 +962,7 @@ public:
 
 			if (auto oFun = dynamic_cast<CrossEntropy*>(fun)) {
 				if (!helper_.float_copy_from_gpu(2 * tmp.length_,
-						fun->gpu_var_.input_ptr_ + 6 * tmp.length_, tmp.real_)) {
+						fun->gpu_var_.input_ptr_ + Vars::dims_ * tmp.length_, tmp.real_)) {
 					was_failure = true;
 					return "Cannot copy from GPU: " + fun->getName();
 				}
@@ -925,6 +1005,54 @@ public:
 		return loss / batch->size();
 	}
 
+	// Number of correct predictions in the current batch (argmax |z_k|^2 vs the
+	// label), computed on the GPU from the activations already in place. Call it
+	// right after GpuForward. Almost free: a tiny kernel plus a small int copy,
+	// reusing a cached device buffer, so no per-step allocation.
+	int getCorrect(OutputFunc *outp) {
+		auto c_fun = dynamic_cast<CFunc*>(outp);
+		assert(c_fun);
+		CrossEntropyGpu *ce = dynamic_cast<CrossEntropyGpu*>(getMappingFor(c_fun));
+		assert(ce);
+		int N = ce->length();
+		int no_mappings = ce->getNoMappings();
+
+		if (gpu_correct_cap_ < no_mappings) {
+			gpu_correct_ = helper_.int_allocate_on_gpu(no_mappings);
+			assert(gpu_correct_);
+			gpu_correct_cap_ = no_mappings;
+		}
+
+		gpu_argmax_correct(ce->gpu_in_ptr_, gpu_labels_, gpu_correct_, N, no_mappings);
+
+		std::vector<int> correct(no_mappings);
+		assert(helper_.int_copy_from_gpu(no_mappings, gpu_correct_, &correct[0]));
+		int hits = 0;
+		for (int c : correct) {
+			hits += c;
+		}
+		return hits;
+	}
+
+	// Predicted class (Born argmax) per mapping/batch element — for confusion.
+	std::vector<int> getPredictions(OutputFunc *outp) {
+		auto c_fun = dynamic_cast<CFunc*>(outp);
+		assert(c_fun);
+		CrossEntropyGpu *ce = dynamic_cast<CrossEntropyGpu*>(getMappingFor(c_fun));
+		assert(ce);
+		int N = ce->length();
+		int no_mappings = ce->getNoMappings();
+		if (gpu_correct_cap_ < no_mappings) {
+			gpu_correct_ = helper_.int_allocate_on_gpu(no_mappings);
+			assert(gpu_correct_);
+			gpu_correct_cap_ = no_mappings;
+		}
+		gpu_argmax_predict(ce->gpu_in_ptr_, gpu_correct_, N, no_mappings);
+		std::vector<int> pred(no_mappings);
+		assert(helper_.int_copy_from_gpu(no_mappings, gpu_correct_, &pred[0]));
+		return pred;
+	}
+
 	std::map<int, float> getLoss(int label) {
 		assert(gpu_net_.outputs_.size());
 		std::map<int, float> ret;
@@ -963,6 +1091,9 @@ public:
 					ret[ce->cpu_func_[indx]->uid()] = -std::log(prob);
 					indx++;
 				}
+			} else if (SequenceCrossEntropyGpu *sce = dynamic_cast<SequenceCrossEntropyGpu*>(outp)) {
+				// mean per-position loss, computed on-device in the forward kernel
+				ret[sce->cpu_func_[0]->uid()] = sce->readLoss();
 			}
 		}
 		return ret;
@@ -1090,6 +1221,32 @@ public:
 		batchToGpu(inp, outp, &batch);
 		bool was_failure = false;
 		GpuForward(was_failure);
+		return !was_failure;
+	}
+
+	// Embedding-input overload (autoregressive LM): same flow, but routes an
+	// EmbeddingBatch (per-clone token sequences + per-position targets).
+	bool gpuForward(InputFunc *inp, OutputFunc *outp, EmbeddingBatch &batch) {
+		copyInputsToClones();
+		batchToGpu(inp, outp, &batch);
+		bool was_failure = false;
+		GpuForward(was_failure);
+		return !was_failure;
+	}
+
+	// Inference-only allocation: no gradient buffers (requires Vars::dims_ ==
+	// Vars::INFER_DIMS set before building the net), so the arena is ~4x smaller.
+	bool allocateOnGpuInfer(int batch_size) {
+		gpu_net_.hasGradients_ = false;
+		return allocateOnGpu(batch_size);
+	}
+
+	// Forward-only pass (no gradient zeroing); pair with allocateOnGpuInfer.
+	bool gpuInfer(InputFunc *inp, OutputFunc *outp, InputBatch &batch) {
+		copyInputsToClones();
+		batchToGpu(inp, outp, &batch);
+		bool was_failure = false;
+		GpuInfer(was_failure);
 		return !was_failure;
 	}
 

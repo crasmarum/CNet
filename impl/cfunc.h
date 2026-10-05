@@ -195,6 +195,22 @@ public:
 		}
 	}
 
+	// Circularly symmetric complex Gaussian init (arXiv:1810.11650): real and
+	// imaginary parts are independent N(0, scale/length) via Box-Muller.
+	virtual void gaussInit(float scale) {
+		float stddev = sqrt(scale / (float) input().length_);
+		for (int i = 0; i < mutable_input()->length_; ++i) {
+			float u1 = (float) rand_.randDouble();
+			float u2 = (float) rand_.randDouble();
+			if (u1 < 1e-12f) {
+				u1 = 1e-12f;
+			}
+			float r = stddev * sqrt(-2.0f * log(u1));
+			mutable_input()->real_[i] = r * cos(6.2831853f * u2);
+			mutable_input()->imag_[i] = r * sin(6.2831853f * u2);
+		}
+	}
+
 	virtual void printGradient() {
 		std::cout << getName() << ": ";
 		for (int in_indx = 0; in_indx < input().length_; ++in_indx) {
@@ -286,7 +302,43 @@ public:
 		}
 	}
 
+	// True Adam (CPU): first AND second moment per parameter, treating the real
+	// and imaginary components as independent real parameters. The per-parameter
+	// step normalisation (the sqrt(v) term) is what momentum alone lacks.
+	void trueAdamUpdate(float l_rate, float beta1, float beta2, float eps, int t) {
+		int L = input_.length_;
+		if ((int) adam_m_re_.size() != L) {
+			adam_m_re_.assign(L, 0.f);
+			adam_m_im_.assign(L, 0.f);
+			adam_v_re_.assign(L, 0.f);
+			adam_v_im_.assign(L, 0.f);
+		}
+		float bc1 = 1.0f - pow(beta1, t + 1);
+		float bc2 = 1.0f - pow(beta2, t + 1);
+		#pragma omp parallel for
+		for (int i = 0; i < L; ++i) {
+			float gr = input_.dz_star_real_[i];
+			float gi = input_.dz_star_imag_[i];
+
+			adam_m_re_[i] = beta1 * adam_m_re_[i] + (1 - beta1) * gr;
+			adam_m_im_[i] = beta1 * adam_m_im_[i] + (1 - beta1) * gi;
+			adam_v_re_[i] = beta2 * adam_v_re_[i] + (1 - beta2) * gr * gr;
+			adam_v_im_[i] = beta2 * adam_v_im_[i] + (1 - beta2) * gi * gi;
+
+			float mhr = adam_m_re_[i] / bc1;
+			float mhi = adam_m_im_[i] / bc1;
+			float vhr = adam_v_re_[i] / bc2;
+			float vhi = adam_v_im_[i] / bc2;
+
+			input_.real_[i] -= l_rate * mhr / (sqrt(vhr) + eps);
+			input_.imag_[i] -= l_rate * mhi / (sqrt(vhi) + eps);
+		}
+	}
+
 private:
+	std::vector<float> adam_m_re_, adam_m_im_, adam_v_re_, adam_v_im_;  // true-Adam state
+
+
 	void out_others() {
 		for (int next_func_indx = 0; next_func_indx < next_func_.size(); ++next_func_indx) {
 			auto curr_output = output(next_func_indx);

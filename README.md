@@ -30,7 +30,7 @@ The following code shows how to build a minimal neural net for the MNIST/Fashion
   auto outp = cnet.add(new CrossEntropy(InSize(10)), {lin});
 ```
 
-Please see the file [cnet.cpp](https://github.com/crasmarum/CNet/blob/a31b701317c5aa98da7dc59ca7bf928fcc53af8c/cnet.cpp) for how to train on CPU/GPU the above complex valued neural net with the MNIST/Fashion MNIST datasets.
+Please see the file [cnet.cpp](https://github.com/crasmarum/CNet/blob/main/cnet.cpp) for how to train on CPU/GPU the above complex valued neural net with the MNIST/Fashion MNIST datasets.
 
 ## Adding Custom Complex Valued Functions / NN Layers
 
@@ -131,7 +131,7 @@ Depth 2: L2Out_3 3096,
 ...
 ```
 
-Please see the file [examples/sigmoid.h](https://github.com/crasmarum/CNet/blob/8d4caa113661ceff4db43cecb4fdcf17ec15061b/examples/sigmoid.h) for additional details.
+Please see the file [examples/sigmoid.h](https://github.com/crasmarum/CNet/blob/main/examples/sigmoid.h) for additional details.
 
 # Computation Graph on CUDA
 
@@ -170,7 +170,7 @@ setInput(InputBatch& batch, int b_indx)
 As the input parameter for other layers, its values are either randomly set at the beginning of training a network, e.g., `net.init_inputs()`, 
 or are restored from a model via `net.restore(std::string file)`.
 
-See  the file [cnet.cpp](https://github.com/crasmarum/CNet/blob/a31b701317c5aa98da7dc59ca7bf928fcc53af8c/cnet.cpp)  for more details.
+See  the file [cnet.cpp](https://github.com/crasmarum/CNet/blob/main/cnet.cpp)  for more details.
 
 ## Embedding Layer
 The Embedding Layer is used only as the main input for the neural network. The main variables of an embedding layer are
@@ -213,6 +213,37 @@ The main variable of this function is its input/output size. Example of its usag
 CNet cnet;
 auto inp = cnet.add(new CInput(OutSize(28 * 28)));
 auto fft = cnet.add(new FourierTrans(InSize(28 * 28)), {inp});
+```
+
+## Inverse Fourier Transform Layer
+
+This layer implements the [Inverse Discrete Fourier Transform](https://en.wikipedia.org/wiki/Discrete_Fourier_transform), the exact (unitary) inverse of `FourierTrans`:
+
+ $IFFT : \mathbb{C}^N \to \mathbb{C}^N \text{ given by } IFFT(z)_p \mapsto \sum_q z_q e^{-i2{\pi}pq / N} / \sqrt{N}$.
+
+It is typically used to bring a Hadamard product back to the time domain, i.e. to realise a circular convolution as $Conv(u, v) = IFFT\big(Hadamard(FFT(u), FFT(v))\big)$.
+
+ ```c++
+#include "impl/ft.h"
+
+auto fft  = cnet.add(new FourierTrans(InSize(28 * 28)), {inp});
+auto hdm  = cnet.add(new Hadamard(InSize(28 * 28), InSize(28 * 28)), {fft, h_data});
+auto ifft = cnet.add(new InverseFourierTrans(InSize(28 * 28)), {hdm});
+```
+
+## Triangular (Causal) Fourier Layer
+
+This layer implements a *causal* variant of the DFT: a lower-triangular-masked Fourier sum, so output position $p$ depends only on inputs $0 \le q \le p$:
+
+ $TriangFourier : \mathbb{C}^N \to \mathbb{C}^N \text{ given by } TriangFourier(z)_p \mapsto \sum_{q \le p} z_q e^{i2{\pi}pq / N} / \sqrt{N}$.
+
+This makes it a *parameter-free causal token mixer* — the autoregressive analogue of self-attention used in [FNet](https://aclanthology.org/2022.naacl-main.319.pdf)-style language models: it mixes information across tokens while never letting a position see its own future. With a token-major `CEmbedding` layout (token $t$ occupies a contiguous block) the triangular mask over the flattened index is exactly token-level causality. Because the mask breaks the FFT factorisation, it is computed as a direct $O(N^2)$ sum.
+
+ ```c++
+#include "impl/ft.h"
+
+auto emb = cnet.add(new CEmbedding(emb_dim, max_in_tokens, no_embedings));
+auto mix = cnet.add(new TriangFourier(InSize(emb_dim * max_in_tokens)), {emb});
 ```
 
 ## Hadamard Layer
@@ -274,6 +305,22 @@ auto lin = cnet.add(new Linear(InSize(512), InSize(512 * 10)), {gelu, l_data});
 auto outp = cnet.add(new CrossEntropy(InSize(10)), {lin});
 ```
 
+## Tokenwise Linear Layer
+
+This is a *position-wise* linear layer: the input is seen as $N$ token blocks of width $E_{in}$, and the **same** $E_{in} \times E_{out}$ weight matrix is applied to every token independently (a shared per-token dense/FFN projection).
+
+$TokenwiseLinear : \mathbb{C}^{N \cdot E_{in}} \times \mathbb{C}^{E_{in} \cdot E_{out}} \to \mathbb{C}^{N \cdot E_{out}}$.
+
+Sharing the weight across positions costs $O(N \cdot E_{in} \cdot E_{out})$ parameters and compute, versus $O\big((N \cdot E)^2\big)$ for a full dense `Linear` over the flattened sequence — this is what makes a per-token feed-forward block affordable in a sequence model. The constructor takes the number of tokens and the input/output embedding widths:
+
+```c++
+#include "impl/tokenwise.h"
+
+int N = 64, E = 128, H = 4 * E;        // N tokens, width E, hidden H
+auto w1 = cnet.add(new CInput(OutSize(E * H)));
+auto ff = cnet.add(new TokenwiseLinear(N, E, H), {hidden, w1});
+```
+
 ## CRelu Layer
 
 This activation function is the equivalent of Relu:
@@ -310,6 +357,21 @@ auto inp = cnet.add(new CInput(OutSize(512)));
 auto rel = cnet.add(new CGelu(InSize(512)), {inp});
 ```
 
+## SoftMax (L2 Normalization) Layer
+
+Despite its name, this layer is the complex $L2$ normalization — it divides by the Euclidean norm:
+
+$SoftMax : \mathbb{C}^N \to \mathbb{C}^N \text{ given by } SoftMax(z)_k \mapsto z_k / \|z\|, \quad \|z\| = \sqrt{\sum_j |z_j|^2}$.
+
+Unlike `CGelu`, this activation is scale-covariant and **commutes with the (unitary) Fourier Transform**, so it can be used inside a spectral network without breaking the FFT/convolution equivalence — useful as the nonlinearity between spectral mixing layers.
+
+```c++
+#include "impl/softmax.h"
+
+auto inp = cnet.add(new CInput(OutSize(512)));
+auto nrm = cnet.add(new SoftMax(InSize(512)), {inp});
+```
+
 ## L2Out Loss function
 
 This loss function is simply the square of the $L2$ norm:
@@ -336,7 +398,7 @@ $CrossEntropy : \mathbb{C}^N \times \mathbb{R}^N \to \mathbb{R} \text{ given by 
 
 You can read more on it in the [On the Equivalence of Convolutional and Hadamard Networks using DFT](https://arxiv.org/abs/1810.11650) research paper.
 You can see an example of using the `CrossEntropy` loss function `ce` in the following code snippet, as well as in the 
-[cnet.cpp](https://github.com/crasmarum/CNet/blob/a31b701317c5aa98da7dc59ca7bf928fcc53af8c/cnet.cpp) file:
+[cnet.cpp](https://github.com/crasmarum/CNet/blob/main/cnet.cpp) file:
 
 ```c++
 #include "impl/crossent.h"
@@ -348,6 +410,51 @@ auto lin = cnet.add(new Linear(InSize(28 * 28), InSize(28 * 28 * 10)), {gelu, l_
 auto ce = cnet.add(new CrossEntropy(InSize(10)), {lin});
 ```
 
+## Sequence Cross Entropy Loss function
+
+This is the autoregressive analogue of `CrossEntropy`. The input is $N$ contiguous vocabulary-sized blocks (one per sequence position); each block is treated as an independent Born-rule measurement, and the loss is the mean over positions of the negative log-probability of that position's target token:
+
+$SeqCE : \mathbb{C}^{N \cdot V} \times \mathbb{R}^{N} \to \mathbb{R} \text{ given by } SeqCE(z, y) \mapsto \frac{1}{N}\sum_{p=0}^{N-1} -\log\big(|z_{p,y_p}|^2 / \|z_p\|^2\big)$.
+
+The per-position targets (the input tokens shifted left by one) are set with `setTargets(std::vector<int>)` before each forward pass. Combined with a token-major `CEmbedding`, a causal `TriangFourier` mixer and `TokenwiseLinear` feed-forward blocks, this trains a character-level language model where every position predicts its next token in a single pass.
+
+```c++
+#include "impl/seqcrossent.h"
+
+int N = 64, vocab = 65;
+auto logits = cnet.add(new TokenwiseLinear(N, emb_dim, vocab), {last, w_out});
+auto seq    = cnet.add(new SequenceCrossEntropy(InSize(N * vocab), vocab), {logits});
+// ... each step:
+seq->setTargets(targets);   // per-position next-token targets
+```
+
+# Optimizers
+
+The learnable `CInput` / `CEmbedding` parameters are trained with the Wirtinger gradients accumulated during the backward pass. Three update rules are available, each on both CPU and GPU:
+
+* **Plain gradient descent** — `updateInputs(l_rate)` (CPU) / `gpuUpdateInputs(l_rate)` (GPU).
+* **Momentum Adam** (first moment only) — `adamUpdate(...)`.
+* **Full Adam** (first + second moment with bias correction, and optional gradient clip-by-value) — `trueAdamUpdate(...)`.
+
+On GPU a batch is trained as a set of net clones, so the update is called once per step with the learning rate scaled by the batch size (the per-clone gradients are summed onto the ancestor parameters first):
+
+```c++
+// plain SGD
+cnet.gpuUpdateInputs(l_rate / batch.size());
+// momentum Adam
+cnet.adamUpdate(l_rate / batch.size(), beta, step);
+// full Adam with gradient clipping (grad_clip = 0 disables the clip)
+cnet.trueAdamUpdate(l_rate / batch.size(), beta1, beta2, eps, step, grad_clip);
+```
+
+On CPU, where gradients are accumulated over several samples before an update, the Adam variants additionally take that accumulation batch size:
+
+```c++
+net.adamUpdate(l_rate, batch_size, beta, step);
+net.trueAdamUpdate(l_rate, batch_size, beta1, beta2, eps, step);
+```
+
+Because the Born-rule `CrossEntropy` / `SequenceCrossEntropy` losses are ill-conditioned, full Adam (`trueAdamUpdate`) with gradient clipping is recommended over plain SGD for classification and language-model training.
 
 # Building the Software
 
@@ -375,7 +482,7 @@ You can change the default learning rate and the GPU batch size via the `l_rate`
 ~/cnet -mnist_images ~/train-images.idx3-ubyte -mnist_labels ~/train-labels.idx1-ubyte \
        -model_path ~/test.mod  -mnist_gpu_train true -l_rate 0.001 -batch_size 40
 ```
-You can find the example training code in the [cnet.cpp](https://github.com/crasmarum/CNet/blob/a31b701317c5aa98da7dc59ca7bf928fcc53af8c/cnet.cpp) file:
+You can find the example training code in the [cnet.cpp](https://github.com/crasmarum/CNet/blob/main/cnet.cpp) file:
 ```c++
 MnistDataReader reader;
 assert(reader.Open(mnist_images, mnist_labels, 60000));
@@ -429,5 +536,6 @@ The current version of the CNet framework has some limitations:
 * there is no support for multiple GPUs at the moment;
 * APIs to create new functions / layers are for CPU-only. Support for APIs for implementing CUDA layers, to follow.
 * certain CUDA layer implementations are not optimal;
+* the causal `TriangFourier` mixer is a direct $O(N^2)$ computation (the triangular mask precludes the FFT speed-up), so it is compute-bound for long sequences;
 * supported only on Linux/MacOS. 
 

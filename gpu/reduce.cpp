@@ -4,7 +4,23 @@
 #include "../utils/stopwatch.h"
 #include "../utils/flags.h"
 
+#ifdef __CUDACC__
+#include <cufft.h>
+#endif
+
 FLAG_INT(reduce_block_size, 512);
+
+// When set, the Linear layer uses the direct shared-memory GEMV kernels
+// (forward and backward) instead of the generic reduce-then-sum path.
+FLAG_BOOL(fast_linear, true)
+
+// When set, the FourierTrans layer uses a cuFFT O(N log N) transform instead of
+// the O(N^2) direct-DFT reduction. Off by default while it beds in.
+FLAG_BOOL(fft_fast, false)
+
+// When set, SoftMax uses the O(N) closed-form backward instead of the O(N^2)
+// dense-Jacobian reduction.
+FLAG_BOOL(fast_softmax, true)
 
 #define Z(var, pos, len) cmplx((var)[(pos)], (var)[(len + pos)])
 
@@ -108,23 +124,23 @@ __global__ void reducing_kernel__(int provider_id, GpuInVar *in, cmplx_ *out,
 
     unsigned int tid = threadIdx.x;
 	size_t thread_indx = blockIdx.x * blockDim.x + threadIdx.x;
-	if (thread_indx >= max_no_threads) {
-		return;
-	}
 
 	// max_threads = segment_len * no_segments * no_mappings;
-	int no_segments = max_no_threads / no_mappings / seg_length;
 	int pos_in_segment = thread_indx % seg_length;
-	if (pos_in_segment >= init_seg_length) {
-		sdata[tid] = {0, 0};	// we need to do this!
-		return;
-	}
-
-	int map_indx = thread_indx / no_segments / seg_length;
-	int segm_no = (thread_indx / seg_length) % no_segments;
     size_t out_indx = thread_indx / blockSize;
 
-	sdata[tid] = getDataFor(provider_id, map_indx, pos_in_segment, init_seg_length, segm_no, in, tid);
+	// Every lane in the block must reach each __syncthreads() below, so
+	// out-of-range and padding lanes contribute zero rather than returning
+	// early: a divergent __syncthreads() is undefined behaviour (block hang
+	// or corrupted partial sums).
+	if (thread_indx >= max_no_threads || pos_in_segment >= init_seg_length) {
+		sdata[tid] = {0, 0};
+	} else {
+		int no_segments = max_no_threads / no_mappings / seg_length;
+		int map_indx = thread_indx / no_segments / seg_length;
+		int segm_no = (thread_indx / seg_length) % no_segments;
+		sdata[tid] = getDataFor(provider_id, map_indx, pos_in_segment, init_seg_length, segm_no, in, tid);
+	}
     __syncthreads();
 
 /*
@@ -379,8 +395,91 @@ void softmax_kernel_end(cmplx_ *temp_in, GpuInVar *in, GpuOutVar *out, int seg_l
 
 }
 
+// ---- cuFFT fast path for FourierTrans (forward) ----
+// CNet stores complex vectors planar (all reals then all imags) while cuFFT
+// wants interleaved cufftComplex, so a gather/scatter pair brackets each
+// transform. The batch of clones is laid out contiguously so one batched plan
+// of size N (batch M) does the whole layer.
+
+// planar input z (per clone) -> interleaved, contiguous per clone.
+__global__ void gpu_fft_gather__(GpuInVar *in, cmplx_ *buf, int N, int no_mappings) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= no_mappings * N) {
+		return;
+	}
+	int map = tid / N;
+	int k = tid % N;
+	buf[tid] = cmplx(*Z_real_(in[map], k), *Z_imag_(in[map], k));
+}
+
+// interleaved transform result -> planar output, scaled (overwrite).
+__global__ void gpu_fft_scatter_out__(cmplx_ *buf, GpuOutVar *out, int N, int no_mappings, float scale) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= no_mappings * N) {
+		return;
+	}
+	int map = tid / N;
+	int k = tid % N;
+	cmplx_ v = buf[tid];
+	out[map].out_ptr_[k] = v.real * scale;
+	out[map].out_ptr_[out[map].out_length_ + k] = v.imag * scale;
+}
+
+void FourierGpu::ensure_fft_plan(int N, int M) {
+#ifdef __CUDACC__
+	if (fft_plan_ != -1 && fft_N_ == N && fft_M_ == M) {
+		return;
+	}
+	free_fft();
+	cufftHandle plan;
+	cufftResult r = cufftPlan1d(&plan, N, CUFFT_C2C, M);
+	assert(r == CUFFT_SUCCESS);
+	fft_plan_ = (int) plan;
+	gpuErrchk(cudaMalloc((void**) &fft_buf_, sizeof(cmplx_) * (size_t) N * M));
+	fft_N_ = N;
+	fft_M_ = M;
+#endif
+}
+
+void FourierGpu::free_fft() {
+#ifdef __CUDACC__
+	if (fft_plan_ != -1) {
+		cufftDestroy((cufftHandle) fft_plan_);
+		fft_plan_ = -1;
+	}
+	if (fft_buf_) {
+		cudaFree(fft_buf_);
+		fft_buf_ = NULL;
+	}
+	fft_N_ = 0;
+	fft_M_ = 0;
+#endif
+}
+
 void FourierGpu::gpu_fft_forward(int block_size) {
-    int b_out_length = getPaddedLength(block_size, this);
+	if (fft_fast) {
+#ifdef __CUDACC__
+		int N = length();
+		int M = getNoMappings();
+		ensure_fft_plan(N, M);
+
+		int total = N * M;
+		int tb = 256;
+		unsigned grid = (total + tb - 1) / tb;
+		float scale = 1.0f / sqrtf((float) N);
+
+		gpu_fft_gather__ CUDA2(grid, tb) (gpu_in_ptr_, fft_buf_, N, M);
+		cufftExecC2C((cufftHandle) fft_plan_, (cufftComplex*) fft_buf_,
+				(cufftComplex*) fft_buf_, CUFFT_FORWARD);
+		gpu_fft_scatter_out__ CUDA2(grid, tb) (fft_buf_, gpu_out_ptr_, N, M, scale);
+
+		gpuErrchk(cudaPeekAtLastError());
+		gpuErrchk(cudaDeviceSynchronize());
+		return;
+#endif
+	}
+
+	int b_out_length = getPaddedLength(block_size, this);
 	std::vector<cmplx_> output(b_out_length);
 	GpuHelper helper;
 	auto gpu_buffer = helper.cmplx_allocate_on_gpu(output.size());
@@ -390,6 +489,36 @@ void FourierGpu::gpu_fft_forward(int block_size) {
 
 	reducing_kernel(FFT_DATA_PROVIDER, gpu_in_ptr_, gpu_buffer, length(), length(), getNoMappings(), block_size);
 	fft_kernel_end(FFT_DATA_PROVIDER, gpu_buffer, gpu_in_ptr_, gpu_out_ptr_, length(), getNoMappings(), block_size);
+}
+
+// Inverse DFT forward: identical to FourierGpu::gpu_fft_forward but with
+// CUFFT_INVERSE. Reuses the same gather/scatter kernels, plan and 1/sqrt(N)
+// scaling (the unitary inverse). cuFFT is required for the inverse layer.
+void InverseFourierGpu::gpu_ifft_forward(int block_size) {
+	if (fft_fast) {
+#ifdef __CUDACC__
+		int N = length();
+		int M = getNoMappings();
+		ensure_fft_plan(N, M);
+
+		int total = N * M;
+		int tb = 256;
+		unsigned grid = (total + tb - 1) / tb;
+		float scale = 1.0f / sqrtf((float) N);
+
+		gpu_fft_gather__ CUDA2(grid, tb) (gpu_in_ptr_, fft_buf_, N, M);
+		cufftExecC2C((cufftHandle) fft_plan_, (cufftComplex*) fft_buf_,
+				(cufftComplex*) fft_buf_, CUFFT_INVERSE);
+		gpu_fft_scatter_out__ CUDA2(grid, tb) (fft_buf_, gpu_out_ptr_, N, M, scale);
+
+		gpuErrchk(cudaPeekAtLastError());
+		gpuErrchk(cudaDeviceSynchronize());
+		return;
+#endif
+	}
+	// The slow (unity-root) path implements only the forward DFT; the inverse
+	// layer therefore requires the cuFFT fast path.
+	assert(fft_fast && "InverseFourierGpu requires -fft_fast true");
 }
 
 void TrianFourierGpu::gpu_T_fft_forward(int block_size) {
@@ -578,18 +707,89 @@ void new_l_kernel_end(cmplx_ *temp_in, GpuInVar *in, GpuOutVar *out, int seg_len
 
 }
 
+// Optimized Linear (matrix-vector) forward.
+//
+// Each block handles a tile of output rows for a single batch element (map).
+// The input vector (N complex numbers) is loaded once into shared memory and
+// reused across every row the block computes, so the O(N*M) global reads of the
+// vector collapse to O(N) per block. This replaces the generic reduce-then-sum
+// path (two kernel launches plus a per-call scratch cudaMalloc) with a single
+// direct GEMV kernel.
+__global__ void gpu_linear_forward__(GpuInVar *in, GpuOutVar *out,
+		int N, int M, int no_mappings, int blocks_per_map) {
+#ifdef __CUDACC__
+	extern __shared__ cmplx_ svec[];
+#else
+	cmplx_ svec[1];   // CPU build never executes device kernels
+#endif
+	// blockIdx.x is uniform across a block, so this early-out is uniform and
+	// can never cause a divergent __syncthreads().
+	int map_indx = blockIdx.x / blocks_per_map;
+	if (map_indx >= no_mappings) {
+		return;
+	}
+
+	float *in_ptr = in[map_indx].input_ptr_;
+	int in_len = in[map_indx].input_length_;
+
+	// Cooperatively cache the input vector in shared memory.
+	for (int c = threadIdx.x; c < N; c += blockDim.x) {
+		svec[c] = Z(in_ptr, c, in_len);
+	}
+	__syncthreads();
+
+	int row = (blockIdx.x % blocks_per_map) * blockDim.x + threadIdx.x;
+	if (row < M) {
+		float *mat_row = in_ptr + (row + 1) * N;
+		cmplx_ sum = cmplx(0.f, 0.f);
+		for (int c = 0; c < N; ++c) {
+			sum += svec[c] * Z(mat_row, c, in_len);
+		}
+		out[map_indx].out_ptr_[row] = sum.real;
+		out[map_indx].out_ptr_[out[map_indx].out_length_ + row] = sum.imag;
+	}
+}
+
 void LinearGpu::gpu_linear_forward(int block_size) {
-	int seg_in_len = ((Linear*)getCpuFun()[0])->firstInputLength();
-	int no_segments = ((Linear*)getCpuFun()[0])->outSize();
+	int seg_in_len = ((Linear*)getCpuFun()[0])->firstInputLength();   // N
+	int no_segments = ((Linear*)getCpuFun()[0])->outSize();           // M
 
-//	int seg_out_len = mp->getOuts().front().out_length_;
-//	int seg_in_len = mp->length() / (seg_out_len + 1); // here the assumption is that is only one output! not true
+	// Fast path: cache the input vector in shared memory and compute each
+	// output row directly. Used whenever the vector fits in shared memory.
+	// The direct GEMV uses one thread per output row, so it only pays off when
+	// there are enough rows to fill the GPU. For few output rows the generic
+	// reduction (which parallelises over the contraction dimension) is faster,
+	// so fall back to it below the threshold.
+	size_t shmem = (size_t) seg_in_len * sizeof(cmplx_);
+	if (fast_linear && no_segments >= 512 && shmem <= 48u * 1024u) {
+		// Keep blocks small (one row per thread, 128 rows per block) so that a
+		// single layer spreads over many SMs instead of one giant block.
+		int threads = 128;
+		if (threads > no_segments) {
+			threads = no_segments;
+		}
+		if (threads < 1) {
+			threads = 1;
+		}
+		int blocks_per_map = (no_segments + threads - 1) / threads;
+		unsigned grid = (unsigned) getNoMappings() * blocks_per_map;
 
+		gpu_linear_forward__ CUDA(grid, threads, shmem)
+				(gpu_in_ptr_, gpu_out_ptr_, seg_in_len, no_segments, getNoMappings(), blocks_per_map);
+
+#ifdef __CUDACC__
+		gpuErrchk(cudaPeekAtLastError());
+		gpuErrchk(cudaDeviceSynchronize());
+#endif
+		return;
+	}
+
+	// Fallback for very wide inputs that do not fit in shared memory: the
+	// original reduce-then-sum path.
 	int padded_segment_len = seg_in_len % block_size == 0 ? seg_in_len
 						   : (seg_in_len + block_size - seg_in_len % block_size);
 	int b_out_length = (padded_segment_len / block_size) * getNoMappings() * seg_in_len;
 
-	// TODO: make this global
 	std::vector<cmplx_> output(b_out_length);
 	GpuHelper helper;
 	auto gpu_buffer = helper.cmplx_allocate_on_gpu(output.size());
@@ -601,6 +801,48 @@ void LinearGpu::gpu_linear_forward(int block_size) {
 			        MAX_BLOCK_SIZE);
 	new_l_kernel_end(gpu_buffer, gpu_in_ptr_, gpu_out_ptr_, seg_in_len, getNoMappings(), no_segments,
 			        MAX_BLOCK_SIZE);
+}
+
+// ======== TokenwiseLinear: shared e_in x e_out weight applied per token slice.
+// Input layout per map: [ data: n_tokens*e_in ][ weight: e_out*e_in ].
+// out(t,r) = sum_c data(t,c) * weight(r,c), index t*e_out + r.
+
+__global__ void gpu_tokenwise_forward__(GpuInVar *in, GpuOutVar *out,
+		int n_tokens, int e_in, int e_out, int no_mappings) {
+	size_t tid = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+	size_t per_map = (size_t) n_tokens * e_out;
+	if (tid >= (size_t) no_mappings * per_map) {
+		return;
+	}
+	int map_indx = (int) (tid / per_map);
+	int o = (int) (tid % per_map);     // output index within this map
+	int t = o / e_out;
+	int r = o % e_out;
+	int w_base = n_tokens * e_in;
+
+	cmplx_ sum = cmplx(0.f, 0.f);
+	for (int c = 0; c < e_in; ++c) {
+		sum += Z_(in[map_indx], t * e_in + c) * Z_(in[map_indx], w_base + r * e_in + c);
+	}
+	out[map_indx].out_ptr_[o] = sum.real;
+	out[map_indx].out_ptr_[out[map_indx].out_length_ + o] = sum.imag;
+}
+
+void TokenwiseLinearGpu::gpu_tokenwise_forward() {
+	TokenwiseLinear *cpu = (TokenwiseLinear*) getCpuFun()[0];
+	int n_tokens = cpu->nTokens();
+	int e_in = cpu->inDim();
+	int e_out = cpu->outDim();
+
+	size_t total = (size_t) getNoMappings() * n_tokens * e_out;
+	int tb = 256;
+	unsigned grid = (unsigned) ((total + tb - 1) / tb);
+	gpu_tokenwise_forward__ CUDA2(grid, tb)
+			(gpu_in_ptr_, gpu_out_ptr_, n_tokens, e_in, e_out, getNoMappings());
+#ifdef __CUDACC__
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+#endif
 }
 
 // ======== Gradients
@@ -650,6 +892,193 @@ void CrossEntropyGpu::gpu_cross_ent_backward(int label) {
 	gpu_cross_ent_backward__ CUDA2( grid, MAX_BLOCK_SIZE )
 			(gpu_in_ptr_, gpu_out_ptr_, length(), label, gpu_labels_, no_threads);
 
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+}
+
+// ======== SequenceCrossEntropy (autoregressive per-position loss) ============
+// Batched over B clones. Targets are laid out per clone: targets[map*n_pos + p].
+// one thread per (clone, position): ||z_p||^2 and -log p_{target}. total = B*n_pos.
+__global__ void seq_ce_forward__(GpuInVar *in, int vocab, int n_pos,
+		int *targets, float *sqnorm, float *poss_loss, int total) {
+	int t = blockIdx.x * blockDim.x + threadIdx.x;
+	if (t >= total) {
+		return;
+	}
+	int map_indx = t / n_pos;
+	int p = t - map_indx * n_pos;
+	int base = p * vocab;
+	float sum = 0.f;
+	for (int k = 0; k < vocab; ++k) {
+		cmplx_ z = Z_(in[map_indx], base + k);
+		sum += z.real * z.real + z.imag * z.imag;
+	}
+	if (sum < 1e-15f) sum = 1e-15f;
+	sqnorm[t] = sum;
+	cmplx_ zt = Z_(in[map_indx], base + targets[t]);
+	float prob = (zt.real * zt.real + zt.imag * zt.imag) / sum;
+	if (prob < 1e-15f) prob = 1e-15f;
+	poss_loss[t] = -logf(prob);
+}
+
+// one thread per (clone, position, vocab index): the per-position Born gradient,
+// scaled by 1/n_pos to match the per-clone mean loss (the clone sum + l_rate/B
+// then yields the batch mean). max_len = B*n_pos*vocab.
+__global__ void seq_ce_backward__(GpuInVar *in, int vocab, int n_pos,
+		int *targets, float *sqnorm, float inv_n, int max_len) {
+	int gi = blockIdx.x * blockDim.x + threadIdx.x;
+	if (gi >= max_len) {
+		return;
+	}
+	int per_clone = n_pos * vocab;
+	int map_indx = gi / per_clone;
+	int within = gi - map_indx * per_clone;   // index inside this clone's logits
+	int p = within / vocab;
+	int k = within - p * vocab;
+	int tpos = map_indx * n_pos + p;
+	float sqn = sqnorm[tpos];
+	float zr = *Z_real_(in[map_indx], within);
+	float zi = *Z_imag_(in[map_indx], within);
+	float gr, gi_;
+	if (k == targets[tpos]) {
+		float sqmod = zr * zr + zi * zi;
+		if (sqmod < 1e-15f) sqmod = 1e-15f;
+		float f = (sqn - sqmod) / (sqmod * sqn);
+		gr  = -zr * f * inv_n;
+		gi_ = -zi * f * inv_n;
+	} else {
+		gr  = zr / sqn * inv_n;
+		gi_ = zi / sqn * inv_n;
+	}
+	atomicAdd(dZ_star_real_(in[map_indx], within), gr);
+	atomicAdd(dZ_star_imag_(in[map_indx], within), gi_);
+	atomicAdd(dZ_real_(in[map_indx], within), gr);
+	atomicAdd(dZ_imag_(in[map_indx], within), -gi_);
+}
+
+SequenceCrossEntropyGpu::~SequenceCrossEntropyGpu() {
+#ifdef __CUDACC__
+	if (gpu_targets_)   cudaFree(gpu_targets_);
+	if (gpu_sqnorm_)    cudaFree(gpu_sqnorm_);
+	if (gpu_poss_loss_) cudaFree(gpu_poss_loss_);
+#endif
+}
+
+void SequenceCrossEntropyGpu::gpu_seq_ce_forward() {
+	SequenceCrossEntropy *cpu = (SequenceCrossEntropy*) getCpuFun()[0];
+	vocab_ = cpu->vocab();
+	n_pos_ = cpu->nPos();
+	int B = getNoMappings();
+
+	// Raw cudaMalloc (freed in the destructor): a scoped GpuHelper would free
+	// these the moment it went out of scope, leaving dangling members. The
+	// sqnorm / loss buffers are B*n_pos; gpu_targets_ (self-owned) is only used
+	// in the batch=1 path -- batched runs read the CNet-owned gpu_batch_targets_.
+	if (!gpu_sqnorm_) {
+		gpuErrchk(cudaMalloc((void**) &gpu_sqnorm_, B * n_pos_ * sizeof(float)));
+		gpuErrchk(cudaMalloc((void**) &gpu_poss_loss_, B * n_pos_ * sizeof(float)));
+		if (!gpu_batch_targets_) {
+			gpuErrchk(cudaMalloc((void**) &gpu_targets_, n_pos_ * sizeof(int)));
+		}
+	}
+	int *targets;
+	if (gpu_batch_targets_) {
+		targets = gpu_batch_targets_;   // already uploaded by CNet::batchToGpu
+	} else {
+		gpuErrchk(cudaMemcpy(gpu_targets_, cpu->targetsData(), n_pos_ * sizeof(int),
+				cudaMemcpyHostToDevice));
+		targets = gpu_targets_;
+	}
+
+	int total = B * n_pos_;
+	int tb = 128;
+	unsigned grid = (total + tb - 1) / tb;
+	seq_ce_forward__ CUDA2(grid, tb)
+			(gpu_in_ptr_, vocab_, n_pos_, targets, gpu_sqnorm_, gpu_poss_loss_, total);
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+}
+
+void SequenceCrossEntropyGpu::gpu_seq_ce_backward() {
+	int B = getNoMappings();
+	int total = B * n_pos_ * vocab_;
+	float inv_n = 1.0f / (float) n_pos_;
+	int *targets = gpu_batch_targets_ ? gpu_batch_targets_ : gpu_targets_;
+	int tb = 256;
+	unsigned grid = (total + tb - 1) / tb;
+	seq_ce_backward__ CUDA2(grid, tb)
+			(gpu_in_ptr_, vocab_, n_pos_, targets, gpu_sqnorm_, inv_n, total);
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+}
+
+float SequenceCrossEntropyGpu::readLoss() {
+	int n = getNoMappings() * n_pos_;
+	std::vector<float> loss(n);
+	gpuErrchk(cudaMemcpy(&loss[0], gpu_poss_loss_, n * sizeof(float),
+			cudaMemcpyDeviceToHost));
+	double s = 0.0;
+	for (float l : loss) s += l;
+	return (float) (s / n);
+}
+
+// One thread per batch element: argmax_k |z_k|^2 (the prediction) compared to
+// the label, writing 1/0 into out_correct[map]. |z_k|^2/||z||^2 has the same
+// argmax as |z_k|^2, so no normalisation is needed. Cheap: no_mappings threads,
+// N work each, reusing the activations already on the device.
+__global__ void gpu_argmax_correct__(GpuInVar *in, int *labels, int *out_correct,
+		int N, int no_mappings) {
+	int map_indx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (map_indx >= no_mappings) {
+		return;
+	}
+	int best = 0;
+	float best_val = -1.f;
+	for (int k = 0; k < N; ++k) {
+		float re = *Z_real_(in[map_indx], k);
+		float im = *Z_imag_(in[map_indx], k);
+		float m = re * re + im * im;
+		if (m > best_val) {
+			best_val = m;
+			best = k;
+		}
+	}
+	out_correct[map_indx] = (best == labels[map_indx]) ? 1 : 0;
+}
+
+void gpu_argmax_correct(GpuInVar *in, int *labels, int *out_correct, int N, int no_mappings) {
+	int block = 256;
+	unsigned grid = (no_mappings + block - 1) / block;
+	gpu_argmax_correct__ CUDA2(grid, block) (in, labels, out_correct, N, no_mappings);
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+}
+
+// Like gpu_argmax_correct but writes the predicted class (Born argmax of |z_k|^2)
+// per mapping, for building a confusion matrix on the host.
+__global__ void gpu_argmax_predict__(GpuInVar *in, int *out_pred, int N, int no_mappings) {
+	int map_indx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (map_indx >= no_mappings) {
+		return;
+	}
+	int best = 0;
+	float best_val = -1.f;
+	for (int k = 0; k < N; ++k) {
+		float re = *Z_real_(in[map_indx], k);
+		float im = *Z_imag_(in[map_indx], k);
+		float m = re * re + im * im;
+		if (m > best_val) {
+			best_val = m;
+			best = k;
+		}
+	}
+	out_pred[map_indx] = best;
+}
+
+void gpu_argmax_predict(GpuInVar *in, int *out_pred, int N, int no_mappings) {
+	int block = 256;
+	unsigned grid = (no_mappings + block - 1) / block;
+	gpu_argmax_predict__ CUDA2(grid, block) (in, out_pred, N, no_mappings);
 	gpuErrchk(cudaPeekAtLastError());
 	gpuErrchk(cudaDeviceSynchronize());
 }
