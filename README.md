@@ -78,15 +78,12 @@ write implementations for the `dz()` and the `dz_star()` methods instead.
 For example for the Sigmoid function 
 $Sigmoid\big(\textbf{z} = (z_0,\dots, z_i, \dots)\big)=\big(S_0(\textbf{z}),\dots,S_j(\textbf{z}),\dots\big)$
 we have that the conjugate derivatives are all null because the sigmoid function is defined only in terms of $\textbf{z}=x+iy$ and not of the conjugate $z^\star=x-iy$:
-<p align="center">
-$\frac{d}{d z_i^\star}S_j=0 \text{ for all } 0\leq i,j \lt n$ 
-</p>
+
+$$\frac{d}{d z_i^\star} S_j = 0 \quad \text{for all } 0 \leq i,j < n$$
 
 while the $z$ derivatives are easily computed as 
 
-<p align="center">
-$\frac{d}{d z_i}S_j=g(z_i)(1−g(z_i)) \text{ for all } 0\leq i = j \lt n \text{ where } g(z) \mapsto 1 / (1 + e^{-z}).$ 
-</p>
+$$\frac{d}{d z_i} S_j = g(z_i)\,(1 - g(z_i)) \quad \text{for all } 0 \leq i = j < n, \quad g(z) = \frac{1}{1 + e^{-z}}$$
 
 From the above observations we can easily implement the `dz()` and the `dz_star()` methods:
 
@@ -220,7 +217,7 @@ or are restored from a model via `net.restore(std::string file)`.
 
 This layer implements the [Discrete Fourier Transform](https://en.wikipedia.org/wiki/Discrete_Fourier_transform) function
 
- $FFT : \mathbb{C}^N \to \mathbb{C}^N \text{ given by } FFT(z)_p \mapsto \sum_q z_q e^{i2{\pi}pq / N} / \sqrt{N}$.
+$$\mathrm{FFT}: \mathbb{C}^N \to \mathbb{C}^N, \qquad \mathrm{FFT}(z)_p = \frac{1}{\sqrt{N}} \sum_q z_q\, e^{\,i 2\pi p q / N}.$$
 
 The main variable of this function is its input/output size. Example of its usage:
  ```c++
@@ -235,7 +232,7 @@ auto fft = cnet.add(new FourierTrans(InSize(28 * 28)), {inp});
 
 This layer implements the [Inverse Discrete Fourier Transform](https://en.wikipedia.org/wiki/Discrete_Fourier_transform), the exact (unitary) inverse of `FourierTrans`:
 
- $IFFT : \mathbb{C}^N \to \mathbb{C}^N \text{ given by } IFFT(z)_p \mapsto \sum_q z_q e^{-i2{\pi}pq / N} / \sqrt{N}$.
+$$\mathrm{IFFT}: \mathbb{C}^N \to \mathbb{C}^N, \qquad \mathrm{IFFT}(z)_p = \frac{1}{\sqrt{N}} \sum_q z_q\, e^{-i 2\pi p q / N}.$$
 
 It is typically used to bring a Hadamard product back to the time domain, i.e. to realise a circular convolution as $Conv(u, v) = IFFT\big(Hadamard(FFT(u), FFT(v))\big)$.
 
@@ -249,9 +246,9 @@ auto ifft = cnet.add(new InverseFourierTrans(InSize(28 * 28)), {hdm});
 
 ## Triangular (Causal) Fourier Layer
 
-This layer implements a *causal* variant of the DFT: a lower-triangular-masked Fourier sum, so output position $p$ depends only on inputs $0 \leq q \leq p$:
+This layer implements a *causal* variant of the DFT: a lower-triangular-masked Fourier sum $\mathrm{TriangFourier}: \mathbb{C}^N \to \mathbb{C}^N$, so output position $p$ depends only on inputs $0 \leq q \leq p$:
 
- $\text{TriangFourier} : \mathbb{C}^N \to \mathbb{C}^N \text{ given by } \text{TriangFourier}(z)_p \mapsto \sum_{q=0}^{p} z_q e^{i2{\pi}pq / N} / \sqrt{N}$.
+$$\mathrm{TriangFourier}(z)_p = \frac{1}{\sqrt{N}} \sum_{q=0}^{p} z_q\, e^{\,i 2\pi p q / N}.$$
 
 This makes it a *parameter-free causal token mixer* — the autoregressive analogue of self-attention used in [FNet](https://aclanthology.org/2022.naacl-main.319.pdf)-style language models: it mixes information across tokens while never letting a position see its own future. With a token-major `CEmbedding` layout (token $t$ occupies a contiguous block) the triangular mask over the flattened index is exactly token-level causality. The triangular mask breaks the usual FFT factorisation, so the default kernel is a direct $O(N^2)$ sum; an $O(N \log N)$ GPU fast path is also available (`-fft_fast`), which evaluates the causal transform via a Bluestein/chirp-z factorisation with batched cuFFT (forward and Wirtinger backward).
 
@@ -266,7 +263,7 @@ auto mix = cnet.add(new TriangFourier(InSize(emb_dim * max_in_tokens)), {emb});
 
 This layer implements the Hadamard function which is simply the element-wise multiplication:
 
- $Hadamard : \mathbb{C}^N \times \mathbb{C}^N \to \mathbb{C}^N \text{ given by } Hadamard(u, v)_p \mapsto u_p * v_p$.
+$$\mathrm{Hadamard}: \mathbb{C}^N \times \mathbb{C}^N \to \mathbb{C}^N, \qquad \mathrm{Hadamard}(u, v)_p = u_p\, v_p.$$
 
  In the complex valued neural network world, the Hadamard Layer is equivalent with the Convolution layer, because
  the Fourier Transform famously commutes with the convolution: $FFT\big(Conv(u, v)\big)=Hadamard\big(FFT(u), FFT(v)\big).$ 
@@ -288,7 +285,7 @@ auto hdm = cnet.add(new Hadamard(InSize(28 * 28), InSize(28 * 28)), {fft, h_data
 
 This layer implements the Residual function which computes the element-wise addition:
 
-$Residual : \mathbb{C}^N \times \mathbb{C}^N \to \mathbb{C}^N \text{ given by } Residual(u, v)_p \mapsto u_p + v_p$.
+$$\mathrm{Residual}: \mathbb{C}^N \times \mathbb{C}^N \to \mathbb{C}^N, \qquad \mathrm{Residual}(u, v)_p = u_p + v_p.$$
 
 You can see an example of using the Residual layer `res` in the following code snippet:
  
@@ -307,7 +304,7 @@ auto res = cnet.add(new Residual(InSize(28 * 28), InSize(28 * 28)), {fft, hdm});
 ## Linear Layer
 This layer is the equivalent of the fully connected / dense layer and is performing a matrix multiplication:
 
-$Linear : \mathbb{C}^N \times \mathbb{C}^{N*M} \to \mathbb{C}^M \text{ given by } Linear(u, W) \mapsto u * M$.
+$$\mathrm{Linear}: \mathbb{C}^N \times \mathbb{C}^{N \cdot M} \to \mathbb{C}^M, \qquad \mathrm{Linear}(u, W) = u\,W.$$
 
 You can see an example of using the Linear layer `lin` in the following code snippet:
 
@@ -341,8 +338,7 @@ auto ff = cnet.add(new TokenwiseLinear(N, E, H), {hidden, w1});
 
 This activation function is the equivalent of Relu:
 
-$CRelu : \mathbb{C}^N \to \mathbb{C}^N \text{ given by } 
-CRelu(x + iy)_k \mapsto x_k + iy_k \text{ if } x_k,y_k >0, \space 0 \text{ otherwise}$.
+$$\mathrm{CRelu}: \mathbb{C}^N \to \mathbb{C}^N, \qquad \mathrm{CRelu}(x + iy)_k = x_k + i y_k \ \text{ if } x_k, y_k > 0, \ \text{ else } 0.$$
 
 You can see an example of using the CRelu layer `rel` in the following code snippet:
 
@@ -359,7 +355,7 @@ auto rel = cnet.add(new Crelu(InSize(512)), {inp});
 
 This activation function is the equivalent of Gelu:
 
-$CGelu : \mathbb{C}^N \to \mathbb{C}^N \text{ given by } CGelu(x + iy)_k \mapsto Gelu(x_k) + iGelu(y_k)$.
+$$\mathrm{CGelu}: \mathbb{C}^N \to \mathbb{C}^N, \qquad \mathrm{CGelu}(x + iy)_k = \mathrm{Gelu}(x_k) + i\,\mathrm{Gelu}(y_k).$$
 
 You can read more about $Gelu$ in the paper [Gaussian Error Linear Units (GELUs)](https://arxiv.org/abs/1606.08415).
 You can see an example of using the CGelu layer `rel` in the following code snippet:
@@ -377,7 +373,7 @@ auto rel = cnet.add(new CGelu(InSize(512)), {inp});
 
 Despite its name, this layer is the complex $L2$ normalization — it divides by the Euclidean norm:
 
-$SoftMax : \mathbb{C}^N \to \mathbb{C}^N \text{ given by } SoftMax(z)_k \mapsto z_k / \|z\|, \quad \|z\| = \sqrt{\sum_j |z_j|^2}$.
+$$\mathrm{SoftMax}: \mathbb{C}^N \to \mathbb{C}^N, \qquad \mathrm{SoftMax}(z)_k = \frac{z_k}{\|z\|}, \quad \|z\| = \sqrt{\sum_j |z_j|^2}.$$
 
 Unlike `CGelu`, this activation is scale-covariant and **commutes with the (unitary) Fourier Transform**, so it can be used inside a spectral network without breaking the FFT/convolution equivalence — useful as the nonlinearity between spectral mixing layers.
 
@@ -392,7 +388,7 @@ auto nrm = cnet.add(new SoftMax(InSize(512)), {inp});
 
 This loss function is simply the square of the $L2$ norm:
 
-$L2Out : \mathbb{C}^N \to \mathbb{R} \text{ given by } L2Out(z) \mapsto \sum_k {z_k * z_k^{\star}} = \sum_k |z_k|^2$.
+$$\mathrm{L2Out}: \mathbb{C}^N \to \mathbb{R}, \qquad \mathrm{L2Out}(z) = \sum_k z_k\, z_k^{\star} = \sum_k |z_k|^2.$$
 
 You can see an example of using the `L2Out` loss function `l2` in the following code snippet:
 
@@ -409,8 +405,7 @@ auto l2 = net.add(new L2Out(InSize(128)), {sigm});
 
 The CrossEntropy loss implements the multivariable function
 
-$CrossEntropy : \mathbb{C}^N \times \mathbb{R}^N \to \mathbb{R} \text{ given by } CrossEntropy(z, y) \mapsto 
-\sum_k -y_k \log({z_k * z_k^{\star}}/ \|z\|^2)$.
+$$\mathrm{CrossEntropy}: \mathbb{C}^N \times \mathbb{R}^N \to \mathbb{R}, \qquad \mathrm{CrossEntropy}(z, y) = \sum_k -y_k \log\!\big(z_k\, z_k^{\star} / \|z\|^2\big).$$
 
 You can read more on it in the [On the Equivalence of Convolutional and Hadamard Networks using DFT](https://arxiv.org/abs/1810.11650) research paper.
 You can see an example of using the `CrossEntropy` loss function `ce` in the following code snippet, as well as in the 
@@ -430,7 +425,7 @@ auto ce = cnet.add(new CrossEntropy(InSize(10)), {lin});
 
 This is the autoregressive analogue of `CrossEntropy`. The input is $N$ contiguous vocabulary-sized blocks (one per sequence position); each block is treated as an independent Born-rule measurement, and the loss is the mean over positions of the negative log-probability of that position's target token:
 
-$SeqCE : \mathbb{C}^{N \cdot V} \times \mathbb{R}^{N} \to \mathbb{R} \text{ given by } SeqCE(z, y) \mapsto \frac{1}{N}\sum_{p=0}^{N-1} -\log\big(|z_{p,y_p}|^2 / \|z_p\|^2\big)$.
+$$\mathrm{SeqCE}: \mathbb{C}^{N \cdot V} \times \mathbb{R}^{N} \to \mathbb{R}, \qquad \mathrm{SeqCE}(z, y) = \frac{1}{N}\sum_{p=0}^{N-1} -\log\!\big(|z_{p,y_p}|^2 / \|z_p\|^2\big).$$
 
 The per-position targets (the input tokens shifted left by one) are set with `setTargets(std::vector<int>)` before each forward pass. Combined with a token-major `CEmbedding`, a causal `TriangFourier` mixer and `TokenwiseLinear` feed-forward blocks, this trains a character-level language model where every position predicts its next token in a single pass.
 
