@@ -253,7 +253,7 @@ This layer implements a *causal* variant of the DFT: a lower-triangular-masked F
 
  $\text{TriangFourier} : \mathbb{C}^N \to \mathbb{C}^N \text{ given by } \text{TriangFourier}(z)_p \mapsto \sum_{q=0}^{p} z_q e^{i2{\pi}pq / N} / \sqrt{N}$.
 
-This makes it a *parameter-free causal token mixer* — the autoregressive analogue of self-attention used in [FNet](https://aclanthology.org/2022.naacl-main.319.pdf)-style language models: it mixes information across tokens while never letting a position see its own future. With a token-major `CEmbedding` layout (token $t$ occupies a contiguous block) the triangular mask over the flattened index is exactly token-level causality. Because the mask breaks the FFT factorisation, it is computed as a direct $O(N^2)$ sum.
+This makes it a *parameter-free causal token mixer* — the autoregressive analogue of self-attention used in [FNet](https://aclanthology.org/2022.naacl-main.319.pdf)-style language models: it mixes information across tokens while never letting a position see its own future. With a token-major `CEmbedding` layout (token $t$ occupies a contiguous block) the triangular mask over the flattened index is exactly token-level causality. The triangular mask breaks the usual FFT factorisation, so the default kernel is a direct $O(N^2)$ sum; an $O(N \log N)$ GPU fast path is also available (`-fft_fast`), which evaluates the causal transform via a Bluestein/chirp-z factorisation with batched cuFFT (forward and Wirtinger backward).
 
  ```c++
 #include "impl/ft.h"
@@ -551,7 +551,5 @@ for (int epoch = 0; epoch < no_epochs; ++epoch) {
 The current version of the CNet framework has some limitations:
 * there is no support for multiple GPUs at the moment;
 * APIs to create new functions / layers are for CPU-only. Support for APIs for implementing CUDA layers, to follow.
-* certain CUDA layer implementations are not optimal;
-* the causal `TriangFourier` mixer is a direct $O(N^2)$ computation (the triangular mask precludes the FFT speed-up), so it is compute-bound for long sequences;
 * supported only on Linux/MacOS. 
 
