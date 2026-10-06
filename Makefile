@@ -33,8 +33,12 @@ ifeq ($(NVCC_TEST),nvcc)
     # -MMD -MP: emit a .d file per object listing the headers it includes, so
     # header edits trigger the right recompiles (-MP adds phony header targets
     # so a removed header doesn't break the build).
-    CXXFLAGS = -x cu -std=c++11 -Xcompiler -fopenmp -O2 -MMD -MP
+    CXXFLAGS = -x cu -std=c++11 -Xcompiler -fopenmp -O2 -MMD -MP --default-stream per-thread
     LDFLAGS = -lgomp -lcufft # GNU OpenMP runtime + cuFFT (FourierTrans fast path).
+    # NCCL is only needed by code that does multi-GPU all-reduce. The dp_shakespeare
+    # example links it directly; MAINLIBS adds it to the dev main (gpu_tests.h uses
+    # it) and is patched empty for the public main by github_export.sh.
+    MAINLIBS =
     SRCS = utils/flags.cpp \
            gpu/gpu_func.cpp \
            impl/vars.cpp \
@@ -63,7 +67,7 @@ endif
 
 # VPATH tells 'make' where to look for source files.
 # This is created automatically from the unique directory paths in the SRCS variable.
-VPATH = $(sort $(dir $(SRCS)))
+VPATH = $(sort $(dir $(SRCS))) examples
 
 # Generate object file names, placing them in the OBJ_DIR.
 # This handles both .cpp and .cu files correctly.
@@ -77,10 +81,22 @@ OBJS := $(subst .cu,.o,$(OBJS))
 DEPS = $(OBJS:.o=.d)
 
 
+# Framework objects (everything except the selected main), reused by example mains.
+FW_SRCS = utils/flags.cpp gpu/gpu_func.cpp impl/vars.cpp gpu/kernels.cpp gpu/reduce.cpp gpu/reducegrad.cpp
+FW_OBJS = $(addprefix $(OBJ_DIR)/, $(notdir $(FW_SRCS:.cpp=.o)))
+
+
 # --- Build Rules ---
 
 # Phony targets are not actual files. 'all' is the default goal.
-.PHONY: all clean run info
+.PHONY: all clean run info dp_shakespeare
+.DEFAULT_GOAL := all
+
+# Standalone multi-GPU data-parallel tiny-shakespeare example (its own main).
+dp_shakespeare: $(FW_OBJS) $(OBJ_DIR)/dp_shakespeare.o
+	@mkdir -p $(TARGET_DIR)
+	$(CXX) $^ $(LDFLAGS) -lnccl -o $(TARGET_DIR)/dp_shakespeare
+	@echo "==> Built $(TARGET_DIR)/dp_shakespeare"
 
 # Default target: build the final executable.
 all: $(TARGET)
@@ -89,7 +105,7 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	@echo "==> Linking target: $@"
 	@mkdir -p $(TARGET_DIR) # Ensure the target directory exists.
-	$(CXX) $^ $(LDFLAGS) -o $@
+	$(CXX) $^ $(LDFLAGS) $(MAINLIBS) -o $@
 	@echo "==> Build complete. Executable is at $(TARGET)"
 
 # Generic pattern rule to compile any source file (.cpp or .cu) into an object file.

@@ -602,6 +602,69 @@ public:
 		return true;
 	}
 
+	// ---- Multi-GPU data parallelism (prototype) ------------------------------
+	// Stage ancestor buffers to/from host so a driver can all-reduce gradients
+	// (and broadcast initial weights) across independent CNet replicas, one per
+	// GPU. In the per-variable arena z occupies segments 0,1 (offset 0) and the
+	// dz_star gradient segments 4,5 (offset 4*L), each 2*L floats (cf.
+	// getInputsFromGpu / printInputGradNorms). Ordering follows net_->inputs()
+	// (ancestors only), so two identically-built nets align index-for-index. The
+	// caller must cudaSetDevice() to this net's device before calling these.
+	std::vector<std::vector<float>> collectAncestorGrads() {
+		std::vector<std::vector<float>> out;
+		for (auto fun : net_->inputs()) {
+			if (fun->isGpuOnly()) continue;
+			int L = fun->input().length_;
+			std::vector<float> g(2 * L);
+			helper_.float_copy_from_gpu(2 * L, fun->gpu_var_.input_ptr_ + 4 * L, &g[0]);
+			out.push_back(std::move(g));
+		}
+		return out;
+	}
+	void loadAncestorGrads(const std::vector<std::vector<float>> &grads) {
+		size_t i = 0;
+		for (auto fun : net_->inputs()) {
+			if (fun->isGpuOnly()) continue;
+			int L = fun->input().length_;
+			assert(i < grads.size() && (int) grads[i].size() == 2 * L);
+			helper_.float_copy_to_gpu(2 * L, &grads[i][0], fun->gpu_var_.input_ptr_ + 4 * L);
+			++i;
+		}
+	}
+	std::vector<std::vector<float>> collectAncestorParams() {
+		std::vector<std::vector<float>> out;
+		for (auto fun : net_->inputs()) {
+			if (fun->isGpuOnly()) continue;
+			int L = fun->input().length_;
+			std::vector<float> z(2 * L);
+			helper_.float_copy_from_gpu(2 * L, fun->gpu_var_.input_ptr_, &z[0]);
+			out.push_back(std::move(z));
+		}
+		return out;
+	}
+	void loadAncestorParams(const std::vector<std::vector<float>> &params) {
+		size_t i = 0;
+		for (auto fun : net_->inputs()) {
+			if (fun->isGpuOnly()) continue;
+			int L = fun->input().length_;
+			assert(i < params.size() && (int) params[i].size() == 2 * L);
+			helper_.float_copy_to_gpu(2 * L, &params[i][0], fun->gpu_var_.input_ptr_);
+			++i;
+		}
+	}
+	// Device pointers + float-counts of each ancestor's dz_star gradient segment,
+	// for an in-place NCCL all-reduce (no host staging). Same net_->inputs() order
+	// across identically-built replicas, so the k-th buffer matches across ranks.
+	std::vector<std::pair<float*, int>> ancestorGradBuffers() {
+		std::vector<std::pair<float*, int>> out;
+		for (auto fun : net_->inputs()) {
+			if (fun->isGpuOnly()) continue;
+			int L = fun->input().length_;
+			out.emplace_back(fun->gpu_var_.input_ptr_ + 4 * L, 2 * L);
+		}
+		return out;
+	}
+
 	// Debug: L2 norm of each ancestor input's dz_star gradient (segments 4,5),
 	// read straight from the GPU after backward. Used to compare batched-vs-batch=1:
 	// with B identical clones every ancestor's gradient must be exactly B x the
