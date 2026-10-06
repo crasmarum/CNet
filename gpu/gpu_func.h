@@ -602,6 +602,55 @@ public:
 		return true;
 	}
 
+	// Debug: L2 norm of each ancestor input's dz_star gradient (segments 4,5),
+	// read straight from the GPU after backward. Used to compare batched-vs-batch=1:
+	// with B identical clones every ancestor's gradient must be exactly B x the
+	// batch=1 value; whichever ancestor breaks that localizes the faulty layer.
+	void printInputGradNorms() {
+		for (auto fun : net_->inputs()) {
+			if (fun->isGpuOnly()) {
+				continue;
+			}
+			int L = fun->input().length_;
+			std::vector<float> g(2 * L);
+			helper_.float_copy_from_gpu(2 * L, fun->gpu_var_.input_ptr_ + 4 * L, &g[0]);
+			double n = 0;
+			for (float x : g) n += (double) x * x;
+			std::cout << "GRADNORM\t" << fun->getName() << "\t" << std::sqrt(n) << std::endl;
+		}
+	}
+
+	// Debug: compare each ancestor's own dz_star gradient to its first clone's,
+	// read straight from GPU after a backward (BEFORE updateGradientsFromClones).
+	// With identical clones (dup_batch) the two must be equal; a large |anc-clone0|
+	// means that layer's per-clone forward/backward is wrong (the residual bug).
+	void printAncestorVsCloneGrad() {
+		for (auto fun : net_->inputs()) {
+			if (fun->isGpuOnly()) {
+				continue;
+			}
+			auto it = cpuNet().gpu_clones_of_.find(fun->uid());
+			if (it == cpuNet().gpu_clones_of_.end() || it->second.empty()) {
+				continue;
+			}
+			int L = fun->input().length_;
+			std::vector<float> ag(2 * L), cg(2 * L);
+			helper_.float_copy_from_gpu(2 * L, fun->gpu_var_.input_ptr_ + 4 * L, &ag[0]);
+			helper_.float_copy_from_gpu(2 * L, it->second[0]->gpu_var_.input_ptr_ + 4 * L, &cg[0]);
+			double an = 0, cn = 0, diff = 0;
+			for (int i = 0; i < 2 * L; ++i) {
+				an += (double) ag[i] * ag[i];
+				cn += (double) cg[i] * cg[i];
+				double d = (double) ag[i] - cg[i];
+				diff += d * d;
+			}
+			std::cout << "ACVCLONE\t" << fun->getName()
+					  << "\tanc=" << std::sqrt(an)
+					  << "\tclone0=" << std::sqrt(cn)
+					  << "\t|anc-clone0|=" << std::sqrt(diff) << std::endl;
+		}
+	}
+
 	/**
 	 * Copying the data Z and dZ from ancestor to all clones.
 	 */

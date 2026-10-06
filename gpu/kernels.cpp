@@ -877,8 +877,13 @@ __global__ void gpu_grad_from_clones__(GpuCloneVar *in, int max_input_len, int t
 
 	int start_pos = in[current_input].data_len_; // grad start pos
 	for (int clone_indx = 0; clone_indx < in[current_input].no_clones_; ++clone_indx) {
-		atomicAdd(in[current_input].ancestor_ptr_ + start_pos + pos,
-				*(in[current_input].clone_array_ptr_[clone_indx] + start_pos + pos));
+		float *clone_grad = in[current_input].clone_array_ptr_[clone_indx] + start_pos + pos;
+		atomicAdd(in[current_input].ancestor_ptr_ + start_pos + pos, *clone_grad);
+		// Reset the clone gradient after folding it into the ancestor. Clones are
+		// never touched by the optimizer (only the ancestor is updated+zeroed), and
+		// backward accumulates with atomicAdd, so without this the clone gradients
+		// would pile up across steps and the ancestor would receive a running sum.
+		*clone_grad = 0.0f;
 	}
 }
 

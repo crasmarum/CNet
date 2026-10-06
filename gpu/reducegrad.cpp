@@ -726,7 +726,89 @@ void InverseFourierGpu::gpu_ifft_backward(int label, int block_size) {
 	assert(fft_fast && "InverseFourierGpu requires -fft_fast true");
 }
 
+// ---- Bluestein fast path for TriangFourier (backward / adjoint) ----
+// The adjoint of the lower-triangular DFT is the upper-triangular sum
+//   dz[q]      += (1/sqrt N) sum_{p>=q} dLdz[p]      w^{pq}
+//   dz_star[q] += (1/sqrt N) sum_{p>=q} dLdz_star[p] conj(w^{pq})
+// which chirps into a correlation (reversed kernel): with b = g*chirp (dz) or
+// g*conj(chirp) (dz*), grad = chirp (resp. conj(chirp)) * corr(b, k) / sqrt N,
+// corr computed as b convolved with the reversed kernel KrA/KrB precomputed at
+// setup. Same O(N log N) batched FFT as the forward.
+
+// b = g * (chirp | conj chirp), zero-padded to L, read from output gradients.
+__global__ void gpu_blb_gather_grad__(GpuOutVar *out, cmplx_ *chirp, cmplx_ *buf,
+		int N, int L, int no_mappings, int use_star) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= no_mappings * L) return;
+	int map = tid / L;
+	int k = tid % L;
+	if (k < N) {
+		cmplx_ g  = use_star ? dZ_star_(out[map], k) : dZ_(out[map], k);
+		cmplx_ ch = use_star ? conj_(chirp[k]) : chirp[k];
+		buf[tid] = g * ch;
+	} else {
+		buf[tid] = cmplx(0.f, 0.f);
+	}
+}
+
+__global__ void gpu_blb_kmul__(cmplx_ *buf, cmplx_ *K, int L, int no_mappings) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= no_mappings * L) return;
+	int k = tid % L;
+	buf[tid] = buf[tid] * K[k];
+}
+
+// grad_in[q] += (chirp | conj chirp)[q] * corr[q] * scale  (accumulate).
+__global__ void gpu_blb_scatter_grad__(cmplx_ *buf, cmplx_ *chirp, GpuInVar *in,
+		int N, int L, int no_mappings, float scale, int use_star) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= no_mappings * N) return;
+	int map = tid / N;
+	int q = tid % N;
+	cmplx_ ch = use_star ? conj_(chirp[q]) : chirp[q];
+	cmplx_ v = (ch * buf[map * L + q]) * scale;
+	if (use_star) {
+		atomicAdd(dZ_star_real_(in[map], q), v.real);
+		atomicAdd(dZ_star_imag_(in[map], q), v.imag);
+	} else {
+		atomicAdd(dZ_real_(in[map], q), v.real);
+		atomicAdd(dZ_imag_(in[map], q), v.imag);
+	}
+}
+
 void TrianFourierGpu::gpu_T_fft_backward(int label, int block_size) {
+	if (fft_fast) {
+#ifdef __CUDACC__
+		int N = length();
+		int M = getNoMappings();
+		ensure_bluestein(N, M);
+		int L = bl_L_;
+
+		int tb = 256;
+		unsigned gridL = ((size_t) L * M + tb - 1) / tb;
+		unsigned gridN = ((size_t) N * M + tb - 1) / tb;
+		float scale = 1.0f / ((float) L * sqrtf((float) N));
+
+		// dz += L^T dLdz  (kernel KrA = FFT(reverse(conj chirp)))
+		gpu_blb_gather_grad__ CUDA2(gridL, tb) (gpu_out_ptr_, bl_chirp_, bl_buf_, N, L, M, 0);
+		cufftExecC2C((cufftHandle) bl_plan_, (cufftComplex*) bl_buf_, (cufftComplex*) bl_buf_, CUFFT_FORWARD);
+		gpu_blb_kmul__ CUDA2(gridL, tb) (bl_buf_, bl_KrA_, L, M);
+		cufftExecC2C((cufftHandle) bl_plan_, (cufftComplex*) bl_buf_, (cufftComplex*) bl_buf_, CUFFT_INVERSE);
+		gpu_blb_scatter_grad__ CUDA2(gridN, tb) (bl_buf_, bl_chirp_, gpu_in_ptr_, N, L, M, scale, 0);
+
+		// dz_star += L^H dLdz_star  (kernel KrB = FFT(reverse(chirp)))
+		gpu_blb_gather_grad__ CUDA2(gridL, tb) (gpu_out_ptr_, bl_chirp_, bl_buf_, N, L, M, 1);
+		cufftExecC2C((cufftHandle) bl_plan_, (cufftComplex*) bl_buf_, (cufftComplex*) bl_buf_, CUFFT_FORWARD);
+		gpu_blb_kmul__ CUDA2(gridL, tb) (bl_buf_, bl_KrB_, L, M);
+		cufftExecC2C((cufftHandle) bl_plan_, (cufftComplex*) bl_buf_, (cufftComplex*) bl_buf_, CUFFT_INVERSE);
+		gpu_blb_scatter_grad__ CUDA2(gridN, tb) (bl_buf_, bl_chirp_, gpu_in_ptr_, N, L, M, scale, 1);
+
+		gpuErrchk(cudaPeekAtLastError());
+		gpuErrchk(cudaDeviceSynchronize());
+		return;
+#endif
+	}
+
 	int b_out_length = getPaddedOutLength(block_size, this);
 
 	GpuHelper helper;

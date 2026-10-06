@@ -155,12 +155,34 @@ public:
 };
 
 class TrianFourierGpu : public GpuMapping {
+	// ---- Bluestein fast path (fft_fast) ----
+	// The causal (lower-triangular) DFT  T_p = (1/sqrt N) sum_{q<=p} x_q w^{pq}
+	// is the causal half of a Bluestein chirp transform: with pq = (p^2 + q^2 -
+	// (p-q)^2)/2 and chirp_k = w^{k^2/2} = e^{i pi k^2 / N},
+	//   T_p = chirp_p/sqrt(N) * (a * h)[p],  a_q = x_q chirp_q,  h_k = conj(chirp_k),
+	// where (a*h) is a CAUSAL LINEAR convolution (q in 0..p) -- computed via a
+	// zero-padded batched FFT of size L >= 2N-1. O(N^2) -> O(N log N). The adjoint
+	// (backward) is the same chirp sandwich around a correlation (reversed kernel).
+	// Chirp phases use k^2 mod 2N (float cannot hold k^2 exactly for large k), so
+	// all chirp/kernel tables are built on the host and the kernel FFTs are done
+	// once at setup.
+	int bl_plan_ = -1;          // cufftHandle, batched C2C of size L over M clones
+	cmplx_ *bl_buf_  = NULL;    // interleaved L*M scratch
+	cmplx_ *bl_chirp_ = NULL;   // N : chirp_k = e^{i pi k^2 / N}
+	cmplx_ *bl_Hf_   = NULL;    // L : FFT(pad(conj(chirp)))            -- forward conv kernel
+	cmplx_ *bl_KrA_  = NULL;    // L : FFT(reverse(conj(chirp)))        -- backward dz   correlation
+	cmplx_ *bl_KrB_  = NULL;    // L : FFT(reverse(chirp))              -- backward dz*  correlation
+	int bl_N_ = 0, bl_L_ = 0, bl_M_ = 0;
+
+	void ensure_bluestein(int N, int M);
+	void free_bluestein();
 
 public:
 	TrianFourierGpu(int depth) : GpuMapping(depth) {
 	}
 
 	virtual ~TrianFourierGpu() {
+		free_bluestein();
 	}
 
 	void gpu_T_fft_forward(int block_size);

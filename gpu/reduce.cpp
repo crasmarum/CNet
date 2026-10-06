@@ -521,8 +521,138 @@ void InverseFourierGpu::gpu_ifft_forward(int block_size) {
 	assert(fft_fast && "InverseFourierGpu requires -fft_fast true");
 }
 
+// ---- Bluestein fast path for TriangFourier ----
+// Causal linear convolution a*h via a zero-padded batched FFT of size L. All
+// chirp/kernel phases are precomputed on the host (k^2 reduced mod 2N) so float
+// never has to hold k^2 directly. The lower-triangular mask is free: it is
+// exactly the one-sided range of a linear convolution.
+
+// x_q chirp_q, zero-padded to L, interleaved per clone (forward input gather).
+__global__ void gpu_bl_gather_chirp__(GpuInVar *in, cmplx_ *chirp, cmplx_ *buf,
+		int N, int L, int no_mappings) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= no_mappings * L) return;
+	int map = tid / L;
+	int k = tid % L;
+	buf[tid] = (k < N) ? (Z_(in[map], k) * chirp[k]) : cmplx(0.f, 0.f);
+}
+
+// pointwise multiply by a length-L frequency-domain kernel (broadcast over clones).
+__global__ void gpu_bl_kmul__(cmplx_ *buf, cmplx_ *K, int L, int no_mappings) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= no_mappings * L) return;
+	int k = tid % L;
+	buf[tid] = buf[tid] * K[k];
+}
+
+// T_p = chirp_p * conv[p] * scale  -> planar output (overwrite).
+__global__ void gpu_bl_scatter_out__(cmplx_ *buf, cmplx_ *chirp, GpuOutVar *out,
+		int N, int L, int no_mappings, float scale) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= no_mappings * N) return;
+	int map = tid / N;
+	int p = tid % N;
+	cmplx_ v = (chirp[p] * buf[map * L + p]) * scale;
+	out[map].out_ptr_[p] = v.real;
+	out[map].out_ptr_[out[map].out_length_ + p] = v.imag;
+}
+
+void TrianFourierGpu::ensure_bluestein(int N, int M) {
+#ifdef __CUDACC__
+	if (bl_plan_ != -1 && bl_N_ == N && bl_M_ == M) return;
+	free_bluestein();
+
+	int L = 1;
+	while (L < 2 * N) L *= 2;                  // L >= 2N-1, power of two
+	bl_N_ = N; bl_M_ = M; bl_L_ = L;
+
+	cufftHandle plan;
+	cufftResult r = cufftPlan1d(&plan, L, CUFFT_C2C, M);
+	assert(r == CUFFT_SUCCESS);
+	bl_plan_ = (int) plan;
+
+	gpuErrchk(cudaMalloc((void**) &bl_buf_,   sizeof(cmplx_) * (size_t) L * M));
+	gpuErrchk(cudaMalloc((void**) &bl_chirp_, sizeof(cmplx_) * N));
+	gpuErrchk(cudaMalloc((void**) &bl_Hf_,    sizeof(cmplx_) * L));
+	gpuErrchk(cudaMalloc((void**) &bl_KrA_,   sizeof(cmplx_) * L));
+	gpuErrchk(cudaMalloc((void**) &bl_KrB_,   sizeof(cmplx_) * L));
+
+	// Host-built chirp and kernels. chirp_k = e^{i pi (k^2 mod 2N) / N}.
+	const double PI = acos(-1.0);
+	const long twoN = 2L * (long) N;
+	std::vector<cmplx_> chirp(N);
+	std::vector<cmplx_> hpad(L, cmplx(0.f, 0.f));   // conj(chirp), normal order  (forward conv)
+	std::vector<cmplx_> krA(L,  cmplx(0.f, 0.f));   // reverse(conj(chirp))        (backward dz)
+	std::vector<cmplx_> krB(L,  cmplx(0.f, 0.f));   // reverse(chirp)              (backward dz*)
+	// chirp_k = w^{k^2/2} with w = e^{-i 2pi / N} (UnityRoots uses the negative
+	// convention), i.e. e^{-i pi k^2 / N}; k^2 is reduced mod 2N first.
+	for (int k = 0; k < N; ++k) {
+		long kk = ((long) k * (long) k) % twoN;
+		double ph = PI * (double) kk / (double) N;
+		chirp[k] = cmplx(cos(ph), -sin(ph));
+	}
+	for (int k = 0; k < N; ++k) hpad[k] = cmplx(chirp[k].real, -chirp[k].imag);
+	krA[0] = cmplx(chirp[0].real, -chirp[0].imag);
+	krB[0] = chirp[0];
+	for (int m = 1; m < N; ++m) {
+		krA[L - m] = cmplx(chirp[m].real, -chirp[m].imag);
+		krB[L - m] = chirp[m];
+	}
+	gpuErrchk(cudaMemcpy(bl_chirp_, chirp.data(), sizeof(cmplx_) * N, cudaMemcpyHostToDevice));
+
+	// FFT the three fixed kernels once with a batch-1 size-L plan.
+	cufftHandle kplan;
+	r = cufftPlan1d(&kplan, L, CUFFT_C2C, 1);
+	assert(r == CUFFT_SUCCESS);
+	cmplx_ *dsts[3] = { bl_Hf_, bl_KrA_, bl_KrB_ };
+	std::vector<cmplx_> *srcs[3] = { &hpad, &krA, &krB };
+	for (int i = 0; i < 3; ++i) {
+		gpuErrchk(cudaMemcpy(dsts[i], srcs[i]->data(), sizeof(cmplx_) * L, cudaMemcpyHostToDevice));
+		cufftExecC2C(kplan, (cufftComplex*) dsts[i], (cufftComplex*) dsts[i], CUFFT_FORWARD);
+	}
+	cufftDestroy(kplan);
+	gpuErrchk(cudaDeviceSynchronize());
+#endif
+}
+
+void TrianFourierGpu::free_bluestein() {
+#ifdef __CUDACC__
+	if (bl_plan_ != -1) { cufftDestroy((cufftHandle) bl_plan_); bl_plan_ = -1; }
+	if (bl_buf_)   { cudaFree(bl_buf_);   bl_buf_ = NULL; }
+	if (bl_chirp_) { cudaFree(bl_chirp_); bl_chirp_ = NULL; }
+	if (bl_Hf_)    { cudaFree(bl_Hf_);    bl_Hf_ = NULL; }
+	if (bl_KrA_)   { cudaFree(bl_KrA_);   bl_KrA_ = NULL; }
+	if (bl_KrB_)   { cudaFree(bl_KrB_);   bl_KrB_ = NULL; }
+	bl_N_ = bl_L_ = bl_M_ = 0;
+#endif
+}
+
 void TrianFourierGpu::gpu_T_fft_forward(int block_size) {
-    int b_out_length = getPaddedLength(block_size, this);
+	if (fft_fast) {
+#ifdef __CUDACC__
+		int N = length();
+		int M = getNoMappings();
+		ensure_bluestein(N, M);
+		int L = bl_L_;
+
+		int tb = 256;
+		unsigned gridL = ((size_t) L * M + tb - 1) / tb;
+		unsigned gridN = ((size_t) N * M + tb - 1) / tb;
+		float scale = 1.0f / ((float) L * sqrtf((float) N));   // cuFFT IFFT is unnormalised (x L)
+
+		gpu_bl_gather_chirp__ CUDA2(gridL, tb) (gpu_in_ptr_, bl_chirp_, bl_buf_, N, L, M);
+		cufftExecC2C((cufftHandle) bl_plan_, (cufftComplex*) bl_buf_, (cufftComplex*) bl_buf_, CUFFT_FORWARD);
+		gpu_bl_kmul__ CUDA2(gridL, tb) (bl_buf_, bl_Hf_, L, M);
+		cufftExecC2C((cufftHandle) bl_plan_, (cufftComplex*) bl_buf_, (cufftComplex*) bl_buf_, CUFFT_INVERSE);
+		gpu_bl_scatter_out__ CUDA2(gridN, tb) (bl_buf_, bl_chirp_, gpu_out_ptr_, N, L, M, scale);
+
+		gpuErrchk(cudaPeekAtLastError());
+		gpuErrchk(cudaDeviceSynchronize());
+		return;
+#endif
+	}
+
+	int b_out_length = getPaddedLength(block_size, this);
 	std::vector<cmplx_> output(b_out_length);
 	GpuHelper helper;
 	auto gpu_buffer = helper.cmplx_allocate_on_gpu(output.size());
