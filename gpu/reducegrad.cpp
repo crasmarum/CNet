@@ -7,11 +7,28 @@
 
 #ifdef __CUDACC__
 #include <cufft.h>
+#include <cublas_v2.h>
 #endif
 
 extern bool fast_linear;    // defined in reduce.cpp
 extern bool fft_fast;       // defined in reduce.cpp
 extern bool fast_softmax;   // defined in reduce.cpp
+extern bool tw_cublas;      // defined in reduce.cpp
+
+#ifdef __CUDACC__
+// This TU's cuBLAS handle (bound to the per-thread stream); the forward TU keeps
+// its own -- both are thread_local and cheap.
+static cublasHandle_t twg_blas_handle() {
+	static thread_local cublasHandle_t h = 0;
+	if (!h) {
+		cublasCreate(&h);
+		cublasSetStream(h, cudaStreamPerThread);
+		cublasSetPointerMode(h, CUBLAS_POINTER_MODE_HOST);
+	}
+	return h;
+}
+#endif
+#define TWG_SLOTS 16
 
 __device__ cmplx_ Fdz(int provider_id, GpuInVar in, int in_indx, GpuOutVar out, int out_indx) {
 	switch (provider_id) {
@@ -467,9 +484,18 @@ __global__ void gpu_linear_vec_grad__(GpuInVar *in, GpuOutVar *out,
 }
 
 void LinearGpu::gpu_linear_backward(int label, int block_size) {
-	int N = ((Linear*)getCpuFun()[0])->firstInputLength();   // vector length
-	int M = ((Linear*)getCpuFun()[0])->outSize();            // output rows
+	int N = ((Linear*)getCpuFun()[0])->firstInputLength();   // E_in (vector length)
+	int M = ((Linear*)getCpuFun()[0])->outSize();            // E_out (output rows)
 	int no_mappings = getNoMappings();
+
+#ifdef __CUDACC__
+	// Dense Linear is the position-wise linear with a single token (N = 1).
+	if (tw_cublas && no_mappings > 0) {
+		tw_ensure_pool(d_pool_, tw_cap_, no_mappings);
+		tw_gemm_backward(1, N, M, in_, out_, d_pool_);
+		return;
+	}
+#endif
 
 	// The direct kernels beat the generic reduction when there are few output
 	// rows M (the reduction then wastes most of each 512-wide block on padding).
@@ -582,12 +608,69 @@ __global__ void gpu_tokenwise_vec_grad__(GpuInVar *in, GpuOutVar *out,
 	atomicAdd(dZ_star_imag_(in[map_indx], d_index), sum_dz_star.imag);
 }
 
+#ifdef __CUDACC__
+// Backward for the position-wise linear (the dense Linear calls with N = 1). Both
+// grads are complex GEMMs accumulated (beta=1) onto the pre-zeroed gradient planes:
+//   data grad:   gD[E_in,N]    += (conj)W[E_in,E_out] * dOut[E_out,N]
+//   weight grad: gW[E_in,E_out] += (conj)D[E_in,N]    * dOut[E_out,N]^T  (sum over tokens)
+// split into two real GEMMs per Wirtinger component (dz and dz*).
+void tw_gemm_backward(int N, int e_in, int e_out,
+		const std::vector<GpuInVar> &in_, const std::vector<GpuOutVar> &out_, float **pool) {
+	const int B = (int) in_.size();
+	const int L = in_[0].input_length_, wbase = N * e_in, outlen = out_[0].out_length_;
+	std::vector<float*> hp((size_t) 16 * B, nullptr);
+	for (int b = 0; b < B; ++b) {
+		float *base = in_[b].input_ptr_, *ob = out_[b].out_ptr_;
+		hp[0*B+b]=base;              hp[1*B+b]=base+L;                 // Dr, Di
+		hp[2*B+b]=base+wbase;        hp[3*B+b]=base+L+wbase;           // Wr, Wi
+		hp[4*B+b]=ob+2*outlen;       hp[5*B+b]=ob+3*outlen;            // dOut r/i  (dz)
+		hp[6*B+b]=ob+4*outlen;       hp[7*B+b]=ob+5*outlen;            // dOut r/i  (dz*)
+		hp[8*B+b]=base+2*L;          hp[9*B+b]=base+3*L;               // gData dz r/i
+		hp[10*B+b]=base+4*L;         hp[11*B+b]=base+5*L;              // gData dz* r/i
+		hp[12*B+b]=base+2*L+wbase;   hp[13*B+b]=base+3*L+wbase;        // gWeight dz r/i
+		hp[14*B+b]=base+4*L+wbase;   hp[15*B+b]=base+5*L+wbase;        // gWeight dz* r/i
+	}
+	gpuErrchk(cudaMemcpy(pool, hp.data(), (size_t) 16 * B * sizeof(float*), cudaMemcpyHostToDevice));
+	#define P(i) (pool + (size_t)(i) * B)
+	float **Dr=P(0),**Di=P(1),**Wr=P(2),**Wi=P(3),**GOr=P(4),**GOi=P(5),**GSr=P(6),**GSi=P(7),
+		  **gDr=P(8),**gDi=P(9),**gSDr=P(10),**gSDi=P(11),**gWr=P(12),**gWi=P(13),**gWSr=P(14),**gWSi=P(15);
+	cublasHandle_t h = twg_blas_handle();
+	const float one = 1.f;
+	// data grad: C[E_in,N] = A[E_in,E_out] * Bm[E_out,N], accumulate
+	auto GD = [&](float a, float **A, float **Bm, float **C) {
+		cublasSgemmBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, e_in, N, e_out,
+				&a, (const float* const*) A, e_in, (const float* const*) Bm, e_out, &one, C, e_in, B);
+	};
+	// weight grad: C[E_in,E_out] = A[E_in,N] * Bm[E_out,N]^T, accumulate (sum over N)
+	auto GW = [&](float a, float **A, float **Bm, float **C) {
+		cublasSgemmBatched(h, CUBLAS_OP_N, CUBLAS_OP_T, e_in, e_out, N,
+				&a, (const float* const*) A, e_in, (const float* const*) Bm, e_out, &one, C, e_in, B);
+	};
+	GD( 1.f, Wr, GOr, gDr);  GD(-1.f, Wi, GOi, gDr);
+	GD( 1.f, Wr, GOi, gDi);  GD( 1.f, Wi, GOr, gDi);
+	GD( 1.f, Wr, GSr, gSDr); GD( 1.f, Wi, GSi, gSDr);
+	GD( 1.f, Wr, GSi, gSDi); GD(-1.f, Wi, GSr, gSDi);
+	GW( 1.f, Dr, GOr, gWr);  GW(-1.f, Di, GOi, gWr);
+	GW( 1.f, Dr, GOi, gWi);  GW( 1.f, Di, GOr, gWi);
+	GW( 1.f, Dr, GSr, gWSr); GW( 1.f, Di, GSi, gWSr);
+	GW( 1.f, Dr, GSi, gWSi); GW(-1.f, Di, GSr, gWSi);
+	#undef P
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+}
+#endif
+
 void TokenwiseLinearGpu::gpu_tokenwise_backward() {
 	TokenwiseLinear *cpu = (TokenwiseLinear*) getCpuFun()[0];
-	int n_tokens = cpu->nTokens();
-	int e_in = cpu->inDim();
-	int e_out = cpu->outDim();
+	int n_tokens = cpu->nTokens(), e_in = cpu->inDim(), e_out = cpu->outDim();
 	int no_mappings = getNoMappings();
+#ifdef __CUDACC__
+	if (tw_cublas && no_mappings > 0) {
+		tw_ensure_pool(d_pool_, tw_cap_, no_mappings);
+		tw_gemm_backward(n_tokens, e_in, e_out, in_, out_, d_pool_);
+		return;
+	}
+#endif
 
 	size_t mtot = (size_t) no_mappings * n_tokens * e_out * e_in;
 	int mt = 256;

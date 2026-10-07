@@ -34,7 +34,7 @@ ifeq ($(NVCC_TEST),nvcc)
     # header edits trigger the right recompiles (-MP adds phony header targets
     # so a removed header doesn't break the build).
     CXXFLAGS = -x cu -std=c++11 -Xcompiler -fopenmp -O2 -MMD -MP --default-stream per-thread
-    LDFLAGS = -lgomp -lcufft # GNU OpenMP runtime + cuFFT (FourierTrans fast path).
+    LDFLAGS = -lgomp -lcufft -lcublas # OpenMP + cuFFT + cuBLAS (TokenwiseLinear GEMMs).
     # NCCL is only needed by code that does multi-GPU all-reduce. The dp_shakespeare
     # example links it directly; MAINLIBS adds it to the dev main (gpu_tests.h uses
     # it) and is patched empty for the public main by github_export.sh.

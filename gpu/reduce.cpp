@@ -6,9 +6,14 @@
 
 #ifdef __CUDACC__
 #include <cufft.h>
+#include <cublas_v2.h>
 #endif
 
 FLAG_INT(reduce_block_size, 512);
+
+// When off, TokenwiseLinear falls back to the naive element-wise CUDA kernels
+// (kept for A/B comparison); on by default it uses batched cuBLAS GEMMs.
+FLAG_BOOL(tw_cublas, true)
 
 // When set, the Linear layer uses the direct shared-memory GEMV kernels
 // (forward and backward) instead of the generic reduce-then-sum path.
@@ -1185,8 +1190,17 @@ __global__ void gpu_linear_forward__(GpuInVar *in, GpuOutVar *out,
 }
 
 void LinearGpu::gpu_linear_forward(int block_size) {
-	int seg_in_len = ((Linear*)getCpuFun()[0])->firstInputLength();   // N
-	int no_segments = ((Linear*)getCpuFun()[0])->outSize();           // M
+	int seg_in_len = ((Linear*)getCpuFun()[0])->firstInputLength();   // E_in (contraction)
+	int no_segments = ((Linear*)getCpuFun()[0])->outSize();           // E_out (output rows)
+
+#ifdef __CUDACC__
+	// Dense Linear is the position-wise linear with a single token (N = 1).
+	if (tw_cublas && getNoMappings() > 0) {
+		tw_ensure_pool(d_pool_, tw_cap_, getNoMappings());
+		tw_gemm_forward(1, seg_in_len, no_segments, in_, out_, d_pool_);
+		return;
+	}
+#endif
 
 	// Fast path: cache the input vector in shared memory and compute each
 	// output row directly. Used whenever the vector fits in shared memory.
@@ -1262,17 +1276,81 @@ __global__ void gpu_tokenwise_forward__(GpuInVar *in, GpuOutVar *out,
 	out[map_indx].out_ptr_[out[map_indx].out_length_ + o] = sum.imag;
 }
 
+#ifdef __CUDACC__
+// Shared cuBLAS handle bound to the per-thread stream (one per host thread; the
+// multi-process data-parallel runs are single-threaded per GPU).
+static cublasHandle_t tw_blas_handle() {
+	static thread_local cublasHandle_t h = 0;
+	if (!h) {
+		cublasCreate(&h);
+		cublasSetStream(h, cudaStreamPerThread);
+		cublasSetPointerMode(h, CUBLAS_POINTER_MODE_HOST);
+	}
+	return h;
+}
+#endif
+
+#define TW_SLOTS 16
+void tw_ensure_pool(float **&pool, int &cap, int B) {
+#ifdef __CUDACC__
+	if (cap == B) return;                 // B (clone count) is constant per instance
+	tw_free_pool(pool, cap);
+	cap = B;
+	gpuErrchk(cudaMalloc((void**) &pool, (size_t) TW_SLOTS * B * sizeof(float*)));
+#endif
+}
+void tw_free_pool(float **&pool, int &cap) {
+#ifdef __CUDACC__
+	if (pool) cudaFree(pool);
+	pool = 0; cap = 0;
+#endif
+}
+
+#ifdef __CUDACC__
+// Complex Out[N,E_out] = Data[N,E_in] * W[E_out,E_in]^T via 4 real GEMMs on the
+// planar real/imag segments (the row-major planes already ARE the column-major
+// matrices cuBLAS expects): Out_cm[E_out,N] = W_cm[E_in,E_out]^T * D_cm[E_in,N].
+// slots: 0 Dr, 1 Di, 2 Wr, 3 Wi, 4 Or, 5 Oi. Linear calls this with N = 1.
+void tw_gemm_forward(int N, int e_in, int e_out,
+		const std::vector<GpuInVar> &in_, const std::vector<GpuOutVar> &out_, float **pool) {
+	const int B = (int) in_.size();
+	const int L = in_[0].input_length_, wbase = N * e_in, outlen = out_[0].out_length_;
+	std::vector<float*> hp((size_t) 6 * B, nullptr);
+	for (int b = 0; b < B; ++b) {
+		float *base = in_[b].input_ptr_, *ob = out_[b].out_ptr_;
+		hp[0*B+b]=base;         hp[1*B+b]=base+L;
+		hp[2*B+b]=base+wbase;   hp[3*B+b]=base+L+wbase;
+		hp[4*B+b]=ob;           hp[5*B+b]=ob+outlen;
+	}
+	gpuErrchk(cudaMemcpy(pool, hp.data(), (size_t) 6 * B * sizeof(float*), cudaMemcpyHostToDevice));
+	float **Dr=pool,**Di=pool+B,**Wr=pool+2*B,**Wi=pool+3*B,**Or=pool+4*B,**Oi=pool+5*B;
+	cublasHandle_t h = tw_blas_handle();
+	const float one=1.f, neg=-1.f, zero=0.f;
+	cublasSgemmBatched(h, CUBLAS_OP_T, CUBLAS_OP_N, e_out, N, e_in, &one, (const float* const*)Wr, e_in, (const float* const*)Dr, e_in, &zero, Or, e_out, B);
+	cublasSgemmBatched(h, CUBLAS_OP_T, CUBLAS_OP_N, e_out, N, e_in, &neg, (const float* const*)Wi, e_in, (const float* const*)Di, e_in, &one,  Or, e_out, B);
+	cublasSgemmBatched(h, CUBLAS_OP_T, CUBLAS_OP_N, e_out, N, e_in, &one, (const float* const*)Wi, e_in, (const float* const*)Dr, e_in, &zero, Oi, e_out, B);
+	cublasSgemmBatched(h, CUBLAS_OP_T, CUBLAS_OP_N, e_out, N, e_in, &one, (const float* const*)Wr, e_in, (const float* const*)Di, e_in, &one,  Oi, e_out, B);
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+}
+#endif
+
 void TokenwiseLinearGpu::gpu_tokenwise_forward() {
 	TokenwiseLinear *cpu = (TokenwiseLinear*) getCpuFun()[0];
-	int n_tokens = cpu->nTokens();
-	int e_in = cpu->inDim();
-	int e_out = cpu->outDim();
-
-	size_t total = (size_t) getNoMappings() * n_tokens * e_out;
+	int n_tokens = cpu->nTokens(), e_in = cpu->inDim(), e_out = cpu->outDim();
+	int B = getNoMappings();
+#ifdef __CUDACC__
+	if (tw_cublas && B > 0) {
+		tw_ensure_pool(d_pool_, tw_cap_, B);
+		tw_gemm_forward(n_tokens, e_in, e_out, in_, out_, d_pool_);
+		return;
+	}
+#endif
+	size_t total = (size_t) B * n_tokens * e_out;
 	int tb = 256;
 	unsigned grid = (unsigned) ((total + tb - 1) / tb);
 	gpu_tokenwise_forward__ CUDA2(grid, tb)
-			(gpu_in_ptr_, gpu_out_ptr_, n_tokens, e_in, e_out, getNoMappings());
+			(gpu_in_ptr_, gpu_out_ptr_, n_tokens, e_in, e_out, B);
 #ifdef __CUDACC__
 	gpuErrchk(cudaPeekAtLastError());
 	gpuErrchk(cudaDeviceSynchronize());

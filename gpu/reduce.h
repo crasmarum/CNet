@@ -51,12 +51,25 @@ inline int getPaddedOutLength(int block_size, GpuMapping *mp) {
 	return b_out_length;
 }
 
-class LinearGpu : public GpuMapping {
+// Shared batched-cuBLAS GEMM helpers for the complex "position-wise linear"
+// pattern Out[N,E_out] = Data[N,E_in] * W[E_out,E_in]^T. Used by TokenwiseLinear
+// and by the dense Linear (which is the same layout with N = 1). The caller owns
+// a pointer-array pool (16 slots); it is (re)allocated by tw_ensure_pool.
+void tw_ensure_pool(float **&pool, int &cap, int B);
+void tw_free_pool(float **&pool, int &cap);
+void tw_gemm_forward(int N, int e_in, int e_out,
+		const std::vector<GpuInVar> &in_, const std::vector<GpuOutVar> &out_, float **pool);
+void tw_gemm_backward(int N, int e_in, int e_out,
+		const std::vector<GpuInVar> &in_, const std::vector<GpuOutVar> &out_, float **pool);
 
+class LinearGpu : public GpuMapping {
+	float **d_pool_ = 0;
+	int tw_cap_ = 0;
 public:
 	LinearGpu(int depth) : GpuMapping(depth) {
 	}
 	virtual ~LinearGpu() {
+		tw_free_pool(d_pool_, tw_cap_);
 	}
 
 	void gpu_linear_forward(int block_size);
@@ -76,11 +89,13 @@ public:
 // n_tokens contiguous e_in slices. Direct kernels (the contraction e_in and the
 // output width e_out are small); the weight gradient is accumulated over tokens.
 class TokenwiseLinearGpu : public GpuMapping {
-
+	float **d_pool_ = 0;             // 16 batched-pointer slots for the cuBLAS GEMMs
+	int tw_cap_ = 0;
 public:
 	TokenwiseLinearGpu(int depth) : GpuMapping(depth) {
 	}
 	virtual ~TokenwiseLinearGpu() {
+		tw_free_pool(d_pool_, tw_cap_);
 	}
 
 	void gpu_tokenwise_forward();
