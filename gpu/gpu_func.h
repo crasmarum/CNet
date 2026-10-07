@@ -1261,6 +1261,10 @@ public:
 		return net_->add(func, in_uids);
 	}
 
+	int add(CFunc* func, std::vector<int> in_uids) {
+		return net_->add(func, in_uids);
+	}
+
 	CFunc*& operator [](int uid) {
 		return net_->map_[uid];
 	}

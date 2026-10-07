@@ -522,14 +522,15 @@ void BornAttentionGpu::free_scratch() {
 }
 
 __global__ void gpu_born_forward__(GpuInVar *in, GpuOutVar *out,
-		cmplx_ *C, float *A, float *S, int N, int d, int B) {
+		cmplx_ *C, float *A, float *S, int N, int d, int B, int causal) {
 	int tid = blockIdx.x * blockDim.x + threadIdx.x;
 	if (tid >= B * N) return;
 	int clone = tid / N, k = tid % N, Mv = N * d;
+	const int mhi = causal ? k : N - 1;
 	GpuInVar inv = in[clone];
 	size_t cb = (size_t) clone * N * N + (size_t) k * N;
 	float Sk = 0.f;
-	for (int m = 0; m <= k; ++m) {
+	for (int m = 0; m <= mhi; ++m) {
 		cmplx_ c = cmplx(0.f, 0.f);
 		for (int dd = 0; dd < d; ++dd)
 			c = c + Z_(inv, k * d + dd) * conj_(Z_(inv, Mv + m * d + dd));
@@ -540,11 +541,11 @@ __global__ void gpu_born_forward__(GpuInVar *in, GpuOutVar *out,
 	}
 	S[(size_t) clone * N + k] = Sk;
 	float invS = Sk > 0.f ? 1.f / Sk : 0.f;
-	for (int m = 0; m <= k; ++m) A[cb + m] *= invS;
+	for (int m = 0; m <= mhi; ++m) A[cb + m] *= invS;
 	GpuOutVar ov = out[clone];
 	for (int dd = 0; dd < d; ++dd) {
 		float orr = 0.f, oii = 0.f;
-		for (int m = 0; m <= k; ++m) {
+		for (int m = 0; m <= mhi; ++m) {
 			float a = A[cb + m];
 			cmplx_ v = Z_(inv, 2 * Mv + m * d + dd);
 			orr += a * v.real; oii += a * v.imag;
@@ -555,16 +556,17 @@ __global__ void gpu_born_forward__(GpuInVar *in, GpuOutVar *out,
 }
 
 __global__ void gpu_born_backward__(GpuInVar *in, GpuOutVar *out,
-		cmplx_ *C, float *A, float *S, int N, int d, int B) {
+		cmplx_ *C, float *A, float *S, int N, int d, int B, int causal) {
 	int tid = blockIdx.x * blockDim.x + threadIdx.x;
 	if (tid >= B * N) return;
 	int clone = tid / N, k = tid % N, Mv = N * d;
+	const int mhi = causal ? k : N - 1;
 	GpuInVar inv = in[clone];
 	GpuOutVar ov = out[clone];
 	size_t cb = (size_t) clone * N * N + (size_t) k * N;
 	float invS = S[(size_t) clone * N + k] > 0.f ? 1.f / S[(size_t) clone * N + k] : 0.f;
 	float abar = 0.f;
-	for (int m = 0; m <= k; ++m) {
+	for (int m = 0; m <= mhi; ++m) {
 		float am = 0.f;
 		for (int dd = 0; dd < d; ++dd) {
 			cmplx_ gO = dZ_(ov, k * d + dd), gOb = dZ_star_(ov, k * d + dd);
@@ -573,7 +575,7 @@ __global__ void gpu_born_backward__(GpuInVar *in, GpuOutVar *out,
 		}
 		abar += A[cb + m] * am;
 	}
-	for (int m = 0; m <= k; ++m) {
+	for (int m = 0; m <= mhi; ++m) {
 		float am = 0.f;
 		for (int dd = 0; dd < d; ++dd) {
 			cmplx_ gO = dZ_(ov, k * d + dd), gOb = dZ_star_(ov, k * d + dd);
@@ -611,7 +613,7 @@ void BornAttentionGpu::gpu_born_forward() {
 	ensure_scratch(N, d, B);
 	int total = B * N, tb = 128;
 	unsigned grid = (total + tb - 1) / tb;
-	gpu_born_forward__ CUDA2(grid, tb) (gpu_in_ptr_, gpu_out_ptr_, ba_c_, ba_A_, ba_S_, N, d, B);
+	gpu_born_forward__ CUDA2(grid, tb) (gpu_in_ptr_, gpu_out_ptr_, ba_c_, ba_A_, ba_S_, N, d, B, f->causal() ? 1 : 0);
 	gpuErrchk(cudaPeekAtLastError());
 	gpuErrchk(cudaDeviceSynchronize());
 #endif
@@ -623,7 +625,7 @@ void BornAttentionGpu::gpu_born_backward() {
 	int N = f->nTokens(), d = f->dim(), B = getNoMappings();
 	int total = B * N, tb = 128;
 	unsigned grid = (total + tb - 1) / tb;
-	gpu_born_backward__ CUDA2(grid, tb) (gpu_in_ptr_, gpu_out_ptr_, ba_c_, ba_A_, ba_S_, N, d, B);
+	gpu_born_backward__ CUDA2(grid, tb) (gpu_in_ptr_, gpu_out_ptr_, ba_c_, ba_A_, ba_S_, N, d, B, f->causal() ? 1 : 0);
 	gpuErrchk(cudaPeekAtLastError());
 	gpuErrchk(cudaDeviceSynchronize());
 #endif

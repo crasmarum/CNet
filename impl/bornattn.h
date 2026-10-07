@@ -22,24 +22,28 @@
 // differences) is below.
 class BornAttention: public CFunc {
 	int N_, d_;
-	std::vector<std::complex<float>> c_;   // c[k*N+m], m<=k
+	bool causal_;                          // true: key m<=k (autoregressive); false: full attention
+	std::vector<std::complex<float>> c_;   // c[k*N+m]
 	std::vector<float> A_, S_;             // A[k*N+m], S[k]
 public:
-	BornAttention(Uid uid, int n_tokens, int dim)
+	BornAttention(Uid uid, int n_tokens, int dim, bool causal = true)
 		: CFunc(uid, InSize(3 * n_tokens * dim), OutSize(n_tokens * dim)),
-		  N_(n_tokens), d_(dim), c_(n_tokens * n_tokens), A_(n_tokens * n_tokens), S_(n_tokens) {}
+		  N_(n_tokens), d_(dim), causal_(causal),
+		  c_(n_tokens * n_tokens), A_(n_tokens * n_tokens), S_(n_tokens) {}
 
-	BornAttention(int n_tokens, int dim)
+	BornAttention(int n_tokens, int dim, bool causal = true)
 		: CFunc(InSize(3 * n_tokens * dim), OutSize(n_tokens * dim)),
-		  N_(n_tokens), d_(dim), c_(n_tokens * n_tokens), A_(n_tokens * n_tokens), S_(n_tokens) {}
+		  N_(n_tokens), d_(dim), causal_(causal),
+		  c_(n_tokens * n_tokens), A_(n_tokens * n_tokens), S_(n_tokens) {}
 
 	virtual ~BornAttention() {}
-	virtual CFunc* clone(Uid uid) { return new BornAttention(uid, N_, d_); }
+	virtual CFunc* clone(Uid uid) { return new BornAttention(uid, N_, d_, causal_); }
 	virtual std::string getName() { return "BornAttention_" + std::to_string(uid_); }
 
 	int M() const { return N_ * d_; }
 	int nTokens() const { return N_; }
 	int dim() const { return d_; }
+	bool causal() const { return causal_; }
 	// absolute input index of block b (0=Q,1=K,2=V), token t, dim dd.
 	inline int qi(int t, int dd) const { return t * d_ + dd; }
 	inline int ki(int t, int dd) const { return M() + t * d_ + dd; }
@@ -50,8 +54,9 @@ public:
 		const int N = N_, d = d_;
 		std::vector<std::complex<float>> O(N * d, {0.f, 0.f});
 		for (int k = 0; k < N; ++k) {
+			const int mhi = causal_ ? k : N - 1;
 			float Sk = 0.f;
-			for (int m = 0; m <= k; ++m) {
+			for (int m = 0; m <= mhi; ++m) {
 				std::complex<float> ckm = 0.f;
 				for (int dd = 0; dd < d; ++dd)
 					ckm += input().z(qi(k, dd)) * std::conj(input().z(ki(m, dd)));
@@ -62,7 +67,7 @@ public:
 			}
 			S_[k] = Sk;
 			float inv = Sk > 0.f ? 1.f / Sk : 0.f;
-			for (int m = 0; m <= k; ++m) {
+			for (int m = 0; m <= mhi; ++m) {
 				float a = A_[k * N + m] * inv;       // A[k,m]
 				A_[k * N + m] = a;
 				for (int dd = 0; dd < d; ++dd)
@@ -86,10 +91,11 @@ public:
 				gOb[p] += output(indx).dz_star(offset(indx) + p);
 			}
 		for (int k = 0; k < N; ++k) {
+			const int mhi = causal_ ? k : N - 1;
 			// a[m] = sum_d Re( gO[k,d] V[m,d] + gOb[k,d] conj(V[m,d]) )
-			std::vector<float> a(k + 1, 0.f);
+			std::vector<float> a(mhi + 1, 0.f);
 			float abar = 0.f;
-			for (int m = 0; m <= k; ++m) {
+			for (int m = 0; m <= mhi; ++m) {
 				float am = 0.f;
 				for (int dd = 0; dd < d; ++dd) {
 					std::complex<float> v = input().z(vi(m, dd));
@@ -99,7 +105,7 @@ public:
 				abar += A_[k * N + m] * am;
 			}
 			float inv = S_[k] > 0.f ? 1.f / S_[k] : 0.f;
-			for (int m = 0; m <= k; ++m) {
+			for (int m = 0; m <= mhi; ++m) {
 				float b = (a[m] - abar) * inv;            // dL/ds[k,m]-chain (real)
 				std::complex<float> ckm = c_[k * N + m], ckmc = std::conj(ckm);
 				float Akm = A_[k * N + m];
