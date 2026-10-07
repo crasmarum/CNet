@@ -729,6 +729,72 @@ void TokenNormGpu::gpu_tn_backward() {
 #endif
 }
 
+// ======== RotaryEmbed (RoPE position rotation for complex tokens) ============
+// y[t,dd] = x[t,dd] * exp(i * base^{-dd/d} * t). One thread per (clone, element).
+__global__ void gpu_rope_forward__(GpuInVar *in, GpuOutVar *out,
+		int N, int d, float base, int B) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	int M = N * d;
+	if (tid >= B * M) return;
+	int clone = tid / M, p = tid - clone * M;
+	int t = p / d, dd = p - t * d;
+	float ang = powf(base, -(float) dd / (float) d) * (float) t;
+	float cr = cosf(ang), ci = sinf(ang);
+	GpuInVar inv = in[clone];
+	GpuOutVar ov = out[clone];
+	cmplx_ x = Z_(inv, p);
+	ov.out_ptr_[p]                   = x.real * cr - x.imag * ci;   // Re(x*r)
+	ov.out_ptr_[ov.out_length_ + p]  = x.real * ci + x.imag * cr;   // Im(x*r)
+}
+
+__global__ void gpu_rope_backward__(GpuInVar *in, GpuOutVar *out,
+		int N, int d, float base, int B) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	int M = N * d;
+	if (tid >= B * M) return;
+	int clone = tid / M, p = tid - clone * M;
+	int t = p / d, dd = p - t * d;
+	float ang = powf(base, -(float) dd / (float) d) * (float) t;
+	float cr = cosf(ang), ci = sinf(ang);
+	GpuInVar inv = in[clone];
+	GpuOutVar ov = out[clone];
+	cmplx_ gO = dZ_(ov, p), gOb = dZ_star_(ov, p);
+	// dz = gO * r  (r = cr + i ci)
+	float dzr = gO.real * cr - gO.imag * ci;
+	float dzi = gO.real * ci + gO.imag * cr;
+	// dz* = gOb * conj(r)  (conj r = cr - i ci)
+	float dsr =  gOb.real * cr + gOb.imag * ci;
+	float dsi = -gOb.real * ci + gOb.imag * cr;
+	atomicAdd(dZ_real_(inv, p), dzr);
+	atomicAdd(dZ_imag_(inv, p), dzi);
+	atomicAdd(dZ_star_real_(inv, p), dsr);
+	atomicAdd(dZ_star_imag_(inv, p), dsi);
+}
+
+void RotaryEmbedGpu::gpu_rope_forward() {
+#ifdef __CUDACC__
+	RotaryEmbed *f = (RotaryEmbed*) cpu_func_.front();
+	int N = f->nTokens(), d = f->dim(), B = getNoMappings();
+	int total = B * N * d, tb = 128;
+	unsigned grid = (total + tb - 1) / tb;
+	gpu_rope_forward__ CUDA2(grid, tb) (gpu_in_ptr_, gpu_out_ptr_, N, d, (float) f->base(), B);
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+#endif
+}
+
+void RotaryEmbedGpu::gpu_rope_backward() {
+#ifdef __CUDACC__
+	RotaryEmbed *f = (RotaryEmbed*) cpu_func_.front();
+	int N = f->nTokens(), d = f->dim(), B = getNoMappings();
+	int total = B * N * d, tb = 128;
+	unsigned grid = (total + tb - 1) / tb;
+	gpu_rope_backward__ CUDA2(grid, tb) (gpu_in_ptr_, gpu_out_ptr_, N, d, (float) f->base(), B);
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+#endif
+}
+
 // Inverse DFT forward: identical to FourierGpu::gpu_fft_forward but with
 // CUFFT_INVERSE. Reuses the same gather/scatter kernels, plan and 1/sqrt(N)
 // scaling (the unitary inverse). cuFFT is required for the inverse layer.

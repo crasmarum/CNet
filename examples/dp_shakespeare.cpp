@@ -69,7 +69,15 @@ FLAG_STRING(data, "tiny_shakespear2.txt")
 FLAG_BOOL(born, false)      // use Born-rule attention mixer instead of causal Fourier
 FLAG_BOOL(block_norm, false) // L2-normalize (SoftMax) each block output (deep nets)
 FLAG_BOOL(token_norm, false) // per-token complex RMS pre-norm (pre-LN transformer)
+FLAG_BOOL(rope, false)      // rotary position embedding on Born-attention Q,K
 FLAG_FLOAT(ce_eps, 0.0)     // Born-loss target-prob floor (0 = exact; ~1e-3 stabilizes)
+FLAG_STRING(save_path, "")  // if set, rank 0 saves the trained model here after training
+FLAG_BOOL(generate, false)  // generation mode: restore -model and sample text (no training)
+FLAG_STRING(model, "")      // model file to restore in -generate mode
+FLAG_STRING(prompt, "ROMEO:")// seed text for generation
+FLAG_INT(gen_len, 600)      // number of characters to generate
+FLAG_FLOAT(temp, 0.8)       // sampling temperature (lower = greedier)
+FLAG_BOOL(print_net, false) // build the LM and print its layer graph, then exit
 
 // ---------------- minimal character dataset (90/10 train/val) ----------------
 struct CharData {
@@ -106,6 +114,10 @@ static int buildLM(ComplexNet &net, int embId, int E, int N, int L, int vocab) {
 			int wQ = net.add(new CInput(OutSize(E * dh))); int Q  = net.add(new TokenwiseLinear(N, E, dh), {pre, wQ});
 			int wK = net.add(new CInput(OutSize(E * dh))); int K  = net.add(new TokenwiseLinear(N, E, dh), {pre, wK});
 			int wV = net.add(new CInput(OutSize(E * dh))); int Vv = net.add(new TokenwiseLinear(N, E, dh), {pre, wV});
+			if (rope) {                                                        // RoPE on queries/keys
+				Q = net.add(new RotaryEmbed(N, dh), {Q});
+				K = net.add(new RotaryEmbed(N, dh), {K});
+			}
 			int att = net.add(new BornAttention(N, dh), {Q, K, Vv});
 			int wO = net.add(new CInput(OutSize(dh * E)));
 			mixout = net.add(new TokenwiseLinear(N, dh, E), {att, wO});
@@ -130,8 +142,70 @@ static int buildLM(ComplexNet &net, int embId, int E, int N, int L, int vocab) {
 	return ce;
 }
 
+// Temperature sampling from a position's Born distribution p_k = |z_k|^2/||z||^2
+// (SequenceCrossEntropy normalises the per-position outputs in forward()).
+static int sampleNext(SequenceCrossEntropy *seq, int p, int vocab, double temp, std::mt19937 &rng) {
+	std::vector<double> q(vocab); double Z = 0;
+	for (int k = 0; k < vocab; ++k) {
+		double pr = seq->getProbability(p, k);
+		pr = std::pow(pr < 1e-12 ? 1e-12 : pr, 1.0 / temp);
+		q[k] = pr; Z += pr;
+	}
+	std::uniform_real_distribution<double> U(0.0, 1.0);
+	double c = U(rng) * Z, s = 0;
+	for (int k = 0; k < vocab; ++k) { s += q[k]; if (c <= s) return k; }
+	return vocab - 1;
+}
+
+// Restore a saved model and autoregressively sample text on the CPU. The mixers
+// are causal, so right-filling the N-token window and reading the distribution at
+// the last real position is exact (the zero padding never influences it).
+static int runGenerate() {
+	if (((std::string) model).empty()) { std::cerr << "-generate requires -model <file>\n"; return 1; }
+	CharData ds; ds.load(data);
+	std::vector<char> i2c(ds.vocab);
+	for (auto &kv : ds.c2i) i2c[kv.second] = kv.first;
+
+	CNet net;
+	if (!net.restore((std::string) model)) { std::cerr << "cannot restore model: " << (std::string) model << "\n"; return 1; }
+	auto *em  = (CEmbedding*) net.cpuNet().findFirstOfType(isEmbedding);
+	auto *seq = (SequenceCrossEntropy*) net.cpuNet().findFirstOfType(isSeqCrossEntropy);
+	if (!em || !seq) { std::cerr << "restored model has no embedding / sequence head\n"; return 1; }
+	const int Ngen = seq->nPos(), vocab = seq->vocab();
+
+	std::mt19937 rng(std::random_device{}());
+	std::vector<int> ctx;
+	for (char c : (std::string) prompt) if (ds.c2i.count(c)) ctx.push_back(ds.c2i[c]);
+	std::string out = prompt;
+	for (int g = 0; g < gen_len; ++g) {
+		std::vector<int> win(Ngen, 0);
+		int ctxn = (int) ctx.size(), take = std::min(ctxn, Ngen);
+		for (int i = 0; i < take; ++i) win[i] = ctx[ctxn - take + i];   // real tokens at 0..take-1
+		em->setInput(win);
+		net.cpuNet().forward();
+		int nxt = sampleNext(seq, take - 1, vocab, temp, rng);           // next after last real token
+		ctx.push_back(nxt); out += i2c[nxt];
+	}
+	std::cout << "=== generated (model=" << model << " temp=" << temp << ") ===\n"
+			  << out << std::endl;
+	return 0;
+}
+
 int main(int argc, char **argv) {
 	FLAGS::Parse(argc, argv);
+	if (generate) return runGenerate();          // standalone sampling, no training / NCCL
+	if (print_net) {                              // dump the layer graph, no training / NCCL
+		CharData ds; ds.load(data);
+		CNet net;
+		int embId = net.cpuNet().add(new CEmbedding(emb, tokens, ds.vocab));
+		buildLM(net.cpuNet(), embId, emb, tokens, blocks, ds.vocab);
+		std::cout << "config: born=" << born << " token_norm=" << token_norm
+				  << " rope=" << rope << " block_norm=" << block_norm
+				  << "  E=" << emb << " N=" << tokens << " L=" << blocks
+				  << " vocab=" << ds.vocab << "\n\n"
+				  << net.cpuNet().toString();
+		return 0;
+	}
 	const int W = world, R = rank, N = tokens, E = emb, L = blocks;
 	if (W < 1 || batch % W != 0) {
 		std::cerr << "batch (" << batch << ") must be a positive multiple of world (" << W << ")\n";
@@ -164,7 +238,7 @@ int main(int argc, char **argv) {
 				  << "  model E=" << E << " N=" << N << " L=" << L
 				  << "  global_batch=" << batch << " world=" << W
 				  << "  born=" << born << " block_norm=" << block_norm
-				  << " token_norm=" << token_norm
+				  << " token_norm=" << token_norm << " rope=" << rope
 				  << "  grad_clip=" << grad_clip << " ce_eps=" << ce_eps
 				  << "  chance=ln(vocab)=" << std::log((double) vocab) << std::endl;
 
@@ -243,6 +317,17 @@ int main(int argc, char **argv) {
 		}
 	}
 	cudaStreamSynchronize(cudaStreamPerThread);
+
+	// Rank 0 checkpoints the trained model (weights pulled GPU->CPU first). Every
+	// rank holds identical weights, so one save suffices. Generate later with
+	// -generate -model <save_path>.
+	if (R == 0 && !((std::string) save_path).empty()) {
+		if (net.getInputsFromGpu() && net.save((std::string) save_path))
+			std::cout << "saved model to " << (std::string) save_path << std::endl;
+		else
+			std::cerr << "WARNING: model save to " << (std::string) save_path << " failed\n";
+	}
+
 	cudaFree(scratch);
 	ncclCommDestroy(comm);
 	if (R == 0) { remove(idf); remove(rdy); }

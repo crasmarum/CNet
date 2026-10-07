@@ -277,6 +277,23 @@ auto V = cnet.add(new TokenwiseLinear(N, E, d), {pre, wV});
 auto att = cnet.add(new BornAttention(N, d), {Q, K, V});   // input [Q;K;V] -> O
 ```
 
+## Rotary Position Embedding (RoPE) Layer
+
+`RotaryEmbed` applies a position-dependent complex phase rotation to each token's features — rotary position embeddings (RoPE) expressed as what they natively *are* in a complex network: a rotation. The input is $N$ tokens of $D$ complex features each (token $t$, dimension $d$ at index $t\,D + d$):
+
+$$\mathrm{RotaryEmbed}(x)_{t,d} = x_{t,d}\, e^{\,i\,\theta_d\, t}, \qquad \theta_d = \mathrm{base}^{-d/D}.$$
+
+Applied to the queries and keys of `BornAttention`, the per-feature inner product $Q_{k,d}\,\overline{K_{j,d}}$ picks up the **relative** phase $e^{\,i\,\theta_d(k-j)}$, so the Born score $|\langle Q_k,K_j\rangle|^2$ becomes position-aware. Because a single complex dimension is one rotation plane, there is one frequency per complex feature. The map $y = r\,x$ (with $r = e^{i\theta_d t}$ a unit-modulus constant per position/feature) is holomorphic, so the Wirtinger backward is exact and trivial — with $g = \partial L/\partial y$ and $\bar g = \partial L/\partial \bar y$, one has $\partial L/\partial x = g\,r$ and $\partial L/\partial \bar x = \bar g\,\bar r$. The layer is parameter-free.
+
+```c++
+#include "impl/rotary.h"
+
+int N = 64, dh = 64;
+auto Qr  = cnet.add(new RotaryEmbed(N, dh), {Q});   // rotate queries
+auto Kr  = cnet.add(new RotaryEmbed(N, dh), {K});   // rotate keys
+auto att = cnet.add(new BornAttention(N, dh), {Qr, Kr, V});
+```
+
 ## Hadamard Layer
 
 This layer implements the Hadamard function which is simply the element-wise multiplication:
@@ -607,11 +624,17 @@ make dp_shakespeare
 ./examples/run_dp_shakespeare.sh 4 -batch 48 -steps 3000
 ```
 
-By default the example uses the parameter-free `TriangFourier` causal mixer. Flags let it assemble a fully complex transformer instead: `-born true` swaps in the `BornAttention` content-based mixer (with `TokenwiseLinear` Q/K/V/O projections), `-token_norm true` adds per-token `TokenNorm` pre-normalization (pre-LN), and `-ce_eps 0.001` enables the Born-loss probability floor for stable deep training:
+By default the example uses the parameter-free `TriangFourier` causal mixer. Flags let it assemble a fully complex transformer instead: `-born true` swaps in the `BornAttention` content-based mixer (with `TokenwiseLinear` Q/K/V/O projections), `-rope true` adds `RotaryEmbed` rotary position embeddings on the queries/keys, `-token_norm true` adds per-token `TokenNorm` pre-normalization (pre-LN), and `-ce_eps 0.001` enables the Born-loss probability floor for stable deep training:
 
 ```bash
-./examples/run_dp_shakespeare.sh 4 -born true -token_norm true -ce_eps 0.001 \
+./examples/run_dp_shakespeare.sh 4 -born true -rope true -token_norm true -ce_eps 0.001 \
     -emb 160 -tokens 64 -blocks 8 -batch 64 -steps 8000 -grad_clip 0.5
+```
+
+The trained model can be checkpointed (`-save_path model.mod`) and then sampled without retraining:
+
+```bash
+./dp_shakespeare -generate true -model model.mod -prompt "ROMEO:" -gen_len 600 -temp 0.8
 ```
 
 The per-step work is the forward/backward plus a single coalesced NCCL

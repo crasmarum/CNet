@@ -235,6 +235,20 @@ public:
 	virtual void backward(int label) override { gpu_tn_backward(); }
 };
 
+// Rotary position embedding (RoPE) for complex tokens (see impl/rotary.h). The
+// per-(token,feature) unit phasor exp(i theta_dd t) is recomputed in the kernel
+// (one thread per element), so no scratch is needed. y=r*x is holomorphic:
+// dL/dx = gO*r, dL/dx* = gOb*conj(r).
+class RotaryEmbedGpu : public GpuMapping {
+public:
+	RotaryEmbedGpu(int depth) : GpuMapping(depth) {}
+	virtual ~RotaryEmbedGpu() {}
+	void gpu_rope_forward();
+	void gpu_rope_backward();
+	virtual void forward() override { gpu_rope_forward(); }
+	virtual void backward(int label) override { gpu_rope_backward(); }
+};
+
 class SoftMaxGpu : public GpuMapping {
 
 public:

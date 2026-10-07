@@ -24,7 +24,13 @@
 const int __one__ = 1;
 const bool isCpuLittleEndian = 1 == *(char*) (&__one__);
 
-const int magicNo = 0xABCDE0EE;
+const int magicNo = 0xABCDE0EE;   // legacy, unversioned files (treated as version 0)
+// Versioned files start with this distinct magic followed by an int32 format
+// version, so legacy files (which have magicNo then a layer id) remain readable.
+// Restore* methods can branch on ModelSaver::format_version_ to read fields added
+// in later versions. Bump kFormatVersion whenever the on-disk layout changes.
+const int magicNoV = 0xABCDE1EE;
+const int kFormatVersion = 1;
 
 class BinaryReader {
 public:
@@ -478,6 +484,7 @@ private:
 	int no_prev_func = 0;
 	int in_size = 0;
 	int out_size = 0;
+	int format_version_ = 0;   // 0 = legacy (pre-versioning) file; set by Restore*
 
 private:
 	bool WriteLayer(CFunc *layer, BinaryWriter &writer) {
@@ -895,6 +902,79 @@ private:
 		return true;
 	}
 
+	// BornAttention carries no learnable parameters of its own (Q/K/V come from
+	// feeding TokenwiseLinear layers), so only its constructor args (N tokens,
+	// complex head dim) are persisted.
+	bool Write(BornAttention *ba, BinaryWriter &writer) {
+		writer.write_int32(isBornAttention);
+		writeFuncInfo(writer, ba);
+		writer.write_int32(ba->nTokens());
+		writer.write_int32(ba->dim());
+		return true;
+	}
+
+	bool RestoreBornAttention(ComplexNet &net, BinaryReader &reader) {
+		L_(lDebug) << "RestoreBornAttention";
+		std::vector<int> prev;
+		readFuncInfo(reader, prev);
+
+		int n_tokens = 0, dim = 0;
+		assert(reader.read_int32(&n_tokens));
+		assert(reader.read_int32(&dim));
+		net.add(new BornAttention(Uid(uid), n_tokens, dim), prev);
+		return true;
+	}
+
+	// TokenNorm is also parameter-free; persist N, per-token dim, and the eps floor.
+	bool Write(TokenNorm *tn, BinaryWriter &writer) {
+		writer.write_int32(isTokenNorm);
+		writeFuncInfo(writer, tn);
+		writer.write_int32(tn->nTokens());
+		writer.write_int32(tn->dim());
+		float eps = tn->eps();
+		writer.write(&eps, 1);
+		return true;
+	}
+
+	bool RestoreTokenNorm(ComplexNet &net, BinaryReader &reader) {
+		L_(lDebug) << "RestoreTokenNorm";
+		std::vector<int> prev;
+		readFuncInfo(reader, prev);
+
+		int n_tokens = 0, dim = 0;
+		float eps = 0.f;
+		assert(reader.read_int32(&n_tokens));
+		assert(reader.read_int32(&dim));
+		assert(reader.read_float(&eps, 1));
+		net.add(new TokenNorm(Uid(uid), n_tokens, dim, eps), prev);
+		return true;
+	}
+
+	// RotaryEmbed is parameter-free; persist N, per-token dim, and the RoPE base.
+	bool Write(RotaryEmbed *ro, BinaryWriter &writer) {
+		writer.write_int32(isRotary);
+		writeFuncInfo(writer, ro);
+		writer.write_int32(ro->nTokens());
+		writer.write_int32(ro->dim());
+		float base = (float) ro->base();
+		writer.write(&base, 1);
+		return true;
+	}
+
+	bool RestoreRotary(ComplexNet &net, BinaryReader &reader) {
+		L_(lDebug) << "RestoreRotary";
+		std::vector<int> prev;
+		readFuncInfo(reader, prev);
+
+		int n_tokens = 0, dim = 0;
+		float base = 10000.f;
+		assert(reader.read_int32(&n_tokens));
+		assert(reader.read_int32(&dim));
+		assert(reader.read_float(&base, 1));
+		net.add(new RotaryEmbed(Uid(uid), n_tokens, dim, (double) base), prev);
+		return true;
+	}
+
 public:
 //	bool Save(CNet& c_net, std::string file) {
 //		return Save(c_net.cpuNet(), file);
@@ -906,7 +986,8 @@ public:
 			L_(lError) << "Cannot open: \"" << file << "\"";
 			return false;
 		}
-		writer.write_int32(magicNo);
+		writer.write_int32(magicNoV);
+		writer.write_int32(kFormatVersion);
 
 		for (auto func : net.functionList()) {
 			if (func->isGpuOnly()) {
@@ -929,7 +1010,8 @@ public:
 	std::string SaveToString(ComplexNet &net) {
 		StringBinaryWriter writer;
 
-		writer.write_int32(magicNo);
+		writer.write_int32(magicNoV);
+		writer.write_int32(kFormatVersion);
 
 		for (auto func : net.functionList()) {
 			if (func->isGpuOnly()) {
@@ -952,9 +1034,13 @@ public:
 		StringBinaryReader reader(input);
 
 		int current;
-		if (!reader.read_int32(&current) || current != magicNo) {
-			L_(lError) << std::hex << current;
-			return false;
+		if (!reader.read_int32(&current)) { L_(lError) << "empty model"; return false; }
+		if (current == magicNoV) {
+			if (!reader.read_int32(&format_version_)) { L_(lError) << "missing format version"; return false; }
+		} else if (current == magicNo) {
+			format_version_ = 0;   // legacy, unversioned file
+		} else {
+			L_(lError) << "bad magic " << std::hex << current; return false;
 		}
 		while (reader.read_int32(&current)) {
 			// Dispatch generated from the single layer registry (CNET_LAYER_TABLE).
@@ -981,10 +1067,13 @@ public:
 		}
 
 		int current;
-		if (!reader.read_int32(&current) || current != magicNo) {
-			L_(lError) << std::hex << current;
-			reader.close();
-			return false;
+		if (!reader.read_int32(&current)) { reader.close(); L_(lError) << "empty model"; return false; }
+		if (current == magicNoV) {
+			if (!reader.read_int32(&format_version_)) { reader.close(); L_(lError) << "missing format version"; return false; }
+		} else if (current == magicNo) {
+			format_version_ = 0;   // legacy, unversioned file
+		} else {
+			L_(lError) << "bad magic " << std::hex << current; reader.close(); return false;
 		}
 		while (reader.read_int32(&current)) {
 			// Dispatch generated from the single layer registry (CNET_LAYER_TABLE).

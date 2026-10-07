@@ -60,7 +60,8 @@ public:
 		X(isMeanPool,       MeanPoolGpu)      \
 		X(isSeqCrossEntropy, SequenceCrossEntropyGpu) \
 		X(isBornAttention,  BornAttentionGpu)  \
-		X(isTokenNorm,      TokenNormGpu)
+		X(isTokenNorm,      TokenNormGpu)      \
+		X(isRotary,         RotaryEmbedGpu)
 
 	void add(float **gpu_ptr, std::vector<CFunc*>& block, int depth) {
 		assert(block.size());
