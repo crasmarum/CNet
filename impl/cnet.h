@@ -30,6 +30,8 @@
 #include "pool.h"
 #include "tokenwise.h"
 #include "seqcrossent.h"
+#include "bornattn.h"
+#include "tokennorm.h"
 #include "l2out.h"
 
 const int isHadamard = 1;
@@ -51,6 +53,8 @@ const int isMeanPool = 16;
 const int isPower = 17;
 const int isTokenwise = 18;
 const int isSeqCrossEntropy = 19;
+const int isBornAttention = 20;
+const int isTokenNorm = 21;
 
 const int isUnknown = INT_MAX;
 
@@ -146,6 +150,10 @@ public:
 	}
 
 	static int getType(CFunc *func) {
+		// BornAttention is registered for execution (getType/GPU dispatch) but not
+		// yet for serialization, so it is matched here outside CNET_LAYER_TABLE.
+		if (dynamic_cast<BornAttention*>(func)) return isBornAttention;
+		if (dynamic_cast<TokenNorm*>(func)) return isTokenNorm;
 		// Dispatch generated from the single layer registry (see CNET_LAYER_TABLE).
 		#define X(C, ID, R) if (dynamic_cast<C*>(func)) return ID;
 		CNET_LAYER_TABLE(X)

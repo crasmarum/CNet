@@ -259,6 +259,24 @@ auto emb = cnet.add(new CEmbedding(emb_dim, max_in_tokens, no_embedings));
 auto mix = cnet.add(new TriangFourier(InSize(emb_dim * max_in_tokens)), {emb});
 ```
 
+## Born-Rule Attention Layer
+
+This is a *content-based* causal token mixer: the complex analogue of single-head self-attention, but with the attention scores given by the **quantum-measurement (Born) rule** instead of a softmaxed dot product. The input is the concatenation of three complex blocks $[Q; K; V]$, each of shape $N \times d$ (token $k$, dimension $dd$ at index $k\,d + dd$), and the output $O$ has shape $N \times d$:
+
+$$c_{k,m} = \sum_{dd} Q_{k,dd}\, \overline{K_{m,dd}}, \qquad s_{k,m} = |c_{k,m}|^2, \qquad A_{k,m} = \frac{s_{k,m}}{\sum_{m' \leq k} s_{k,m'}}, \qquad O_{k,dd} = \sum_{m \leq k} A_{k,m}\, V_{m,dd}.$$
+
+The score $s_{k,m} = |\langle Q_k, K_m\rangle|^2$ is exactly the Born-rule probability of measuring query $k$ against key $m$, so routing is content-based like attention but requires no softmax — the squared magnitude of a complex inner product is already non-negative and is normalised causally over $m \leq k$. The Wirtinger backward (verified to $\sim 10^{-9}$ against finite differences on CPU, and exactly against the CUDA kernel) differentiates through $c$, $s$, the normalisation and the value mix. The constructor takes the number of tokens and the (complex) head dimension; $Q$, $K$, $V$ are produced by three `TokenwiseLinear` projections of the stream:
+
+```c++
+#include "impl/bornattn.h"
+
+int N = 64, E = 128, d = E / 2;        // N tokens, width E, head dim d
+auto Q = cnet.add(new TokenwiseLinear(N, E, d), {pre, wQ});
+auto K = cnet.add(new TokenwiseLinear(N, E, d), {pre, wK});
+auto V = cnet.add(new TokenwiseLinear(N, E, d), {pre, wV});
+auto att = cnet.add(new BornAttention(N, d), {Q, K, V});   // input [Q;K;V] -> O
+```
+
 ## Hadamard Layer
 
 This layer implements the Hadamard function which is simply the element-wise multiplication:
@@ -384,6 +402,22 @@ auto inp = cnet.add(new CInput(OutSize(512)));
 auto nrm = cnet.add(new SoftMax(InSize(512)), {inp});
 ```
 
+## TokenNorm (Per-Token RMS Normalization) Layer
+
+Where `SoftMax` normalizes a whole block by its *global* Euclidean norm, `TokenNorm` normalizes **each token independently** by its own root-mean-power — the complex analogue of (gain-free) RMSNorm/LayerNorm, and the per-token counterpart of `SoftMax`. The input is $N$ tokens of $d$ complex features each (token $t$, dimension $dd$ at index $t\,d + dd$):
+
+$$r_t = \sqrt{\frac{1}{d}\sum_{dd} |x_{t,dd}|^2 + \varepsilon}, \qquad \mathrm{TokenNorm}(x)_{t,dd} = \frac{x_{t,dd}}{r_t}.$$
+
+A learnable affine is intentionally omitted (a following `TokenwiseLinear` supplies gain and bias), which keeps the layer **parameter-free** and its Wirtinger backward exact. With $T = \sum_{dd}\big(\tfrac{\partial L}{\partial y}\,x + \tfrac{\partial L}{\partial \bar y}\,\bar x\big)$ the input gradients are $\partial L/\partial x_{dd} = (\partial L/\partial y_{dd})/r - \bar{x}_{dd}\,T/(2 d r^3)$ and $\partial L/\partial \bar{x}_{dd} = (\partial L/\partial \bar{y}_{dd})/r - x_{dd}\,T/(2 d r^3)$ (verified: CPU finite-difference and GPU-vs-CPU to machine precision). Used as a *pre-norm* (normalize the residual-stream input to each sub-block), it lets deep complex transformers train stably — on tiny-shakespeare it breaks the plateau that global block-normalization hits. The constructor takes the number of tokens, the per-token feature width, and an optional $\varepsilon$:
+
+```c++
+#include "impl/tokennorm.h"
+
+int N = 64, E = 128;
+auto normed = cnet.add(new TokenNorm(N, E), {last});       // per-token RMS pre-norm
+auto Q      = cnet.add(new TokenwiseLinear(N, E, E / 2), {normed, wQ});
+```
+
 ## L2Out Loss function
 
 This loss function is simply the square of the $L2$ norm:
@@ -466,6 +500,8 @@ net.trueAdamUpdate(l_rate, batch_size, beta1, beta2, eps, step);
 ```
 
 Because the Born-rule `CrossEntropy` / `SequenceCrossEntropy` losses are ill-conditioned, full Adam (`trueAdamUpdate`) with gradient clipping is recommended over plain SGD for classification and language-model training.
+
+The ill-conditioning is concrete: the exact gradient of $-\log(|z_t|^2/\|z\|^2)$ grows like $1/|z_t|$ when the model assigns a near-zero amplitude to the *correct* token, so a single hard example can produce an explosive update that parameter-level gradient clipping cannot catch (the bad gradient is already summed into the minibatch). `SequenceCrossEntropy` therefore offers an optional **probability floor** `setEps(eps)` (the `-ce_eps` flag in the language-model example): the target modulus is clamped from below, $|z_t|^2 \leftarrow \max(|z_t|^2,\ \varepsilon\,\|z\|^2)$, **in the gradient only** — a uniform measurement-noise floor, i.e. label-smoothing for the Born rule. The forward loss stays exact, so the reported metric is unchanged; only the optimization is regularised, and `eps = 0` is bit-identical to the exact gradient. A value around $10^{-3}$ removes the training-loss spikes that otherwise appear with deep models and higher learning rates.
 
 # Building the Software
 
@@ -569,6 +605,13 @@ make dp_shakespeare
 
 # N GPUs (one process per GPU); the helper script launches and pins them
 ./examples/run_dp_shakespeare.sh 4 -batch 48 -steps 3000
+```
+
+By default the example uses the parameter-free `TriangFourier` causal mixer. Flags let it assemble a fully complex transformer instead: `-born true` swaps in the `BornAttention` content-based mixer (with `TokenwiseLinear` Q/K/V/O projections), `-token_norm true` adds per-token `TokenNorm` pre-normalization (pre-LN), and `-ce_eps 0.001` enables the Born-loss probability floor for stable deep training:
+
+```bash
+./examples/run_dp_shakespeare.sh 4 -born true -token_norm true -ce_eps 0.001 \
+    -emb 160 -tokens 64 -blocks 8 -batch 64 -steps 8000 -grad_clip 0.5
 ```
 
 The per-step work is the forward/backward plus a single coalesced NCCL

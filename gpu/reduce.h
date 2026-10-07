@@ -198,6 +198,43 @@ public:
 	}
 };
 
+// Born-rule causal self-attention on GPU (see impl/bornattn.h for the layer and
+// its verified Wirtinger backward). Input [Q;K;V] of length 3*N*d per clone ->
+// output N*d. Per-clone scratch stores c (N*N complex), A (N*N real) and S (N).
+class BornAttentionGpu : public GpuMapping {
+	cmplx_ *ba_c_ = NULL;   // c[k,m]   : B*N*N
+	float  *ba_A_ = NULL;   // A[k,m]   : B*N*N
+	float  *ba_S_ = NULL;   // S[k]     : B*N
+	int ba_N_ = 0, ba_d_ = 0, ba_M_ = 0;   // M_ = number of clones (getNoMappings)
+	void ensure_scratch(int N, int d, int M);
+	void free_scratch();
+public:
+	BornAttentionGpu(int depth) : GpuMapping(depth) {}
+	virtual ~BornAttentionGpu() { free_scratch(); }
+	void gpu_born_forward();
+	void gpu_born_backward();
+	virtual void forward() override { gpu_born_forward(); }
+	virtual void backward(int label) override { gpu_born_backward(); }
+};
+
+// Per-token complex RMS normalization on the GPU (see impl/tokennorm.h). One
+// thread per (clone, token): each token's d features are disjoint across threads,
+// so forward writes outputs directly and backward accumulates input gradients
+// (atomicAdd, matching the arena's accumulate-across-consumers convention).
+class TokenNormGpu : public GpuMapping {
+	float *tn_r_ = NULL;   // r_t : B*N  (forward -> backward)
+	int tn_N_ = 0, tn_M_ = 0;
+	void ensure_scratch(int N, int M);
+	void free_scratch();
+public:
+	TokenNormGpu(int depth) : GpuMapping(depth) {}
+	virtual ~TokenNormGpu() { free_scratch(); }
+	void gpu_tn_forward();
+	void gpu_tn_backward();
+	virtual void forward() override { gpu_tn_forward(); }
+	virtual void backward(int label) override { gpu_tn_backward(); }
+};
+
 class SoftMaxGpu : public GpuMapping {
 
 public:

@@ -491,6 +491,244 @@ void FourierGpu::gpu_fft_forward(int block_size) {
 	fft_kernel_end(FFT_DATA_PROVIDER, gpu_buffer, gpu_in_ptr_, gpu_out_ptr_, length(), getNoMappings(), block_size);
 }
 
+// ===================== Born-rule attention (GPU) =====================
+// Transcription of impl/bornattn.h (verified CPU reference). Input [Q;K;V] of
+// length 3*N*d per clone (Q at pos t*d+dd, K at M+.., V at 2M+..), output N*d.
+// One thread per (clone, query k); K[m]/V[m] receive from all queries k>=m, so
+// their gradients use atomics.
+
+void BornAttentionGpu::ensure_scratch(int N, int d, int M) {
+#ifdef __CUDACC__
+	if (ba_c_ && ba_N_ == N && ba_d_ == d && ba_M_ == M) return;
+	free_scratch();
+	ba_N_ = N; ba_d_ = d; ba_M_ = M;
+	gpuErrchk(cudaMalloc((void**) &ba_c_, sizeof(cmplx_) * (size_t) M * N * N));
+	gpuErrchk(cudaMalloc((void**) &ba_A_, sizeof(float)  * (size_t) M * N * N));
+	gpuErrchk(cudaMalloc((void**) &ba_S_, sizeof(float)  * (size_t) M * N));
+#endif
+}
+void BornAttentionGpu::free_scratch() {
+#ifdef __CUDACC__
+	if (ba_c_) { cudaFree(ba_c_); ba_c_ = NULL; }
+	if (ba_A_) { cudaFree(ba_A_); ba_A_ = NULL; }
+	if (ba_S_) { cudaFree(ba_S_); ba_S_ = NULL; }
+	ba_N_ = ba_d_ = ba_M_ = 0;
+#endif
+}
+
+__global__ void gpu_born_forward__(GpuInVar *in, GpuOutVar *out,
+		cmplx_ *C, float *A, float *S, int N, int d, int B) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= B * N) return;
+	int clone = tid / N, k = tid % N, Mv = N * d;
+	GpuInVar inv = in[clone];
+	size_t cb = (size_t) clone * N * N + (size_t) k * N;
+	float Sk = 0.f;
+	for (int m = 0; m <= k; ++m) {
+		cmplx_ c = cmplx(0.f, 0.f);
+		for (int dd = 0; dd < d; ++dd)
+			c = c + Z_(inv, k * d + dd) * conj_(Z_(inv, Mv + m * d + dd));
+		C[cb + m] = c;
+		float s = c.real * c.real + c.imag * c.imag;
+		A[cb + m] = s;
+		Sk += s;
+	}
+	S[(size_t) clone * N + k] = Sk;
+	float invS = Sk > 0.f ? 1.f / Sk : 0.f;
+	for (int m = 0; m <= k; ++m) A[cb + m] *= invS;
+	GpuOutVar ov = out[clone];
+	for (int dd = 0; dd < d; ++dd) {
+		float orr = 0.f, oii = 0.f;
+		for (int m = 0; m <= k; ++m) {
+			float a = A[cb + m];
+			cmplx_ v = Z_(inv, 2 * Mv + m * d + dd);
+			orr += a * v.real; oii += a * v.imag;
+		}
+		ov.out_ptr_[k * d + dd] = orr;
+		ov.out_ptr_[ov.out_length_ + k * d + dd] = oii;
+	}
+}
+
+__global__ void gpu_born_backward__(GpuInVar *in, GpuOutVar *out,
+		cmplx_ *C, float *A, float *S, int N, int d, int B) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= B * N) return;
+	int clone = tid / N, k = tid % N, Mv = N * d;
+	GpuInVar inv = in[clone];
+	GpuOutVar ov = out[clone];
+	size_t cb = (size_t) clone * N * N + (size_t) k * N;
+	float invS = S[(size_t) clone * N + k] > 0.f ? 1.f / S[(size_t) clone * N + k] : 0.f;
+	float abar = 0.f;
+	for (int m = 0; m <= k; ++m) {
+		float am = 0.f;
+		for (int dd = 0; dd < d; ++dd) {
+			cmplx_ gO = dZ_(ov, k * d + dd), gOb = dZ_star_(ov, k * d + dd);
+			cmplx_ v = Z_(inv, 2 * Mv + m * d + dd);
+			am += (gO * v).real + (gOb * conj_(v)).real;
+		}
+		abar += A[cb + m] * am;
+	}
+	for (int m = 0; m <= k; ++m) {
+		float am = 0.f;
+		for (int dd = 0; dd < d; ++dd) {
+			cmplx_ gO = dZ_(ov, k * d + dd), gOb = dZ_star_(ov, k * d + dd);
+			cmplx_ v = Z_(inv, 2 * Mv + m * d + dd);
+			am += (gO * v).real + (gOb * conj_(v)).real;
+		}
+		float b = (am - abar) * invS;
+		cmplx_ c = C[cb + m], cc = conj_(c);
+		float Akm = A[cb + m];
+		for (int dd = 0; dd < d; ++dd) {
+			cmplx_ gO = dZ_(ov, k * d + dd), gOb = dZ_star_(ov, k * d + dd);
+			cmplx_ q = Z_(inv, k * d + dd), kk = Z_(inv, Mv + m * d + dd);
+			atomicAdd(dZ_real_(inv, 2 * Mv + m * d + dd), gO.real * Akm);
+			atomicAdd(dZ_imag_(inv, 2 * Mv + m * d + dd), gO.imag * Akm);
+			atomicAdd(dZ_star_real_(inv, 2 * Mv + m * d + dd), gOb.real * Akm);
+			atomicAdd(dZ_star_imag_(inv, 2 * Mv + m * d + dd), gOb.imag * Akm);
+			cmplx_ dQ = cc * conj_(kk), dQb = c * kk;        // Q: b*conj(c)*conj(K), b*c*K
+			atomicAdd(dZ_real_(inv, k * d + dd), b * dQ.real);
+			atomicAdd(dZ_imag_(inv, k * d + dd), b * dQ.imag);
+			atomicAdd(dZ_star_real_(inv, k * d + dd), b * dQb.real);
+			atomicAdd(dZ_star_imag_(inv, k * d + dd), b * dQb.imag);
+			cmplx_ dK = c * conj_(q), dKb = cc * q;          // K: b*c*conj(Q), b*conj(c)*Q
+			atomicAdd(dZ_real_(inv, Mv + m * d + dd), b * dK.real);
+			atomicAdd(dZ_imag_(inv, Mv + m * d + dd), b * dK.imag);
+			atomicAdd(dZ_star_real_(inv, Mv + m * d + dd), b * dKb.real);
+			atomicAdd(dZ_star_imag_(inv, Mv + m * d + dd), b * dKb.imag);
+		}
+	}
+}
+
+void BornAttentionGpu::gpu_born_forward() {
+#ifdef __CUDACC__
+	BornAttention *f = (BornAttention*) cpu_func_.front();
+	int N = f->nTokens(), d = f->dim(), B = getNoMappings();
+	ensure_scratch(N, d, B);
+	int total = B * N, tb = 128;
+	unsigned grid = (total + tb - 1) / tb;
+	gpu_born_forward__ CUDA2(grid, tb) (gpu_in_ptr_, gpu_out_ptr_, ba_c_, ba_A_, ba_S_, N, d, B);
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+#endif
+}
+
+void BornAttentionGpu::gpu_born_backward() {
+#ifdef __CUDACC__
+	BornAttention *f = (BornAttention*) cpu_func_.front();
+	int N = f->nTokens(), d = f->dim(), B = getNoMappings();
+	int total = B * N, tb = 128;
+	unsigned grid = (total + tb - 1) / tb;
+	gpu_born_backward__ CUDA2(grid, tb) (gpu_in_ptr_, gpu_out_ptr_, ba_c_, ba_A_, ba_S_, N, d, B);
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+#endif
+}
+
+// ======== TokenNorm (per-token complex RMS normalization) ===================
+void TokenNormGpu::ensure_scratch(int N, int M) {
+#ifdef __CUDACC__
+	if (tn_r_ && tn_N_ == N && tn_M_ == M) return;
+	free_scratch();
+	tn_N_ = N; tn_M_ = M;
+	gpuErrchk(cudaMalloc((void**) &tn_r_, sizeof(float) * (size_t) M * N));
+#endif
+}
+void TokenNormGpu::free_scratch() {
+#ifdef __CUDACC__
+	if (tn_r_) { cudaFree(tn_r_); tn_r_ = NULL; }
+	tn_N_ = tn_M_ = 0;
+#endif
+}
+
+// r_t = sqrt(mean_dd |x[t,dd]|^2 + eps); y = x / r_t. One thread per (clone,token).
+__global__ void gpu_tn_forward__(GpuInVar *in, GpuOutVar *out,
+		float *R, int N, int d, float eps, int B) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= B * N) return;
+	int clone = tid / N, t = tid % N;
+	GpuInVar inv = in[clone];
+	GpuOutVar ov = out[clone];
+	float s = 0.f;
+	for (int dd = 0; dd < d; ++dd) {
+		cmplx_ x = Z_(inv, t * d + dd);
+		s += x.real * x.real + x.imag * x.imag;
+	}
+	float r = sqrtf(s / (float) d + eps);
+	R[(size_t) clone * N + t] = r;
+	float invr = 1.f / r;
+	for (int dd = 0; dd < d; ++dd) {
+		cmplx_ x = Z_(inv, t * d + dd);
+		ov.out_ptr_[t * d + dd] = x.real * invr;
+		ov.out_ptr_[ov.out_length_ + t * d + dd] = x.imag * invr;
+	}
+}
+
+// dL/dx[dd]  = gO[dd]/r  - conj(x[dd]) * T/(2 d r^3)
+// dL/dx*[dd] = gOb[dd]/r - x[dd]       * T/(2 d r^3),  T = sum(gO x + gOb conj x)
+// Written with explicit real/imag to avoid relying on complex*scalar overloads.
+__global__ void gpu_tn_backward__(GpuInVar *in, GpuOutVar *out,
+		float *R, int N, int d, int B) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= B * N) return;
+	int clone = tid / N, t = tid % N;
+	GpuInVar inv = in[clone];
+	GpuOutVar ov = out[clone];
+	float r = R[(size_t) clone * N + t];
+	float invr = 1.f / r;
+	float coup = 1.f / (2.f * (float) d * r * r * r);
+	float Tre = 0.f, Tim = 0.f;
+	for (int dd = 0; dd < d; ++dd) {
+		cmplx_ gO = dZ_(ov, t * d + dd), gOb = dZ_star_(ov, t * d + dd);
+		cmplx_ x = Z_(inv, t * d + dd);
+		// gO*x
+		Tre += gO.real * x.real - gO.imag * x.imag;
+		Tim += gO.real * x.imag + gO.imag * x.real;
+		// gOb*conj(x)
+		Tre += gOb.real * x.real + gOb.imag * x.imag;
+		Tim += -gOb.real * x.imag + gOb.imag * x.real;
+	}
+	float Tcr = Tre * coup, Tci = Tim * coup;
+	for (int dd = 0; dd < d; ++dd) {
+		cmplx_ gO = dZ_(ov, t * d + dd), gOb = dZ_star_(ov, t * d + dd);
+		cmplx_ x = Z_(inv, t * d + dd);
+		// dz = gO/r - conj(x)*Tc ; conj(x)*Tc = (xr*Tcr + xi*Tci, xr*Tci - xi*Tcr)
+		float dzr = gO.real * invr - (x.real * Tcr + x.imag * Tci);
+		float dzi = gO.imag * invr - (x.real * Tci - x.imag * Tcr);
+		// dz* = gOb/r - x*Tc ; x*Tc = (xr*Tcr - xi*Tci, xr*Tci + xi*Tcr)
+		float dsr = gOb.real * invr - (x.real * Tcr - x.imag * Tci);
+		float dsi = gOb.imag * invr - (x.real * Tci + x.imag * Tcr);
+		atomicAdd(dZ_real_(inv, t * d + dd), dzr);
+		atomicAdd(dZ_imag_(inv, t * d + dd), dzi);
+		atomicAdd(dZ_star_real_(inv, t * d + dd), dsr);
+		atomicAdd(dZ_star_imag_(inv, t * d + dd), dsi);
+	}
+}
+
+void TokenNormGpu::gpu_tn_forward() {
+#ifdef __CUDACC__
+	TokenNorm *f = (TokenNorm*) cpu_func_.front();
+	int N = f->nTokens(), d = f->dim(), B = getNoMappings();
+	ensure_scratch(N, B);
+	int total = B * N, tb = 128;
+	unsigned grid = (total + tb - 1) / tb;
+	gpu_tn_forward__ CUDA2(grid, tb) (gpu_in_ptr_, gpu_out_ptr_, tn_r_, N, d, f->eps(), B);
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+#endif
+}
+
+void TokenNormGpu::gpu_tn_backward() {
+#ifdef __CUDACC__
+	TokenNorm *f = (TokenNorm*) cpu_func_.front();
+	int N = f->nTokens(), d = f->dim(), B = getNoMappings();
+	int total = B * N, tb = 128;
+	unsigned grid = (total + tb - 1) / tb;
+	gpu_tn_backward__ CUDA2(grid, tb) (gpu_in_ptr_, gpu_out_ptr_, tn_r_, N, d, B);
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+#endif
+}
+
 // Inverse DFT forward: identical to FourierGpu::gpu_fft_forward but with
 // CUFFT_INVERSE. Reuses the same gather/scatter kernels, plan and 1/sqrt(N)
 // scaling (the unitary inverse). cuFFT is required for the inverse layer.
@@ -1055,7 +1293,7 @@ __global__ void seq_ce_forward__(GpuInVar *in, int vocab, int n_pos,
 // scaled by 1/n_pos to match the per-clone mean loss (the clone sum + l_rate/B
 // then yields the batch mean). max_len = B*n_pos*vocab.
 __global__ void seq_ce_backward__(GpuInVar *in, int vocab, int n_pos,
-		int *targets, float *sqnorm, float inv_n, int max_len) {
+		int *targets, float *sqnorm, float inv_n, float eps, int max_len) {
 	int gi = blockIdx.x * blockDim.x + threadIdx.x;
 	if (gi >= max_len) {
 		return;
@@ -1073,6 +1311,12 @@ __global__ void seq_ce_backward__(GpuInVar *in, int vocab, int n_pos,
 	if (k == targets[tpos]) {
 		float sqmod = zr * zr + zi * zi;
 		if (sqmod < 1e-15f) sqmod = 1e-15f;
+		// target probability floor (matches CPU SequenceCrossEntropy): bound the
+		// 1/|z_t| gradient blow-up. eps == 0 -> exact Born gradient.
+		if (eps > 0.0f) {
+			float floor = eps * sqn;
+			if (sqmod < floor) sqmod = floor;
+		}
 		float f = (sqn - sqmod) / (sqmod * sqn);
 		gr  = -zr * f * inv_n;
 		gi_ = -zi * f * inv_n;
@@ -1133,11 +1377,12 @@ void SequenceCrossEntropyGpu::gpu_seq_ce_backward() {
 	int B = getNoMappings();
 	int total = B * n_pos_ * vocab_;
 	float inv_n = 1.0f / (float) n_pos_;
+	float eps = ((SequenceCrossEntropy*) getCpuFun()[0])->eps();
 	int *targets = gpu_batch_targets_ ? gpu_batch_targets_ : gpu_targets_;
 	int tb = 256;
 	unsigned grid = (total + tb - 1) / tb;
 	seq_ce_backward__ CUDA2(grid, tb)
-			(gpu_in_ptr_, vocab_, n_pos_, targets, gpu_sqnorm_, inv_n, total);
+			(gpu_in_ptr_, vocab_, n_pos_, targets, gpu_sqnorm_, inv_n, eps, total);
 	gpuErrchk(cudaPeekAtLastError());
 	gpuErrchk(cudaDeviceSynchronize());
 }

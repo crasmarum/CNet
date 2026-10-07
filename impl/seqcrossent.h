@@ -20,6 +20,15 @@ class SequenceCrossEntropy: public CFunc, public OutputFunc {
 	int n_pos_;
 	std::vector<int> targets_;          // per-position target token
 	std::vector<float> pos_sqnorm_;     // per-position ||z_p||^2
+	// Optional probability floor for the TARGET branch of the gradient only.
+	// The exact Born gradient of -log(|z_t|^2/||z||^2) grows like 1/|z_t| when the
+	// correct-token amplitude collapses, so a single hard example can produce an
+	// explosive update that spikes training. eps_ > 0 floors the target's Born
+	// probability at eps (sqmod <- max(sqmod, eps*||z||^2)) in the gradient, which
+	// bounds the update (a uniform measurement-noise floor, i.e. label-smoothing
+	// for the Born rule). loss()/forward() stay exact, so the reported NLL metric
+	// is unchanged -- only the optimisation is regularised. eps_ == 0 is exact.
+	float eps_ = 0.0f;
 
 public:
 	SequenceCrossEntropy(Uid uid, InSize in_size, int vocab)
@@ -44,7 +53,9 @@ public:
 	}
 
 	virtual CFunc* clone(Uid uid) override {
-		return new SequenceCrossEntropy(uid, InSize(input().length_), vocab_);
+		auto* c = new SequenceCrossEntropy(uid, InSize(input().length_), vocab_);
+		c->eps_ = eps_;
+		return c;
 	}
 
 	virtual std::string getName() override {
@@ -54,6 +65,8 @@ public:
 	int vocab() const { return vocab_; }
 	int nPos()  const { return n_pos_; }
 	const int* targetsData() const { return targets_.data(); }   // for GPU upload
+	float eps() const { return eps_; }
+	void setEps(float e) { eps_ = e; }
 
 	// targets[p] is the token that position p must predict (the input shifted
 	// left by one). Size must equal n_pos_.
@@ -114,6 +127,12 @@ public:
 					float sqmod = input().real_[gi] * input().real_[gi]
 								+ input().imag_[gi] * input().imag_[gi];
 					sqmod = (sqmod < 1e-15f) ? 1e-15f : sqmod;
+					// probability floor: clamp the target modulus from below so the
+					// 1/|z_t| blow-up of the exact gradient is bounded (eps_==0: exact).
+					if (eps_ > 0.0f) {
+						float floor = eps_ * sqn;
+						if (sqmod < floor) sqmod = floor;
+					}
 					float f = (sqn - sqmod) / (sqmod * sqn);
 					input().dz_star_real_[gi] = -input().real_[gi] * f * inv_n;
 					input().dz_star_imag_[gi] = -input().imag_[gi] * f * inv_n;

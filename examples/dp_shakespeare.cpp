@@ -64,7 +64,12 @@ FLAG_INT(warmup, 200)       // linear-warmup steps
 FLAG_INT(val_every, 500)    // validation period (0 = off)
 FLAG_FLOAT(lr, 1e-3)        // peak learning rate
 FLAG_FLOAT(min_lr, 1e-4)    // cosine floor
+FLAG_FLOAT(grad_clip, 0.0)  // true-Adam clip-by-value per grad component (0 = off)
 FLAG_STRING(data, "tiny_shakespear2.txt")
+FLAG_BOOL(born, false)      // use Born-rule attention mixer instead of causal Fourier
+FLAG_BOOL(block_norm, false) // L2-normalize (SoftMax) each block output (deep nets)
+FLAG_BOOL(token_norm, false) // per-token complex RMS pre-norm (pre-LN transformer)
+FLAG_FLOAT(ce_eps, 0.0)     // Born-loss target-prob floor (0 = exact; ~1e-3 stabilizes)
 
 // ---------------- minimal character dataset (90/10 train/val) ----------------
 struct CharData {
@@ -89,18 +94,36 @@ static int buildLM(ComplexNet &net, int embId, int E, int N, int L, int vocab) {
 	const int size = N * E, H = 4 * E;
 	int pos  = net.add(new CInput(OutSize(size)));
 	int last = net.add(new Residual(InSize(size), InSize(size)), {embId, pos});
+	const int dh = E / 2;   // Born-rule attention head dim (complex)
+	// Per-token pre-norm (complex RMSNorm). When on, each sub-block sees a
+	// normalized residual-stream input; the residual still adds to the un-normed
+	// stream (standard pre-LN), which is what lets depth train stably.
+	auto norm = [&](int x) { return token_norm ? net.add(new TokenNorm(N, E), {x}) : x; };
 	for (int b = 0; b < L; ++b) {
-		int mix = net.add(new TriangFourier(InSize(size)), {last});        // causal token mix
-		int r0  = net.add(new Residual(InSize(size), InSize(size)), {last, mix});
+		int mixout;
+		if (born) {                                                        // Born-rule attention
+			int pre = net.add(new CGelu(InSize(size)), {norm(last)});
+			int wQ = net.add(new CInput(OutSize(E * dh))); int Q  = net.add(new TokenwiseLinear(N, E, dh), {pre, wQ});
+			int wK = net.add(new CInput(OutSize(E * dh))); int K  = net.add(new TokenwiseLinear(N, E, dh), {pre, wK});
+			int wV = net.add(new CInput(OutSize(E * dh))); int Vv = net.add(new TokenwiseLinear(N, E, dh), {pre, wV});
+			int att = net.add(new BornAttention(N, dh), {Q, K, Vv});
+			int wO = net.add(new CInput(OutSize(dh * E)));
+			mixout = net.add(new TokenwiseLinear(N, dh, E), {att, wO});
+		} else {                                                           // causal Fourier
+			mixout = net.add(new TriangFourier(InSize(size)), {norm(last)});
+		}
+		int r0  = net.add(new Residual(InSize(size), InSize(size)), {last, mixout});
 		int n0  = net.add(new CGelu(InSize(size)), {r0});
 		int w1  = net.add(new CInput(OutSize(E * H)));
-		int f1  = net.add(new TokenwiseLinear(N, E, H), {n0, w1});          // position-wise FFN
+		int f1  = net.add(new TokenwiseLinear(N, E, H), {norm(n0), w1});    // position-wise FFN (pre-norm)
 		int g   = net.add(new CGelu(InSize(N * H)), {f1});
 		int w2  = net.add(new CInput(OutSize(H * E)));
 		int f2  = net.add(new TokenwiseLinear(N, H, E), {g, w2});
 		int r1  = net.add(new Residual(InSize(size), InSize(size)), {n0, f2});
 		last    = net.add(new CGelu(InSize(size)), {r1});
+		if (block_norm) last = net.add(new SoftMax(InSize(size)), {last});   // per-block L2 norm
 	}
+	last       = norm(last);                                                // final pre-logits norm
 	int wo     = net.add(new CInput(OutSize(E * vocab)));
 	int logits = net.add(new TokenwiseLinear(N, E, vocab), {last, wo});     // per-token -> vocab
 	int ce     = net.add(new SequenceCrossEntropy(InSize(N * vocab), vocab), {logits});
@@ -140,6 +163,9 @@ int main(int argc, char **argv) {
 		std::cout << "tiny-shakespeare: chars=" << ds.data.size() << " vocab=" << vocab
 				  << "  model E=" << E << " N=" << N << " L=" << L
 				  << "  global_batch=" << batch << " world=" << W
+				  << "  born=" << born << " block_norm=" << block_norm
+				  << " token_norm=" << token_norm
+				  << "  grad_clip=" << grad_clip << " ce_eps=" << ce_eps
 				  << "  chance=ln(vocab)=" << std::log((double) vocab) << std::endl;
 
 	CNet net;
@@ -147,6 +173,7 @@ int main(int argc, char **argv) {
 	int ceId  = buildLM(net.cpuNet(), embId, E, N, L, vocab);
 	((CEmbedding*) net.cpuNet()[embId])->setIsMainInput(true);
 	((SequenceCrossEntropy*) net.cpuNet()[ceId])->setIsMainOutput(true);
+	((SequenceCrossEntropy*) net.cpuNet()[ceId])->setEps(ce_eps);  // 0 = exact Born
 	net.cpuNet().init_inputs(1234);                // identical init on every rank
 	net.allocateOnGpu(per);
 	CEmbedding *em = (CEmbedding*) net.cpuNet()[embId];
@@ -200,7 +227,7 @@ int main(int argc, char **argv) {
 		for (size_t i = 0; i < gradBufs.size(); ++i)                      // scatter
 			cudaMemcpyAsync(gradBufs[i].first, scratch + off[i],
 				(size_t) gradBufs[i].second * sizeof(float), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
-		net.trueAdamUpdate(lr_at(t), b1, b2, eps, t, 0.0f);
+		net.trueAdamUpdate(lr_at(t), b1, b2, eps, t, grad_clip);
 
 		if (R == 0 && t % 100 == 0) {
 			std::cout << "step " << t << "  train " << (acc / accn) << " nats/char  lr "
