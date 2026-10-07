@@ -161,6 +161,7 @@ static int sampleNext(SequenceCrossEntropy *seq, int p, int vocab, double temp, 
 // are causal, so right-filling the N-token window and reading the distribution at
 // the last real position is exact (the zero padding never influences it).
 static int runGenerate() {
+	FILELog::ReportingLevel() = lWarning;   // quiet per-layer restore/forward debug logs
 	if (((std::string) model).empty()) { std::cerr << "-generate requires -model <file>\n"; return 1; }
 	CharData ds; ds.load(data);
 	std::vector<char> i2c(ds.vocab);

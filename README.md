@@ -637,6 +637,13 @@ The trained model can be checkpointed (`-save_path model.mod`) and then sampled 
 ./dp_shakespeare -generate true -model model.mod -prompt "ROMEO:" -gen_len 600 -temp 0.8
 ```
 
+A pretrained fully-complex Born-rule model (Born attention + RoPE + TokenNorm, ~2.1M complex parameters, val 1.52 nats/char on tiny-shakespeare) is available as a [release asset](https://github.com/crasmarum/CNet/releases/download/v0.1/rope20k.mod) — download it and generate directly:
+
+```bash
+curl -L -o rope20k.mod https://github.com/crasmarum/CNet/releases/download/v0.1/rope20k.mod
+./dp_shakespeare -generate true -model rope20k.mod -prompt "ROMEO:" -gen_len 600 -temp 0.8
+```
+
 The per-step work is the forward/backward plus a single coalesced NCCL
 all-reduce of the gradients; the validation loss is identical across GPU counts,
 confirming correctness. Measured on RTX A6000 (CUDA 12.8, NCCL 2.26), same
