@@ -89,7 +89,7 @@ FW_OBJS = $(addprefix $(OBJ_DIR)/, $(notdir $(FW_SRCS:.cpp=.o)))
 # --- Build Rules ---
 
 # Phony targets are not actual files. 'all' is the default goal.
-.PHONY: all clean run info dp_shakespeare
+.PHONY: all clean run info dp_shakespeare generate
 .DEFAULT_GOAL := all
 
 # Standalone multi-GPU data-parallel tiny-shakespeare example (its own main).
@@ -97,6 +97,12 @@ dp_shakespeare: $(FW_OBJS) $(OBJ_DIR)/dp_shakespeare.o
 	@mkdir -p $(TARGET_DIR)
 	$(CXX) $^ $(LDFLAGS) -lnccl -o $(TARGET_DIR)/dp_shakespeare
 	@echo "==> Built $(TARGET_DIR)/dp_shakespeare"
+
+# Standalone CPU-only text generator (its own main; no CUDA/NCCL).
+generate: $(FW_OBJS) $(OBJ_DIR)/generate.o
+	@mkdir -p $(TARGET_DIR)
+	$(CXX) $^ $(LDFLAGS) -o $(TARGET_DIR)/generate
+	@echo "==> Built $(TARGET_DIR)/generate"
 
 # Default target: build the final executable.
 all: $(TARGET)
