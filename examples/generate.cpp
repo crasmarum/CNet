@@ -92,7 +92,7 @@ int main(int argc, char **argv) {
 	std::mt19937 rng(std::random_device{}());
 	std::vector<int> ctx;
 	for (char c : (std::string) prompt) if (ds.c2i.count(c)) ctx.push_back(ds.c2i[c]);
-	std::string out = prompt;
+	std::cout << (std::string) prompt << std::flush;      // echo the seed
 	for (int g = 0; g < gen_len; ++g) {
 		std::vector<int> win(N, 0);
 		int ctxn = (int) ctx.size(), take = std::min(ctxn, N);
@@ -101,8 +101,8 @@ int main(int argc, char **argv) {
 		net.cpuNet().forward();
 		int nxt = sampleNext(seq, take - 1, vocab, temp, rng);
 		ctx.push_back(nxt);
-		out += i2c[nxt];
+		std::cout << i2c[nxt] << std::flush;              // stream each token as it is produced
 	}
-	std::cout << out << std::endl;
+	std::cout << std::endl;
 	return 0;
 }
