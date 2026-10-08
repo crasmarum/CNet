@@ -11,9 +11,16 @@
 
 FLAG_INT(reduce_block_size, 512);
 
-// When off, TokenwiseLinear falls back to the naive element-wise CUDA kernels
-// (kept for A/B comparison); on by default it uses batched cuBLAS GEMMs.
-FLAG_BOOL(tw_cublas, true)
+// When off, TokenwiseLinear falls back to the naive element-wise CUDA kernels;
+// when on it uses batched cuBLAS GEMMs. DEFAULT OFF: the cuBLAS batched backward
+// is correct for N=1 (dense Linear passes GPU==CPU) but produces WRONG gradients
+// for N>1 (multi-token) in full training -- a model built on it never learns
+// context and plateaus at the unigram/chance loss (char: 3.35 stuck vs 2.1 and
+// falling with cuBLAS off; reproduced on WikiText too). The forward and the 16
+// backward GEMMs look algebraically/layout consistent on inspection, so the bug
+// is subtle (batched-GEMM usage for N>1); until it is root-caused and covered by
+// a TokenwiseLinear GPU-vs-CPU gradient test, train with the exact kernels.
+FLAG_BOOL(tw_cublas, false)
 
 // When set, the Linear layer uses the direct shared-memory GEMV kernels
 // (forward and backward) instead of the generic reduce-then-sum path.

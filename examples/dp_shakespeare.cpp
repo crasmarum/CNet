@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <unistd.h>
 #include <nccl.h>
+#include <cublas_v2.h>
 
 #include "../utils/flags.h"
 #include "../utils/stopwatch.h"
@@ -65,6 +66,11 @@ FLAG_INT(val_every, 500)    // validation period (0 = off)
 FLAG_FLOAT(lr, 1e-3)        // peak learning rate
 FLAG_FLOAT(min_lr, 1e-4)    // cosine floor
 FLAG_FLOAT(grad_clip, 0.0)  // true-Adam clip-by-value per grad component (0 = off)
+FLAG_FLOAT(grad_norm_clip, 0.0) // GLOBAL gradient-norm clip on the all-reduced grad (0 = off):
+                                // scales the whole gradient when ||g|| exceeds this, which
+                                // (unlike clip-by-value) bounds the coordinated large-norm update
+                                // that the spike-prone Born loss produces. Applied identically on
+                                // every rank (same summed gradient), so replicas stay in sync.
 FLAG_STRING(data, "tiny_shakespear2.txt")
 FLAG_BOOL(born, false)      // use Born-rule attention mixer instead of causal Fourier
 FLAG_BOOL(block_norm, false) // L2-normalize (SoftMax) each block output (deep nets)
@@ -78,6 +84,9 @@ FLAG_STRING(prompt, "ROMEO:")// seed text for generation
 FLAG_INT(gen_len, 600)      // number of characters to generate
 FLAG_FLOAT(temp, 0.8)       // sampling temperature (lower = greedier)
 FLAG_BOOL(print_net, false) // build the LM and print its layer graph, then exit
+FLAG_BOOL(token_lm, false)  // sub-word token LM: -data is a DIR with train.bin/val.bin (uint16 ids)
+FLAG_INT(vocab_size, 8192)  // vocab in -token_lm mode (must match the BPE used to make the bins)
+FLAG_STRING(nccl_id, "/tmp/cnet_shk_id")  // base path for the NCCL rendezvous id file (per DP group)
 
 // ---------------- minimal character dataset (90/10 train/val) ----------------
 struct CharData {
@@ -91,6 +100,32 @@ struct CharData {
 		for (char c : s) if (!c2i.count(c)) c2i[c] = vocab++;
 		for (char c : s) data.push_back(c2i[c]);
 		ntrain = (int) ((data.size() / 10) * 9);
+	}
+};
+
+// ---- sub-word token dataset: <dir>/train.bin + <dir>/val.bin, uint16 ids ----
+// train ids occupy [0, ntrain); val ids are appended at [ntrain, end), so the
+// existing held-out sampler (which draws from [ntrain, size)) reads validation.
+struct TokenData {
+	std::vector<int> data;
+	int vocab = 0, ntrain = 0;
+	static void readBin(const std::string &p, std::vector<int> &out) {
+		std::ifstream f(p, std::ios::binary);
+		if (!f) { std::cerr << "cannot read " << p << "\n"; exit(1); }
+		f.seekg(0, std::ios::end); std::streamoff n = f.tellg(); f.seekg(0);
+		std::vector<uint16_t> buf((size_t) n / 2);
+		f.read((char*) buf.data(), (std::streamsize) buf.size() * 2);
+		out.reserve(out.size() + buf.size());
+		for (uint16_t v : buf) out.push_back((int) v);
+	}
+	void load(const std::string &dir, int vocab_) {
+		vocab = vocab_;
+		std::vector<int> tr, va;
+		readBin(dir + "/train.bin", tr);
+		readBin(dir + "/val.bin", va);
+		ntrain = (int) tr.size();
+		data = std::move(tr);
+		data.insert(data.end(), va.begin(), va.end());
 	}
 };
 
@@ -196,14 +231,16 @@ int main(int argc, char **argv) {
 	FLAGS::Parse(argc, argv);
 	if (generate) return runGenerate();          // standalone sampling, no training / NCCL
 	if (print_net) {                              // dump the layer graph, no training / NCCL
-		CharData ds; ds.load(data);
+		int vcb;
+		if (token_lm) vcb = vocab_size;
+		else { CharData ds; ds.load(data); vcb = ds.vocab; }
 		CNet net;
-		int embId = net.cpuNet().add(new CEmbedding(emb, tokens, ds.vocab));
-		buildLM(net.cpuNet(), embId, emb, tokens, blocks, ds.vocab);
+		int embId = net.cpuNet().add(new CEmbedding(emb, tokens, vcb));
+		buildLM(net.cpuNet(), embId, emb, tokens, blocks, vcb);
 		std::cout << "config: born=" << born << " token_norm=" << token_norm
 				  << " rope=" << rope << " block_norm=" << block_norm
 				  << "  E=" << emb << " N=" << tokens << " L=" << blocks
-				  << " vocab=" << ds.vocab << "\n\n"
+				  << " vocab=" << vcb << "\n\n"
 				  << net.cpuNet().toString();
 		return 0;
 	}
@@ -217,7 +254,10 @@ int main(int argc, char **argv) {
 	cudaSetDevice(R % nDev);
 
 	// --- NCCL rendezvous: rank 0 writes the unique id to /tmp; others poll. ---
-	const char *idf = "/tmp/cnet_shk_id.bin", *rdy = "/tmp/cnet_shk_id.ready";
+	// The id-file base is a flag so independent DP groups can run concurrently
+	// (e.g. a Born run on GPUs 0-3 and a Fourier run on 4-7 at the same time).
+	std::string idf_s = (std::string) nccl_id + ".bin", rdy_s = (std::string) nccl_id + ".ready";
+	const char *idf = idf_s.c_str(), *rdy = rdy_s.c_str();
 	ncclUniqueId id;
 	if (R == 0) {
 		ncclGetUniqueId(&id);
@@ -232,10 +272,11 @@ int main(int argc, char **argv) {
 	ncclComm_t comm;
 	if (ncclCommInitRank(&comm, W, id, R) != ncclSuccess) { std::cerr << "rank " << R << ": nccl init failed\n"; return 1; }
 
-	CharData ds; ds.load(data);
-	const int vocab = ds.vocab;
+	std::vector<int> ids; int vocab, ntrainTok;
+	if (token_lm) { TokenData d; d.load(data, vocab_size); ids = std::move(d.data); vocab = d.vocab; ntrainTok = d.ntrain; }
+	else          { CharData  d; d.load(data);             ids = std::move(d.data); vocab = d.vocab; ntrainTok = d.ntrain; }
 	if (R == 0)
-		std::cout << "tiny-shakespeare: chars=" << ds.data.size() << " vocab=" << vocab
+		std::cout << (token_lm ? "token-LM: tokens=" : "tiny-shakespeare: chars=") << ids.size() << " vocab=" << vocab
 				  << "  model E=" << E << " N=" << N << " L=" << L
 				  << "  global_batch=" << batch << " world=" << W
 				  << "  born=" << born << " block_norm=" << block_norm
@@ -260,6 +301,10 @@ int main(int argc, char **argv) {
 	int total = 0;
 	for (size_t i = 0; i < gradBufs.size(); ++i) { off[i] = total; total += gradBufs[i].second; }
 	float *scratch = nullptr; cudaMalloc(&scratch, (size_t) total * sizeof(float));
+	// cuBLAS handle for the global gradient-norm clip (operates on the coalesced
+	// all-reduced gradient in `scratch`).
+	cublasHandle_t gbh = 0;
+	if (grad_norm_clip > 0.f) { cublasCreate(&gbh); cublasSetStream(gbh, cudaStreamPerThread); cublasSetPointerMode(gbh, CUBLAS_POINTER_MODE_HOST); }
 
 	std::mt19937 rng(1000 + R);                    // each rank draws a different data shard
 	auto targetsOf = [&](const std::vector<int> &win, int lab) {
@@ -270,13 +315,13 @@ int main(int argc, char **argv) {
 	};
 	auto buildBatch = [&](bool heldout) {
 		EmbeddingBatch b(per, N);
-		int lo = heldout ? ds.ntrain : 0;
-		int hi = (heldout ? (int) ds.data.size() : ds.ntrain) - N - 2;
+		int lo = heldout ? ntrainTok : 0;
+		int hi = (heldout ? (int) ids.size() : ntrainTok) - N - 2;
 		std::uniform_int_distribution<int> d(lo, hi);
 		for (int i = 0; i < per; ++i) {
 			int p = d(rng);
-			std::vector<int> win(ds.data.begin() + p, ds.data.begin() + p + N);
-			int lab = ds.data[p + N];
+			std::vector<int> win(ids.begin() + p, ids.begin() + p + N);
+			int lab = ids[p + N];
 			b.add(win, lab);
 			b.addTargets(targetsOf(win, lab));
 		}
@@ -290,7 +335,9 @@ int main(int argc, char **argv) {
 
 	const float b1 = 0.9f, b2 = 0.999f, eps = 1e-8f;
 	StopWatch sw; float acc = 0; int accn = 0;
+	float best_val = 1e30f;   // best held-out loss seen, for best-checkpoint saving
 	for (int t = 1; t <= steps; ++t) {
+		float gnorm = 0.f;
 		EmbeddingBatch batch_ = buildBatch(false);
 		net.gpuForward(em, seq, batch_);
 		acc += net.getLoss(0)[seq->uid()]; ++accn;
@@ -299,6 +346,14 @@ int main(int argc, char **argv) {
 			cudaMemcpyAsync(scratch + off[i], gradBufs[i].first,
 				(size_t) gradBufs[i].second * sizeof(float), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
 		ncclAllReduce(scratch, scratch, total, ncclFloat, ncclSum, comm, cudaStreamPerThread);
+		// Global gradient-NORM clip on the summed gradient (same on every rank).
+		if (grad_norm_clip > 0.f) {
+			cublasSnrm2(gbh, total, scratch, 1, &gnorm);
+			if (gnorm > grad_norm_clip) {
+				float s = grad_norm_clip / gnorm;
+				cublasSscal(gbh, total, &s, scratch, 1);
+			}
+		}
 		for (size_t i = 0; i < gradBufs.size(); ++i)                      // scatter
 			cudaMemcpyAsync(gradBufs[i].first, scratch + off[i],
 				(size_t) gradBufs[i].second * sizeof(float), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
@@ -306,27 +361,49 @@ int main(int argc, char **argv) {
 
 		if (R == 0 && t % 100 == 0) {
 			std::cout << "step " << t << "  train " << (acc / accn) << " nats/char  lr "
-					  << lr_at(t) << "  " << (sw.ElapsedTimeMicros() / 1000.0 / 100) << " ms/step"
+					  << lr_at(t) << "  |g|=" << gnorm << "  "
+					  << (sw.ElapsedTimeMicros() / 1000.0 / 100) << " ms/step"
 					  << std::endl;
 			acc = 0; accn = 0; sw.Reset();
 		}
 		if (R == 0 && val_every > 0 && t % val_every == 0) {
 			float v = 0; const int K = 20;
 			for (int k = 0; k < K; ++k) { EmbeddingBatch vb = buildBatch(true); net.gpuForward(em, seq, vb); v += net.getLoss(0)[seq->uid()]; }
-			std::cout << "  [val] step " << t << "  val " << (v / K) << " nats/char" << std::endl;
+			float vv = v / K;
+			std::cout << "  [val] step " << t << "  val " << vv << " nats/char" << std::endl;
+			// Save the BEST checkpoint so a later Born-loss spike can't wipe out the
+			// run's best model (the loss is spike-prone at large vocab).
+			if (!((std::string) save_path).empty() && vv < best_val) {
+				best_val = vv;
+				if (net.getInputsFromGpu() && net.save((std::string) save_path))
+					std::cout << "    [ckpt] new best val " << vv << " -> saved " << (std::string) save_path << std::endl;
+			}
 			sw.Reset();
 		}
 	}
 	cudaStreamSynchronize(cudaStreamPerThread);
 
-	// Rank 0 checkpoints the trained model (weights pulled GPU->CPU first). Every
-	// rank holds identical weights, so one save suffices. Generate later with
-	// -generate -model <save_path>.
+	// Rank 0 checkpoints the final model (weights pulled GPU->CPU first). Every rank
+	// holds identical weights, so one save suffices. Generate later with
+	// -generate -model <save_path>. When held-out validation is on, best-val
+	// checkpoints were already saved during training; only overwrite with the final
+	// model if it is at least as good (don't let a late spike clobber the best).
 	if (R == 0 && !((std::string) save_path).empty()) {
-		if (net.getInputsFromGpu() && net.save((std::string) save_path))
-			std::cout << "saved model to " << (std::string) save_path << std::endl;
-		else
-			std::cerr << "WARNING: model save to " << (std::string) save_path << " failed\n";
+		bool do_save = true;
+		if (val_every > 0 && best_val < 1e29f) {
+			float v = 0; const int K = 20;
+			for (int k = 0; k < K; ++k) { EmbeddingBatch vb = buildBatch(true); net.gpuForward(em, seq, vb); v += net.getLoss(0)[seq->uid()]; }
+			float vv = v / K;
+			do_save = (vv <= best_val);
+			std::cout << "final val " << vv << " (best " << best_val << "); "
+					  << (do_save ? "saving final" : "keeping best checkpoint") << std::endl;
+		}
+		if (do_save) {
+			if (net.getInputsFromGpu() && net.save((std::string) save_path))
+				std::cout << "saved model to " << (std::string) save_path << std::endl;
+			else
+				std::cerr << "WARNING: model save to " << (std::string) save_path << " failed\n";
+		}
 	}
 
 	cudaFree(scratch);

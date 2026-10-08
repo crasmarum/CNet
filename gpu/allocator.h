@@ -272,7 +272,7 @@ public:
 	}
 
 	//=================
-	float** ptr_float_allocate_on_gpu(int length) {
+	float** ptr_float_allocate_on_gpu(size_t length) {
 		float **data;
 		auto ret = cudaMalloc((void**) &data, length * sizeof(float*));
 		if (ret != cudaSuccess) {
@@ -292,7 +292,7 @@ public:
 		return cudaSuccess == ret;
 	}
 
-	float* float_allocate_on_gpu(int length) {
+	float* float_allocate_on_gpu(size_t length) {
 		float *data;
 		auto ret = cudaMalloc((void**) &data, length * sizeof(float));
 		if (ret != cudaSuccess) {
@@ -359,7 +359,7 @@ public:
 		}
 	}
 
-	int* int_allocate_on_gpu(int length) {
+	int* int_allocate_on_gpu(size_t length) {
 		int *data;
 		auto ret = cudaMalloc((void**) &data, length * sizeof(int));
 		if (ret != cudaSuccess) {
