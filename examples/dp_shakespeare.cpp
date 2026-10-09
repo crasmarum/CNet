@@ -77,6 +77,8 @@ FLAG_BOOL(block_norm, false) // L2-normalize (SoftMax) each block output (deep n
 FLAG_BOOL(token_norm, false) // per-token complex RMS pre-norm (pre-LN transformer)
 FLAG_BOOL(rope, false)      // rotary position embedding on Born-attention Q,K
 FLAG_FLOAT(ce_eps, 0.0)     // Born-loss target-prob floor (0 = exact; ~1e-3 stabilizes)
+FLAG_FLOAT(attn_eps, 0.0)   // Born-ATTENTION normalization floor A=s/(S+eps): bounds the 1/S
+                            // gradient blow-up when a query's scores collapse (0 = exact)
 FLAG_STRING(save_path, "")  // if set, rank 0 saves the trained model here after training
 FLAG_BOOL(generate, false)  // generation mode: restore -model and sample text (no training)
 FLAG_STRING(model, "")      // model file to restore in -generate mode
@@ -84,6 +86,7 @@ FLAG_STRING(prompt, "ROMEO:")// seed text for generation
 FLAG_INT(gen_len, 600)      // number of characters to generate
 FLAG_FLOAT(temp, 0.8)       // sampling temperature (lower = greedier)
 FLAG_BOOL(print_net, false) // build the LM and print its layer graph, then exit
+FLAG_INT(seed, 1000)        // base seed for the per-rank data sampler (rank r uses seed+r)
 FLAG_BOOL(token_lm, false)  // sub-word token LM: -data is a DIR with train.bin/val.bin (uint16 ids)
 FLAG_INT(vocab_size, 8192)  // vocab in -token_lm mode (must match the BPE used to make the bins)
 FLAG_STRING(nccl_id, "/tmp/cnet_shk_id")  // base path for the NCCL rendezvous id file (per DP group)
@@ -153,7 +156,7 @@ static int buildLM(ComplexNet &net, int embId, int E, int N, int L, int vocab) {
 				Q = net.add(new RotaryEmbed(N, dh), {Q});
 				K = net.add(new RotaryEmbed(N, dh), {K});
 			}
-			int att = net.add(new BornAttention(N, dh), {Q, K, Vv});
+			int att = net.add(new BornAttention(N, dh, true, attn_eps), {Q, K, Vv});
 			int wO = net.add(new CInput(OutSize(dh * E)));
 			mixout = net.add(new TokenwiseLinear(N, dh, E), {att, wO});
 		} else {                                                           // causal Fourier
@@ -306,7 +309,7 @@ int main(int argc, char **argv) {
 	cublasHandle_t gbh = 0;
 	if (grad_norm_clip > 0.f) { cublasCreate(&gbh); cublasSetStream(gbh, cudaStreamPerThread); cublasSetPointerMode(gbh, CUBLAS_POINTER_MODE_HOST); }
 
-	std::mt19937 rng(1000 + R);                    // each rank draws a different data shard
+	std::mt19937 rng(seed + R);                    // each rank draws a different data shard (seed flag)
 	auto targetsOf = [&](const std::vector<int> &win, int lab) {
 		std::vector<int> t(N, 0);
 		for (int i = 0; i + 1 < (int) win.size(); ++i) t[i] = win[i + 1];

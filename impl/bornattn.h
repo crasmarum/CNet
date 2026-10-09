@@ -23,21 +23,25 @@
 class BornAttention: public CFunc {
 	int N_, d_;
 	bool causal_;                          // true: key m<=k (autoregressive); false: full attention
+	float eps_;                            // normalization floor: A=s/(S+eps). Bounds the 1/S
+	                                       // gradient blow-up when a query's scores collapse (S->0),
+	                                       // the spike that otherwise destabilizes long training.
 	std::vector<std::complex<float>> c_;   // c[k*N+m]
 	std::vector<float> A_, S_;             // A[k*N+m], S[k]
 public:
-	BornAttention(Uid uid, int n_tokens, int dim, bool causal = true)
+	BornAttention(Uid uid, int n_tokens, int dim, bool causal = true, float eps = 0.f)
 		: CFunc(uid, InSize(3 * n_tokens * dim), OutSize(n_tokens * dim)),
-		  N_(n_tokens), d_(dim), causal_(causal),
+		  N_(n_tokens), d_(dim), causal_(causal), eps_(eps),
 		  c_(n_tokens * n_tokens), A_(n_tokens * n_tokens), S_(n_tokens) {}
 
-	BornAttention(int n_tokens, int dim, bool causal = true)
+	BornAttention(int n_tokens, int dim, bool causal = true, float eps = 0.f)
 		: CFunc(InSize(3 * n_tokens * dim), OutSize(n_tokens * dim)),
-		  N_(n_tokens), d_(dim), causal_(causal),
+		  N_(n_tokens), d_(dim), causal_(causal), eps_(eps),
 		  c_(n_tokens * n_tokens), A_(n_tokens * n_tokens), S_(n_tokens) {}
 
 	virtual ~BornAttention() {}
-	virtual CFunc* clone(Uid uid) { return new BornAttention(uid, N_, d_, causal_); }
+	virtual CFunc* clone(Uid uid) { return new BornAttention(uid, N_, d_, causal_, eps_); }
+	float eps() const { return eps_; }
 	virtual std::string getName() { return "BornAttention_" + std::to_string(uid_); }
 
 	int M() const { return N_ * d_; }
@@ -66,7 +70,8 @@ public:
 				Sk += s;
 			}
 			S_[k] = Sk;
-			float inv = Sk > 0.f ? 1.f / Sk : 0.f;
+			float denom = Sk + eps_;
+			float inv = denom > 0.f ? 1.f / denom : 0.f;
 			for (int m = 0; m <= mhi; ++m) {
 				float a = A_[k * N + m] * inv;       // A[k,m]
 				A_[k * N + m] = a;
@@ -104,7 +109,8 @@ public:
 				a[m] = am;
 				abar += A_[k * N + m] * am;
 			}
-			float inv = S_[k] > 0.f ? 1.f / S_[k] : 0.f;
+			float denom = S_[k] + eps_;
+			float inv = denom > 0.f ? 1.f / denom : 0.f;
 			for (int m = 0; m <= mhi; ++m) {
 				float b = (a[m] - abar) * inv;            // dL/ds[k,m]-chain (real)
 				std::complex<float> ckm = c_[k * N + m], ckmc = std::conj(ckm);

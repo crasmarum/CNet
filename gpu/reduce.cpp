@@ -12,14 +12,19 @@
 FLAG_INT(reduce_block_size, 512);
 
 // When off, TokenwiseLinear falls back to the naive element-wise CUDA kernels;
-// when on it uses batched cuBLAS GEMMs. DEFAULT OFF: the cuBLAS batched backward
-// is correct for N=1 (dense Linear passes GPU==CPU) but produces WRONG gradients
-// for N>1 (multi-token) in full training -- a model built on it never learns
-// context and plateaus at the unigram/chance loss (char: 3.35 stuck vs 2.1 and
-// falling with cuBLAS off; reproduced on WikiText too). The forward and the 16
-// backward GEMMs look algebraically/layout consistent on inspection, so the bug
-// is subtle (batched-GEMM usage for N>1); until it is root-caused and covered by
-// a TokenwiseLinear GPU-vs-CPU gradient test, train with the exact kernels.
+// when on it uses batched cuBLAS GEMMs. The cuBLAS path is NUMERICALLY CORRECT:
+// its forward and backward match the element-wise reference to float rounding
+// (~1e-3), verified by -tw_gpu (testTokenwiseGpuVsCpu) with a full Born block,
+// asymmetric FFN dims, and distinct per-clone data; it is NOT a gradient bug and
+// NOT TF32 (CUBLAS_PEDANTIC_MATH is set below). HOWEVER, for the Born-attention
+// language model the training reliably gets stuck at the unigram/chance loss with
+// cuBLAS on (char: 3.35 stuck vs ~2.1 and falling with it off; same at lr 2e-3),
+// because the Born loss's unigram saddle is hypersensitive: the tiny difference in
+// GEMM summation order between cuBLAS and the element-wise kernel deterministically
+// decides whether the model escapes the saddle. Default OFF so the flagship Born LM
+// trains out-of-box; cuBLAS (faster) is fine to enable for non-saddle tasks
+// (classification) or once the saddle-escape is made robust (symmetry-breaking
+// init / loss reformulation -- same landscape issue as the WikiText cliff).
 FLAG_BOOL(tw_cublas, false)
 
 // When set, the Linear layer uses the direct shared-memory GEMV kernels
@@ -529,7 +534,7 @@ void BornAttentionGpu::free_scratch() {
 }
 
 __global__ void gpu_born_forward__(GpuInVar *in, GpuOutVar *out,
-		cmplx_ *C, float *A, float *S, int N, int d, int B, int causal) {
+		cmplx_ *C, float *A, float *S, int N, int d, int B, int causal, float eps) {
 	int tid = blockIdx.x * blockDim.x + threadIdx.x;
 	if (tid >= B * N) return;
 	int clone = tid / N, k = tid % N, Mv = N * d;
@@ -547,7 +552,8 @@ __global__ void gpu_born_forward__(GpuInVar *in, GpuOutVar *out,
 		Sk += s;
 	}
 	S[(size_t) clone * N + k] = Sk;
-	float invS = Sk > 0.f ? 1.f / Sk : 0.f;
+	float denomF = Sk + eps;
+	float invS = denomF > 0.f ? 1.f / denomF : 0.f;
 	for (int m = 0; m <= mhi; ++m) A[cb + m] *= invS;
 	GpuOutVar ov = out[clone];
 	for (int dd = 0; dd < d; ++dd) {
@@ -563,7 +569,7 @@ __global__ void gpu_born_forward__(GpuInVar *in, GpuOutVar *out,
 }
 
 __global__ void gpu_born_backward__(GpuInVar *in, GpuOutVar *out,
-		cmplx_ *C, float *A, float *S, int N, int d, int B, int causal) {
+		cmplx_ *C, float *A, float *S, int N, int d, int B, int causal, float eps) {
 	int tid = blockIdx.x * blockDim.x + threadIdx.x;
 	if (tid >= B * N) return;
 	int clone = tid / N, k = tid % N, Mv = N * d;
@@ -571,7 +577,8 @@ __global__ void gpu_born_backward__(GpuInVar *in, GpuOutVar *out,
 	GpuInVar inv = in[clone];
 	GpuOutVar ov = out[clone];
 	size_t cb = (size_t) clone * N * N + (size_t) k * N;
-	float invS = S[(size_t) clone * N + k] > 0.f ? 1.f / S[(size_t) clone * N + k] : 0.f;
+	float denomB = S[(size_t) clone * N + k] + eps;
+	float invS = denomB > 0.f ? 1.f / denomB : 0.f;
 	float abar = 0.f;
 	for (int m = 0; m <= mhi; ++m) {
 		float am = 0.f;
@@ -620,7 +627,7 @@ void BornAttentionGpu::gpu_born_forward() {
 	ensure_scratch(N, d, B);
 	int total = B * N, tb = 128;
 	unsigned grid = (total + tb - 1) / tb;
-	gpu_born_forward__ CUDA2(grid, tb) (gpu_in_ptr_, gpu_out_ptr_, ba_c_, ba_A_, ba_S_, N, d, B, f->causal() ? 1 : 0);
+	gpu_born_forward__ CUDA2(grid, tb) (gpu_in_ptr_, gpu_out_ptr_, ba_c_, ba_A_, ba_S_, N, d, B, f->causal() ? 1 : 0, f->eps());
 	gpuErrchk(cudaPeekAtLastError());
 	gpuErrchk(cudaDeviceSynchronize());
 #endif
@@ -632,7 +639,7 @@ void BornAttentionGpu::gpu_born_backward() {
 	int N = f->nTokens(), d = f->dim(), B = getNoMappings();
 	int total = B * N, tb = 128;
 	unsigned grid = (total + tb - 1) / tb;
-	gpu_born_backward__ CUDA2(grid, tb) (gpu_in_ptr_, gpu_out_ptr_, ba_c_, ba_A_, ba_S_, N, d, B, f->causal() ? 1 : 0);
+	gpu_born_backward__ CUDA2(grid, tb) (gpu_in_ptr_, gpu_out_ptr_, ba_c_, ba_A_, ba_S_, N, d, B, f->causal() ? 1 : 0, f->eps());
 	gpuErrchk(cudaPeekAtLastError());
 	gpuErrchk(cudaDeviceSynchronize());
 #endif
@@ -1294,6 +1301,11 @@ static cublasHandle_t tw_blas_handle() {
 		cublasCreate(&h);
 		cublasSetStream(h, cudaStreamPerThread);
 		cublasSetPointerMode(h, CUBLAS_POINTER_MODE_HOST);
+		// Force true IEEE FP32 (no TF32): on Ampere+ cuBLAS defaults to TF32 for
+		// SGEMM, whose ~10-bit mantissa is too coarse near the Born-loss unigram
+		// saddle and leaves training stuck at chance. The element-wise fallback uses
+		// full FP32; match it so the cuBLAS speedup does not cost correctness.
+		cublasSetMathMode(h, CUBLAS_PEDANTIC_MATH);
 	}
 	return h;
 }
