@@ -1433,7 +1433,7 @@ void CrossEntropyGpu::gpu_cross_ent_backward(int label) {
 // Batched over B clones. Targets are laid out per clone: targets[map*n_pos + p].
 // one thread per (clone, position): ||z_p||^2 and -log p_{target}. total = B*n_pos.
 __global__ void seq_ce_forward__(GpuInVar *in, int vocab, int n_pos,
-		int *targets, float *sqnorm, float *poss_loss, int total) {
+		int *targets, float *sqnorm, float *poss_loss, float smooth, int total) {
 	int t = blockIdx.x * blockDim.x + threadIdx.x;
 	if (t >= total) {
 		return;
@@ -1447,9 +1447,16 @@ __global__ void seq_ce_forward__(GpuInVar *in, int vocab, int n_pos,
 		sum += z.real * z.real + z.imag * z.imag;
 	}
 	if (sum < 1e-15f) sum = 1e-15f;
-	sqnorm[t] = sum;
+	sqnorm[t] = sum;   // raw Born norm; backward recomputes the smoothing from it
 	cmplx_ zt = Z_(in[map_indx], base + targets[t]);
-	float prob = (zt.real * zt.real + zt.imag * zt.imag) / sum;
+	// Laplace-smoothed Born, RELATIVE (scale-invariant like Born itself):
+	//   s = smooth * sum / V,   p_t = (|z_t|^2 + s) / (sum + V*s) = (|z_t|^2+s)/(sum(1+smooth)).
+	// Uniform input -> exactly 1/V; |z_t|^2->0 -> floor smooth/(V(1+smooth)) > 0 (no cliff).
+	// smooth==0 -> exact Born.
+	float s = smooth * sum / vocab;
+	float num = zt.real * zt.real + zt.imag * zt.imag + s;
+	float den = sum * (1.0f + smooth);
+	float prob = num / den;
 	if (prob < 1e-15f) prob = 1e-15f;
 	poss_loss[t] = -logf(prob);
 }
@@ -1458,7 +1465,7 @@ __global__ void seq_ce_forward__(GpuInVar *in, int vocab, int n_pos,
 // scaled by 1/n_pos to match the per-clone mean loss (the clone sum + l_rate/B
 // then yields the batch mean). max_len = B*n_pos*vocab.
 __global__ void seq_ce_backward__(GpuInVar *in, int vocab, int n_pos,
-		int *targets, float *sqnorm, float inv_n, float eps, int max_len) {
+		int *targets, float *sqnorm, float inv_n, float eps, float smooth, int max_len) {
 	int gi = blockIdx.x * blockDim.x + threadIdx.x;
 	if (gi >= max_len) {
 		return;
@@ -1473,11 +1480,27 @@ __global__ void seq_ce_backward__(GpuInVar *in, int vocab, int n_pos,
 	float zr = *Z_real_(in[map_indx], within);
 	float zi = *Z_imag_(in[map_indx], within);
 	float gr, gi_;
-	if (k == targets[tpos]) {
+	if (smooth > 0.0f) {
+		// Gradient of the relative Laplace-smoothed Born loss (matches forward):
+		//   L = -log(|z_t|^2 + a*sum/V) + log(sum) + const,  a = smooth, N = |z_t|^2 + a*sum/V.
+		//   dL/d|z_k|^2 = 1/sum - (a/V)/N - [k==target]/N.
+		int tk = targets[tpos];
+		float a = smooth;
+		float s = a * sqn / vocab;
+		int base_p = (within - k);                       // = p*vocab (target lives here + tk)
+		float ztr = *Z_real_(in[map_indx], base_p + tk);
+		float zti = *Z_imag_(in[map_indx], base_p + tk);
+		float N = ztr * ztr + zti * zti + s;
+		if (N < 1e-15f) N = 1e-15f;
+		float gf = 1.0f / sqn - (a / vocab) / N;
+		if (k == tk) gf -= 1.0f / N;
+		gr  = gf * zr * inv_n;
+		gi_ = gf * zi * inv_n;
+	} else if (k == targets[tpos]) {
 		float sqmod = zr * zr + zi * zi;
 		if (sqmod < 1e-15f) sqmod = 1e-15f;
 		// target probability floor (matches CPU SequenceCrossEntropy): bound the
-		// 1/|z_t| gradient blow-up. eps == 0 -> exact Born gradient.
+		// 1/|z_t| blow-up of the exact gradient. eps == 0 -> exact Born gradient.
 		if (eps > 0.0f) {
 			float floor = eps * sqn;
 			if (sqmod < floor) sqmod = floor;
@@ -1533,7 +1556,7 @@ void SequenceCrossEntropyGpu::gpu_seq_ce_forward() {
 	int tb = 128;
 	unsigned grid = (total + tb - 1) / tb;
 	seq_ce_forward__ CUDA2(grid, tb)
-			(gpu_in_ptr_, vocab_, n_pos_, targets, gpu_sqnorm_, gpu_poss_loss_, total);
+			(gpu_in_ptr_, vocab_, n_pos_, targets, gpu_sqnorm_, gpu_poss_loss_, cpu->smooth(), total);
 	gpuErrchk(cudaPeekAtLastError());
 	gpuErrchk(cudaDeviceSynchronize());
 }
@@ -1542,12 +1565,13 @@ void SequenceCrossEntropyGpu::gpu_seq_ce_backward() {
 	int B = getNoMappings();
 	int total = B * n_pos_ * vocab_;
 	float inv_n = 1.0f / (float) n_pos_;
-	float eps = ((SequenceCrossEntropy*) getCpuFun()[0])->eps();
+	SequenceCrossEntropy *cf = (SequenceCrossEntropy*) getCpuFun()[0];
+	float eps = cf->eps(), smooth = cf->smooth();
 	int *targets = gpu_batch_targets_ ? gpu_batch_targets_ : gpu_targets_;
 	int tb = 256;
 	unsigned grid = (total + tb - 1) / tb;
 	seq_ce_backward__ CUDA2(grid, tb)
-			(gpu_in_ptr_, vocab_, n_pos_, targets, gpu_sqnorm_, inv_n, eps, total);
+			(gpu_in_ptr_, vocab_, n_pos_, targets, gpu_sqnorm_, inv_n, eps, smooth, total);
 	gpuErrchk(cudaPeekAtLastError());
 	gpuErrchk(cudaDeviceSynchronize());
 }

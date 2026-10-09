@@ -77,6 +77,8 @@ FLAG_BOOL(block_norm, false) // L2-normalize (SoftMax) each block output (deep n
 FLAG_BOOL(token_norm, false) // per-token complex RMS pre-norm (pre-LN transformer)
 FLAG_BOOL(rope, false)      // rotary position embedding on Born-attention Q,K
 FLAG_FLOAT(ce_eps, 0.0)     // Born-loss target-prob floor (0 = exact; ~1e-3 stabilizes)
+FLAG_FLOAT(ce_smooth, 0.0)  // Laplace-smoothed Born loss p_t=(|z_t|^2+s)/(sum+V*s): bounded,
+                            // better-conditioned landscape (0 = exact Born)
 FLAG_FLOAT(attn_eps, 0.0)   // Born-ATTENTION normalization floor A=s/(S+eps): bounds the 1/S
                             // gradient blow-up when a query's scores collapse (0 = exact)
 FLAG_STRING(save_path, "")  // if set, rank 0 saves the trained model here after training
@@ -87,6 +89,7 @@ FLAG_INT(gen_len, 600)      // number of characters to generate
 FLAG_FLOAT(temp, 0.8)       // sampling temperature (lower = greedier)
 FLAG_BOOL(print_net, false) // build the LM and print its layer graph, then exit
 FLAG_INT(seed, 1000)        // base seed for the per-rank data sampler (rank r uses seed+r)
+FLAG_BOOL(emb_gauss, false) // symmetry-breaking zero-mean complex embedding init (vs default)
 FLAG_BOOL(token_lm, false)  // sub-word token LM: -data is a DIR with train.bin/val.bin (uint16 ids)
 FLAG_INT(vocab_size, 8192)  // vocab in -token_lm mode (must match the BPE used to make the bins)
 FLAG_STRING(nccl_id, "/tmp/cnet_shk_id")  // base path for the NCCL rendezvous id file (per DP group)
@@ -293,7 +296,24 @@ int main(int argc, char **argv) {
 	((CEmbedding*) net.cpuNet()[embId])->setIsMainInput(true);
 	((SequenceCrossEntropy*) net.cpuNet()[ceId])->setIsMainOutput(true);
 	((SequenceCrossEntropy*) net.cpuNet()[ceId])->setEps(ce_eps);  // 0 = exact Born
+	((SequenceCrossEntropy*) net.cpuNet()[ceId])->setSmooth(ce_smooth);  // Laplace-smoothed Born
 	net.cpuNet().init_inputs(1234);                // identical init on every rank
+	// Optional symmetry-breaking embedding init: zero-mean complex (real AND imag
+	// random), giving DISTINCT per-token embeddings so the model does not start
+	// pinned at the unigram saddle. The default CEmbedding init biases every
+	// component to a common +imag direction (tokens cluster), which makes escaping
+	// the unigram saddle numerically knife-edge (cuBLAS vs element-wise rounding
+	// then decides it). Deterministic across ranks (fixed seed).
+	if (emb_gauss) {
+		CEmbedding *e0 = (CEmbedding*) net.cpuNet()[embId];
+		std::mt19937 er(98765);
+		std::uniform_real_distribution<float> U(-1.f, 1.f);
+		float s = 1.f / std::sqrt((float) E);
+		for (int i = 0; i < e0->input().length_; ++i) {
+			e0->mutable_input()->real_[i] = U(er) * s;
+			e0->mutable_input()->imag_[i] = U(er) * s;
+		}
+	}
 	net.allocateOnGpu(per);
 	CEmbedding *em = (CEmbedding*) net.cpuNet()[embId];
 	SequenceCrossEntropy *seq = (SequenceCrossEntropy*) net.cpuNet()[ceId];

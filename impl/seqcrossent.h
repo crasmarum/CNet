@@ -29,6 +29,7 @@ class SequenceCrossEntropy: public CFunc, public OutputFunc {
 	// for the Born rule). loss()/forward() stay exact, so the reported NLL metric
 	// is unchanged -- only the optimisation is regularised. eps_ == 0 is exact.
 	float eps_ = 0.0f;
+	float smooth_ = 0.0f;   // Laplace-smoothed Born loss: p_t=(|z_t|^2+s)/(sum+V*s)
 
 public:
 	SequenceCrossEntropy(Uid uid, InSize in_size, int vocab)
@@ -55,6 +56,7 @@ public:
 	virtual CFunc* clone(Uid uid) override {
 		auto* c = new SequenceCrossEntropy(uid, InSize(input().length_), vocab_);
 		c->eps_ = eps_;
+		c->smooth_ = smooth_;
 		return c;
 	}
 
@@ -67,6 +69,8 @@ public:
 	const int* targetsData() const { return targets_.data(); }   // for GPU upload
 	float eps() const { return eps_; }
 	void setEps(float e) { eps_ = e; }
+	float smooth() const { return smooth_; }
+	void setSmooth(float s) { smooth_ = s; }
 
 	// targets[p] is the token that position p must predict (the input shifted
 	// left by one). Size must equal n_pos_.
