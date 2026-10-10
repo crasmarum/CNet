@@ -177,13 +177,19 @@ to ~1e-3) and deterministic. It is intrinsic to the loss landscape. We tried, an
 | `dropout` 0.1 / 0.3 (complex multiplicative noise) | still stuck |
 
 Intuition: the escape needs a *consistent directional* nudge (which the
-element-wise summation order happens to provide); isotropic noise just jitters
-around the saddle and averages out. So **use `-tw_cublas false`** (the default);
-it is ~2–8× slower but the only path that learns.
+element-wise summation order happens to provide); **any stochastic perturbation
+disrupts it**. In fact `dropout` and `grad_noise` don't just fail on cuBLAS-on —
+a control showed `-dropout 0.1` **also suppresses escape on cuBLAS-off**
+(cuBLAS-off descends to ~5.4 by step 300 without dropout, but stalls at ~6.9 with
+it). So the stochastic knobs are *counterproductive* for the Born loss, not merely
+neutral.
 
-`-dropout` and `-grad_noise` remain available as regularization / experimental
-knobs (default off); they did not solve the saddle. A robust fix likely needs a
-loss reformulation that de-sensitizes the saddle rather than relying on rounding.
+**Recommendation: train with `-tw_cublas false` (the default) and no stochastic
+regularization (`-dropout 0`, `-grad_noise 0`).** cuBLAS-off is ~2–8× slower but
+is the only path that learns. `-dropout` and `-grad_noise` are kept as
+experimental knobs (both default off) and are documented here mainly as negative
+results; a robust fix for the saddle likely needs a loss reformulation that
+de-sensitizes it, not noise or an init/determinism tweak.
 
 ## 4. Generating games
 
@@ -244,11 +250,11 @@ Restores the model and reports the exact-Born validation loss (nats/move) over
 | `-tw_cublas` | false | **keep false** (see training notes) |
 | `-emb_gauss` | false | symmetry-breaking embedding init (recommended) |
 | `-ce_smooth` / `-ce_eps` | 0 / 0 | Born-loss smoothing / target-prob floor |
-| `-dropout` | 0 | complex dropout prob on each sub-layer output (regularization; see saddle note) |
+| `-dropout` | 0 | complex dropout on each sub-layer output (experimental; **suppresses Born saddle escape — leave off**, see saddle note) |
 | `-lr` / `-min_lr` / `-warmup` | 3e-4 / 3e-5 / 200 | peak / cosine-floor lr / warmup steps |
 | `-grad_clip` | 0 | clip-by-value per grad component (0 = off) |
 | `-grad_norm_clip` | 0 | global grad-norm clip on the all-reduced gradient (0 = off) |
-| `-grad_noise` | 0 | decaying Gaussian gradient noise σ=η/(1+t)^0.55 (experimental; see saddle note) |
+| `-grad_noise` | 0 | decaying Gaussian gradient noise σ=η/(1+t)^0.55 (experimental; doesn't help the saddle — leave off, see saddle note) |
 | `-steps` / `-val_every` | 5000 / 200 | optimizer steps / validation period |
 | `-save_path` | "" | best-val checkpoint path |
 | `-generate` / `-predict` / `-eval_loss` | false | run mode (give `true`) |
