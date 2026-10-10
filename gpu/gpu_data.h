@@ -73,6 +73,9 @@ public:
 		    case isPower:
 		    	add(new CPowerGpu(depth, ((CPower*)block[0])->power()), gpu_ptr, block);
 		        break;
+		    case isDropout:
+		    	add(new DropoutGpu(depth, ((ComplexDropout*)block[0])->dropP()), gpu_ptr, block);
+		        break;
 		    case isEmbedding:
 		    	add(new EmbeddingGpu(depth, ((CEmbedding*)block[0])->embedding_dim_,
 		    				((CEmbedding*)block[0])->no_embeddings_, ((CEmbedding*)block[0])->no_out_tokens_),

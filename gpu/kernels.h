@@ -313,6 +313,35 @@ public:
 	}
 };
 
+// GPU complex dropout (see ComplexDropout in impl/dropout.h). Inverted dropout
+// with a per-element mask = hash(seed, step, element); `step_` bumps each forward
+// for a fresh mask, and backward reuses the same step_ so the masks match. seed_
+// folds in the layer depth so different dropout layers get independent masks.
+class DropoutGpu : public GpuMapping {
+	float keep_;        // 1 - p
+	unsigned seed_;
+	int step_ = 0;
+
+public:
+	DropoutGpu(int depth, float p)
+		: GpuMapping(depth), keep_(1.0f - p), seed_(0x9E3779B9u ^ (unsigned) depth) {}
+
+	virtual ~DropoutGpu() {}
+
+	void gpu_dropout_forward();
+
+	virtual void forward() {
+		++step_;
+		gpu_dropout_forward();
+	}
+
+	void gpu_dropout_backward();
+
+	virtual void backward(int label) {
+		gpu_dropout_backward();
+	}
+};
+
 // GPU |z|^2 magnitude nonlinearity (see CModulus2 in impl/relu.h).
 class CModulus2Gpu : public GpuMapping {
 

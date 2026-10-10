@@ -31,6 +31,7 @@
 #include "tokenwise.h"
 #include "seqcrossent.h"
 #include "bornattn.h"
+#include "dropout.h"
 #include "tokennorm.h"
 #include "rotary.h"
 #include "l2out.h"
@@ -57,6 +58,7 @@ const int isSeqCrossEntropy = 19;
 const int isBornAttention = 20;
 const int isTokenNorm = 21;
 const int isRotary = 22;
+const int isDropout = 23;
 
 const int isUnknown = INT_MAX;
 
@@ -89,7 +91,8 @@ const int isUnknown = INT_MAX;
 	X(SequenceCrossEntropy, isSeqCrossEntropy, RestoreSequenceCrossEntropy) \
 	X(BornAttention,       isBornAttention,  RestoreBornAttention)       \
 	X(TokenNorm,           isTokenNorm,      RestoreTokenNorm)           \
-	X(RotaryEmbed,         isRotary,         RestoreRotary)
+	X(RotaryEmbed,         isRotary,         RestoreRotary)              \
+	X(ComplexDropout,      isDropout,        RestoreDropout)
 
 
 /*

@@ -83,6 +83,7 @@ FLAG_FLOAT(attn_eps, 0.0)   // Born-ATTENTION normalization floor A=s/(S+eps): b
                             // gradient blow-up when a query's scores collapse (0 = exact)
 FLAG_STRING(save_path, "")  // if set, rank 0 saves the trained model here after training
 FLAG_BOOL(generate, false)  // generation mode: restore -model and sample text (no training)
+FLAG_BOOL(eval_loss, false) // eval mode: restore -model, report exact-Born held-out loss
 FLAG_STRING(model, "")      // model file to restore in -generate mode
 FLAG_STRING(prompt, "ROMEO:")// seed text for generation
 FLAG_INT(gen_len, 600)      // number of characters to generate
@@ -233,8 +234,45 @@ static int runGenerate() {
 	return 0;
 }
 
+// Restore a trained model and report the EXACT Born-rule held-out loss (nats/token)
+// over eval_k random validation windows. CPU forward uses the exact Born probability
+// regardless of how the model was trained (smoothed or not), so this is the fair,
+// comparable number. -eval_loss -model <file> -data <dir/txt> [-token_lm ...].
+static int runEval() {
+	FILELog::ReportingLevel() = lWarning;
+	if (((std::string) model).empty()) { std::cerr << "-eval_loss requires -model <file>\n"; return 1; }
+	std::vector<int> ids; int ntrainTok;
+	if (token_lm) { TokenData d; d.load(data, vocab_size); ids = std::move(d.data); ntrainTok = d.ntrain; }
+	else          { CharData  d; d.load(data);             ids = std::move(d.data); ntrainTok = d.ntrain; }
+	CNet net;
+	if (!net.restore((std::string) model)) { std::cerr << "cannot restore model: " << (std::string) model << "\n"; return 1; }
+	auto *em  = (CEmbedding*) net.cpuNet().findFirstOfType(isEmbedding);
+	auto *seq = (SequenceCrossEntropy*) net.cpuNet().findFirstOfType(isSeqCrossEntropy);
+	if (!em || !seq) { std::cerr << "restored model missing embedding / sequence head\n"; return 1; }
+	seq->setEps(0); seq->setSmooth(0);                    // exact Born for evaluation
+	const int Nw = seq->nPos();
+	int lo = ntrainTok, hi = (int) ids.size() - Nw - 2;
+	if (hi <= lo) { std::cerr << "not enough validation tokens\n"; return 1; }
+	std::mt19937 rng(777);
+	std::uniform_int_distribution<int> U(lo, hi);
+	int K = gen_len > 0 ? gen_len : 500;                  // reuse -gen_len as eval window count
+	double tot = 0;
+	for (int k = 0; k < K; ++k) {
+		int p = U(rng);
+		std::vector<int> win(ids.begin() + p, ids.begin() + p + Nw), tgt(Nw);
+		for (int i = 0; i < Nw; ++i) tgt[i] = ids[p + 1 + i];
+		em->setInput(win); seq->setTargets(tgt);
+		net.cpuNet().forward();
+		tot += seq->loss(0);
+	}
+	std::cout << "EXACT-BORN val = " << (tot / K) << " nats/token  over " << K
+			  << " windows (model=" << (std::string) model << ")" << std::endl;
+	return 0;
+}
+
 int main(int argc, char **argv) {
 	FLAGS::Parse(argc, argv);
+	if (eval_loss) return runEval();              // restore a model, report exact-Born val
 	if (generate) return runGenerate();          // standalone sampling, no training / NCCL
 	if (print_net) {                              // dump the layer graph, no training / NCCL
 		int vcb;

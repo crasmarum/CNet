@@ -636,6 +636,13 @@ private:
 		return true;
 	}
 
+	bool Write(ComplexDropout *dp, BinaryWriter &writer) {
+		writer.write_int32(isDropout);
+		writeFuncInfo(writer, dp);
+		writer.write_float(dp->dropP());   // the drop probability defines the layer
+		return true;
+	}
+
 	bool RestoreRelu(ComplexNet &net, BinaryReader &reader) {
 		L_(lDebug) << "RestoreRelu";
 		std::vector<int> prev;
@@ -653,6 +660,15 @@ private:
 
 		net.add(new CGelu(Uid(uid), InSize(out_size)), prev);
 
+		return true;
+	}
+
+	bool RestoreDropout(ComplexNet &net, BinaryReader &reader) {
+		L_(lDebug) << "RestoreDropout";
+		std::vector<int> prev;
+		readFuncInfo(reader, prev);
+		float p = 0; assert(reader.read_float(&p));
+		net.add(new ComplexDropout(Uid(uid), InSize(in_size), p), prev);
 		return true;
 	}
 

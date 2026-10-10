@@ -89,7 +89,7 @@ FW_OBJS = $(addprefix $(OBJ_DIR)/, $(notdir $(FW_SRCS:.cpp=.o)))
 # --- Build Rules ---
 
 # Phony targets are not actual files. 'all' is the default goal.
-.PHONY: all clean run info dp_shakespeare generate
+.PHONY: all clean run info dp_shakespeare generate gollm
 .DEFAULT_GOAL := all
 
 # Standalone multi-GPU data-parallel tiny-shakespeare example (its own main).
@@ -97,6 +97,18 @@ dp_shakespeare: $(FW_OBJS) $(OBJ_DIR)/dp_shakespeare.o
 	@mkdir -p $(TARGET_DIR)
 	$(CXX) $^ $(LDFLAGS) -lnccl -o $(TARGET_DIR)/dp_shakespeare
 	@echo "==> Built $(TARGET_DIR)/dp_shakespeare"
+
+# Go move-prediction LM (examples/gollm.cpp). NCCL is optional: `make gollm`
+# builds the multi-GPU version (needs NCCL); `make gollm NCCL=0` builds a
+# single-GPU version with no NCCL (forces -world 1) for boxes without it.
+NCCL ?= 1
+GOLLM_DEF := $(if $(filter 0,$(NCCL)),,-DWITH_NCCL)
+GOLLM_LIB := $(if $(filter 0,$(NCCL)),,-lnccl)
+gollm: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) $(GOLLM_DEF) -c examples/gollm.cpp -o $(OBJ_DIR)/gollm.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/gollm.o $(LDFLAGS) -lcurand $(GOLLM_LIB) -o $(TARGET_DIR)/gollm
+	@echo "==> Built $(TARGET_DIR)/gollm (NCCL=$(if $(filter 0,$(NCCL)),off,on))"
 
 # Standalone CPU-only text generator (its own main; no CUDA/NCCL).
 generate: $(FW_OBJS) $(OBJ_DIR)/generate.o

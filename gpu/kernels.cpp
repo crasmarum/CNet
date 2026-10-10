@@ -429,6 +429,70 @@ void GeluGpu::gpu_gelu_backward() {
 	gpuErrchk(cudaDeviceSynchronize());
 }
 
+// ---- complex dropout (inverted; mask = hash(seed, step, element)) ----
+// Returns the kept/scaled factor c: 0 if dropped, else 1/keep. Deterministic in
+// (seed, step, idx) so forward and backward recompute the same mask.
+__device__ inline float gpu_drop_factor(unsigned seed, int step, int idx, float keep) {
+	unsigned h = seed ^ 0x9E3779B9u;
+	h ^= (unsigned) step * 0x85EBCA6Bu; h = (h ^ (h >> 15)) * 0x2545F491u;
+	h ^= (unsigned) idx  * 0xC2B2AE35u; h = (h ^ (h >> 13)) * 0x27D4EB2Fu;
+	h ^= h >> 16;
+	float u = (h & 0x00FFFFFFu) / 16777216.0f;     // uniform [0,1)
+	return (u < keep) ? (1.0f / keep) : 0.0f;
+}
+
+__global__ void gpu_dropout_forward__(GpuInVar *in, GpuOutVar *out, int no_func,
+		int length, int max_len, unsigned seed, int step, float keep) {
+	int thread_indx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (thread_indx >= max_len) return;
+	int func_indx = thread_indx / length;
+	int pos = thread_indx % length;
+	float c = gpu_drop_factor(seed, step, thread_indx, keep);
+
+	float *in_fc_start  = (in  + func_indx)->input_ptr_;
+	float *out_fc_start = (out + func_indx)->out_ptr_;
+	int out_len = (out + func_indx)->out_length_;
+	out_fc_start[pos]           = in_fc_start[pos]          * c;   // real
+	out_fc_start[out_len + pos] = in_fc_start[length + pos] * c;   // imag
+}
+
+void DropoutGpu::gpu_dropout_forward() {
+	int total_threads = in_.size() * length();
+	int no_blocks = (total_threads + maxNoThreads - 1) / maxNoThreads;
+	gpu_dropout_forward__ CUDA2(no_blocks, maxNoThreads)
+		(gpu_in_ptr_, gpu_out_ptr_, in_.size(), length(), total_threads, seed_, step_, keep_);
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+}
+
+__global__ void gpu_dropout_backward__(GpuInVar *in, GpuOutVar *out, int length,
+		int max_len, unsigned seed, int step, float keep) {
+	int thread_indx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (thread_indx >= max_len) return;
+	int map_indx = thread_indx / length;
+	int pos = thread_indx % length;
+	float c = gpu_drop_factor(seed, step, thread_indx, keep);   // same mask as forward
+
+	auto dLdz      = dZ_(out[map_indx], pos);
+	auto dLdz_star = dZ_star_(out[map_indx], pos);
+	auto dz      = dLdz      * c;    // out = c * in (c real scalar)
+	auto dz_star = dLdz_star * c;
+
+	atomicAdd(dZ_real_(in[map_indx], pos), dz.real);
+	atomicAdd(dZ_imag_(in[map_indx], pos), dz.imag);
+	atomicAdd(dZ_star_real_(in[map_indx], pos), dz_star.real);
+	atomicAdd(dZ_star_imag_(in[map_indx], pos), dz_star.imag);
+}
+
+void DropoutGpu::gpu_dropout_backward() {
+	int total_threads = in_.size() * length();
+	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
+	gpu_dropout_backward__ CUDA2(no_blocks, maxNoThreads)
+		(gpu_in_ptr_, gpu_out_ptr_, length(), total_threads, seed_, step_, keep_);
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+}
+
 // ---- |z|^2 magnitude nonlinearity ----
 __global__ void gpu_modulus2_forward__(GpuInVar *in, GpuOutVar *out, int length, int max_len) {
 	int thread_indx = blockIdx.x * blockDim.x + threadIdx.x;
