@@ -89,7 +89,7 @@ FW_OBJS = $(addprefix $(OBJ_DIR)/, $(notdir $(FW_SRCS:.cpp=.o)))
 # --- Build Rules ---
 
 # Phony targets are not actual files. 'all' is the default goal.
-.PHONY: all clean run info dp_shakespeare generate gollm
+.PHONY: all clean run info dp_shakespeare generate gollm test_conjlag_fd
 .DEFAULT_GOAL := all
 
 # Standalone multi-GPU data-parallel tiny-shakespeare example (its own main).
@@ -115,6 +115,14 @@ generate: $(FW_OBJS) $(OBJ_DIR)/generate.o
 	@mkdir -p $(TARGET_DIR)
 	$(CXX) $^ $(LDFLAGS) -o $(TARGET_DIR)/generate
 	@echo "==> Built $(TARGET_DIR)/generate"
+
+# Standalone CPU finite-difference gradient check for ConjLagProduct (no NCCL;
+# links the framework objects only). Run: ./test_conjlag_fd
+test_conjlag_fd: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/test_conjlag_fd.cpp -o $(OBJ_DIR)/test_conjlag_fd.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/test_conjlag_fd.o $(LDFLAGS) -o $(TARGET_DIR)/test_conjlag_fd
+	@echo "==> Built $(TARGET_DIR)/test_conjlag_fd"
 
 # Default target: build the final executable.
 all: $(TARGET)

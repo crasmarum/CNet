@@ -493,6 +493,67 @@ void DropoutGpu::gpu_dropout_backward() {
 	gpuErrchk(cudaDeviceSynchronize());
 }
 
+// ---- conjugate lag product y_t = x_t * conj(x_{t-tau}) ----
+__global__ void gpu_conjlag_forward__(GpuInVar *in, GpuOutVar *out, int length, int max_len, int tau) {
+	int thread_indx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (thread_indx >= max_len) return;
+	int map_indx = thread_indx / length;
+	int pos = thread_indx % length;
+	if (pos >= tau) {
+		cmplx_ a = cmplx(*Z_real_(in[map_indx], pos),       *Z_imag_(in[map_indx], pos));
+		cmplx_ b = cmplx(*Z_real_(in[map_indx], pos - tau), *Z_imag_(in[map_indx], pos - tau));
+		cmplx_ y = a * conj_(b);
+		*Z_real_(out[map_indx], pos) = y.real;
+		*Z_imag_(out[map_indx], pos) = y.imag;
+	} else {
+		*Z_real_(out[map_indx], pos) = 0.0f;
+		*Z_imag_(out[map_indx], pos) = 0.0f;
+	}
+}
+
+void ConjLagGpu::gpu_conjlag_forward() {
+	int total_threads = in_.size() * length();
+	int no_blocks = (total_threads + maxNoThreads - 1) / maxNoThreads;
+	gpu_conjlag_forward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, length(), total_threads, tau_);
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+}
+
+__global__ void gpu_conjlag_backward__(GpuInVar *in, GpuOutVar *out, int length, int max_len, int tau) {
+	int thread_indx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (thread_indx >= max_len) return;
+	int map_indx = thread_indx / length;
+	int pos = thread_indx % length;
+
+	cmplx_ dz_acc = cmplx(0.0f, 0.0f), dzs_acc = cmplx(0.0f, 0.0f);
+	if (pos >= tau) {                                     // role a: output t = pos
+		cmplx_ dy  = dZ_(out[map_indx], pos);
+		cmplx_ dys = dZ_star_(out[map_indx], pos);
+		cmplx_ xlag = cmplx(*Z_real_(in[map_indx], pos - tau), *Z_imag_(in[map_indx], pos - tau));
+		dz_acc  = dz_acc  + dy  * conj_(xlag);
+		dzs_acc = dzs_acc + dys * xlag;
+	}
+	if (pos + tau < length) {                             // role b: output t = pos + tau
+		cmplx_ dy  = dZ_(out[map_indx], pos + tau);
+		cmplx_ dys = dZ_star_(out[map_indx], pos + tau);
+		cmplx_ xfwd = cmplx(*Z_real_(in[map_indx], pos + tau), *Z_imag_(in[map_indx], pos + tau));
+		dz_acc  = dz_acc  + dys * conj_(xfwd);
+		dzs_acc = dzs_acc + dy  * xfwd;
+	}
+	atomicAdd(dZ_real_(in[map_indx], pos), dz_acc.real);
+	atomicAdd(dZ_imag_(in[map_indx], pos), dz_acc.imag);
+	atomicAdd(dZ_star_real_(in[map_indx], pos), dzs_acc.real);
+	atomicAdd(dZ_star_imag_(in[map_indx], pos), dzs_acc.imag);
+}
+
+void ConjLagGpu::gpu_conjlag_backward() {
+	int total_threads = in_.size() * length();
+	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
+	gpu_conjlag_backward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, length(), total_threads, tau_);
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+}
+
 // ---- |z|^2 magnitude nonlinearity ----
 __global__ void gpu_modulus2_forward__(GpuInVar *in, GpuOutVar *out, int length, int max_len) {
 	int thread_indx = blockIdx.x * blockDim.x + threadIdx.x;

@@ -342,6 +342,29 @@ public:
 	}
 };
 
+// GPU conjugate lag product y_t = x_t * conj(x_{t-tau}) (see ConjLagProduct in
+// impl/conjlag.h). The lag is within each clone's length-L vector.
+class ConjLagGpu : public GpuMapping {
+	int tau_;
+
+public:
+	ConjLagGpu(int depth, int tau) : GpuMapping(depth), tau_(tau) {}
+
+	virtual ~ConjLagGpu() {}
+
+	void gpu_conjlag_forward();
+
+	virtual void forward() {
+		gpu_conjlag_forward();
+	}
+
+	void gpu_conjlag_backward();
+
+	virtual void backward(int label) {
+		gpu_conjlag_backward();
+	}
+};
+
 // GPU |z|^2 magnitude nonlinearity (see CModulus2 in impl/relu.h).
 class CModulus2Gpu : public GpuMapping {
 

@@ -643,6 +643,13 @@ private:
 		return true;
 	}
 
+	bool Write(ConjLagProduct *cl, BinaryWriter &writer) {
+		writer.write_int32(isConjLag);
+		writeFuncInfo(writer, cl);
+		writer.write_int32(cl->tau());     // the lag defines the layer
+		return true;
+	}
+
 	bool RestoreRelu(ComplexNet &net, BinaryReader &reader) {
 		L_(lDebug) << "RestoreRelu";
 		std::vector<int> prev;
@@ -669,6 +676,15 @@ private:
 		readFuncInfo(reader, prev);
 		float p = 0; assert(reader.read_float(&p));
 		net.add(new ComplexDropout(Uid(uid), InSize(in_size), p), prev);
+		return true;
+	}
+
+	bool RestoreConjLag(ComplexNet &net, BinaryReader &reader) {
+		L_(lDebug) << "RestoreConjLag";
+		std::vector<int> prev;
+		readFuncInfo(reader, prev);
+		int tau = 0; assert(reader.read_int32(&tau));
+		net.add(new ConjLagProduct(Uid(uid), InSize(in_size), tau), prev);
 		return true;
 	}
 

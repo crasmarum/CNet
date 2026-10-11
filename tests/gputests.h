@@ -1175,6 +1175,101 @@ void testModulus2Gpu() {
 	std::cout << "Test passed: " << __func__ << "\n\n";
 }
 
+// Finite-difference check of the ConjLagProduct (y_t = x_t conj(x_{t-tau}))
+// Wirtinger backward, for several lags (tau=0 reduces to |z|^2). Same real-loss
+// convention as testModulus2Grad: dL/dx = 2 Re(dz~), dL/dy = 2 Im(dz~).
+void testConjLagGrad() {
+	std::cout << "\n" << __func__ << "\n\n";
+	for (int tau : {0, 1, 2}) {
+		CNet cnet;
+		int N = 6, label = 2;
+		int ii = cnet.cpuNet().add(new CInput(Uid(1), OutSize(N)));
+		int cl = cnet.cpuNet().add(new ConjLagProduct(Uid(2), InSize(N), tau), {ii});
+		cnet.cpuNet().add(new CrossEntropy(Uid(3), InSize(N)), {cl});
+		cnet.cpuNet().init_inputs(5);
+		cnet.cpuNet().init_exec_graph();
+
+		CInput *inp = (CInput*) cnet.cpuNet()[ii];
+		CrossEntropy *cen = (CrossEntropy*) cnet.cpuNet()[3];
+		SimpleRand r(11);
+		for (int k = 0; k < N; ++k) {
+			inp->mutable_input()->real_[k] = (float) r.randDouble() - 0.5f;
+			inp->mutable_input()->imag_[k] = (float) r.randDouble() - 0.5f;
+		}
+
+		inp->mutable_input()->zero_gradients();
+		cnet.cpuNet().forward();
+		cnet.cpuNet().backward(label);
+
+		std::vector<float> ax(N), ay(N);
+		for (int k = 0; k < N; ++k) {
+			ax[k] = 2.0f * inp->input().dz_star(k).real();   // dL/dx
+			ay[k] = 2.0f * inp->input().dz_star(k).imag();   // dL/dy
+		}
+
+		float eps = 1e-3f, max_err = 0;
+		for (int k = 0; k < N; ++k) {
+			float save = inp->mutable_input()->real_[k];
+			inp->mutable_input()->real_[k] = save + eps; cnet.cpuNet().forward();
+			float Lp = cen->loss(label);
+			inp->mutable_input()->real_[k] = save - eps; cnet.cpuNet().forward();
+			float Lm = cen->loss(label);
+			inp->mutable_input()->real_[k] = save;
+			float fx = (Lp - Lm) / (2 * eps);
+
+			save = inp->mutable_input()->imag_[k];
+			inp->mutable_input()->imag_[k] = save + eps; cnet.cpuNet().forward();
+			Lp = cen->loss(label);
+			inp->mutable_input()->imag_[k] = save - eps; cnet.cpuNet().forward();
+			Lm = cen->loss(label);
+			inp->mutable_input()->imag_[k] = save;
+			float fy = (Lp - Lm) / (2 * eps);
+
+			max_err = std::max(max_err, std::max(fabsf(fx - ax[k]), fabsf(fy - ay[k])));
+		}
+		std::cout << "ConjLagProduct tau=" << tau
+				  << " finite-diff vs analytic max error = " << max_err << "\n";
+		if (check_output) {
+			assert(max_err < 1e-2);
+		}
+	}
+	std::cout << "Test passed: " << __func__ << "\n\n";
+}
+
+// GPU vs CPU parity for ConjLagProduct (forward output + input gradients).
+void testConjLagGpu() {
+	std::cout << "\n" << __func__ << "\n\n";
+	CNet gpuLead;
+	int size = segment_len, tau = 2;
+
+	gpuLead.cpuNet().add(new CInput(Uid(1), OutSize(size)));
+	gpuLead.cpuNet().add(new ConjLagProduct(Uid(2), InSize(size), tau), {1});
+	gpuLead.cpuNet().add(new CrossEntropy(Uid(3), InSize(size)), {2});
+	gpuLead.cpuNet().add(new CInput(Uid(4), OutSize(size)));
+	gpuLead.cpuNet().add(new ConjLagProduct(Uid(5), InSize(size), tau), {4});
+	gpuLead.cpuNet().add(new CrossEntropy(Uid(6), InSize(size)), {5});
+
+	gpuLead.cpuNet().init_inputs();
+	gpuLead.cpuNet().init_exec_graph();
+	bool was_failure = false;
+	gpuLead.AllocateNet(1, was_failure);
+	assert(!was_failure);
+
+	gpuLead.cpuNet().forward();
+	gpuLead.GpuForward(was_failure);
+	auto mp = gpuLead.getMappingFor(gpuLead.cpuNet()[2]);
+	if (check_output) {
+		assert(gpuLead.testDataFromGpu(*mp, 0.01));          // forward parity
+	}
+
+	gpuLead.cpuNet().backward(1);
+	gpuLead.GpuBackward(1, was_failure);
+	if (check_output) {
+		assert(gpuLead.testGradientsFromGpu(*mp, 0.01));     // gradient parity
+	}
+	std::cout << "Test passed: " << __func__ << "\n\n";
+}
+
 // Finite-difference check of the MeanPool derivatives (linear map, but verifies
 // the 1/width scaling and the pool->input routing).
 void testMeanPoolGrad() {

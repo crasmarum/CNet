@@ -453,6 +453,24 @@ auto drop = cnet.add(new ComplexDropout(InSize(N * E), 0.1f), {sub});
 
 **Caveat for the Born-rule loss.** Dropout is a conventional regularizer, but the Born-rule `SequenceCrossEntropy` has a *unigram saddle* whose escape is numerically knife-edge (it is tipped by the summation order of the `TokenwiseLinear` GEMM — see the language-model example). Empirically, **any stochastic perturbation — dropout or gradient noise — suppresses that escape**: on tiny-shakespeare / sub-word data a model that learns fine with dropout off gets pinned at the unigram plateau with `-dropout 0.1`. So for Born-rule language-model training, leave dropout off; it is provided for conventional (real-logit `CrossEntropy`) networks and as a documented research knob.
 
+## Conjugate Lag Product (Cyclic-Correlation) Layer
+
+`ConjLagProduct` computes the instantaneous autocorrelation at a fixed lag `tau`:
+
+$$\mathrm{ConjLagProduct}_\tau(x)_t = x_t\,\overline{x_{t-\tau}} \quad (t \ge \tau;\ 0 \text{ otherwise}).$$
+
+It is the nonlinear, non-holomorphic primitive behind **cyclostationary** and higher-order modulation features: the time-mean of the output estimates the lag-`tau` autocorrelation `R(tau)` (bounded `|R| <= 1` for power-normalised input, so well-scaled), while an FFT of the output over time gives the **cyclic spectrum** (spectral lines at the symbol-rate / carrier cycle frequencies). It is the complex, two-input generalisation of `CModulus2` (`|z|^2 = x*conj(x)` is the `tau = 0` case). The Wirtinger backward (verified to ~1e-4 against central finite differences on CPU, and exactly against the CUDA kernel) differentiates `y = a*conj(b)` through both inputs `a = x_t`, `b = x_{t-tau}`. The constructor takes the input length and the lag:
+
+```c++
+#include "impl/conjlag.h"
+
+int N = 128, tau = 8;
+auto r   = cnet.add(new ConjLagProduct(InSize(N), tau), {x});     // x_t * conj(x_{t-tau})
+auto Rt  = cnet.add(new MeanPool(InSize(N), OutSize(4)), {r});    // pooled autocorrelation R(tau)
+```
+
+This is the a-priori signal structure the pooled-power features miss. On held-out RML2016.10a (11-way modulation), adding a small bank of `ConjLagProduct` lags (`R(tau)` and `|R(tau)|^2`) to the arch-11 spectral-conv classifier raised accuracy from **0.340 to 0.363** under an identical recipe — a modest but real gain in the predicted direction (separating the same-band QAM16/QAM64 and 8PSK/QPSK confusions that linear/power features cannot). A note on scaling: read out the time-mean `R(tau)` (O(1)), not the raw `|FFT(r_tau)|^2` (energy ~N), which otherwise saturates the Born-rule logits.
+
 ## L2Out Loss function
 
 This loss function is simply the square of the $L2$ norm:
