@@ -435,6 +435,24 @@ auto normed = cnet.add(new TokenNorm(N, E), {last});       // per-token RMS pre-
 auto Q      = cnet.add(new TokenwiseLinear(N, E, E / 2), {normed, wQ});
 ```
 
+## Complex Dropout Layer
+
+`ComplexDropout` is inverted dropout for complex activations: at **training** time each element is kept with probability $1-p$ and rescaled by $1/(1-p)$, so the expected activation is unchanged; at **inference** it is the identity.
+
+$$\mathrm{Dropout}(z)_k = \frac{m_k}{1-p}\, z_k, \quad m_k \sim \mathrm{Bernoulli}(1-p) \ \text{(train)}, \qquad \mathrm{Dropout}(z)_k = z_k \ \text{(inference)}.$$
+
+Since the map is multiplication by a real per-element constant $c_k = m_k/(1-p)$, the Wirtinger backward is trivial: $\partial L/\partial z_k = c_k\,\partial L/\partial y_k$ and $\partial L/\partial \bar z_k = c_k\,\partial L/\partial \bar y_k$. The mask is **not stored** — it is a deterministic hash of `(seed, step, element)` recomputed identically in the forward and backward kernels, and the GPU mapping bumps `step` each forward for a fresh mask (the `seed` folds in the layer depth so stacked dropout layers are independent). The CPU path is the identity, so generation/evaluation are unaffected. The constructor takes the input size and the drop probability:
+
+```c++
+#include "impl/dropout.h"
+
+int N = 64, E = 128;
+auto sub  = cnet.add(new TokenwiseLinear(N, E, E), {g, w});   // a sub-layer output
+auto drop = cnet.add(new ComplexDropout(InSize(N * E), 0.1f), {sub});
+```
+
+**Caveat for the Born-rule loss.** Dropout is a conventional regularizer, but the Born-rule `SequenceCrossEntropy` has a *unigram saddle* whose escape is numerically knife-edge (it is tipped by the summation order of the `TokenwiseLinear` GEMM — see the language-model example). Empirically, **any stochastic perturbation — dropout or gradient noise — suppresses that escape**: on tiny-shakespeare / sub-word data a model that learns fine with dropout off gets pinned at the unigram plateau with `-dropout 0.1`. So for Born-rule language-model training, leave dropout off; it is provided for conventional (real-logit `CrossEntropy`) networks and as a documented research knob.
+
 ## L2Out Loss function
 
 This loss function is simply the square of the $L2$ norm:
