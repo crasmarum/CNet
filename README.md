@@ -673,7 +673,7 @@ The trained model can be checkpointed (`-save_path model.mod`) and then sampled 
 ./dp_shakespeare -generate true -model model.mod -prompt "ROMEO:" -gen_len 600 -temp 0.8
 ```
 
-A pretrained fully-complex Born-rule model (Born attention + RoPE + TokenNorm, ~2.1M complex parameters, val 1.52 nats/char on tiny-shakespeare) is available as a [release asset](https://github.com/crasmarum/CNet/releases/download/v0.1/rope20k.mod) — download it and generate directly:
+A pretrained fully-complex Born-rule model (Born attention + RoPE + TokenNorm, ~2.1M complex parameters, val 1.52 nats/char on tiny-shakespeare) is available as a [GitHub release asset](https://github.com/crasmarum/CNet/releases/download/v0.1/rope20k.mod) and on the [Hugging Face Hub](https://huggingface.co/crasmarum/born-attention-lm) — download it and generate directly:
 
 ```bash
 curl -L -o rope20k.mod https://github.com/crasmarum/CNet/releases/download/v0.1/rope20k.mod
