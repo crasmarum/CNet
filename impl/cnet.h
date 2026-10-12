@@ -34,6 +34,7 @@
 #include "dropout.h"
 #include "conjlag.h"
 #include "segfourier.h"
+#include "hadamardconv.h"
 #include "tokennorm.h"
 #include "rotary.h"
 #include "l2out.h"
@@ -63,6 +64,7 @@ const int isRotary = 22;
 const int isDropout = 23;
 const int isConjLag = 24;
 const int isSegFourier = 25;
+const int isHadamardConv = 26;
 
 const int isUnknown = INT_MAX;
 
@@ -98,7 +100,8 @@ const int isUnknown = INT_MAX;
 	X(RotaryEmbed,         isRotary,         RestoreRotary)              \
 	X(ComplexDropout,      isDropout,        RestoreDropout)              \
 	X(ConjLagProduct,      isConjLag,        RestoreConjLag)              \
-	X(SegmentedFourier,    isSegFourier,     RestoreSegFourier)
+	X(SegmentedFourier,    isSegFourier,     RestoreSegFourier)          \
+	X(HadamardConv,        isHadamardConv,   RestoreHadamardConv)
 
 
 /*

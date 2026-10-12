@@ -570,7 +570,7 @@ __global__ void gpu_segfourier_forward__(GpuInVar *in, GpuOutVar *out, int lengt
 	cmplx_ acc = cmplx(0.0f, 0.0f);
 	for (int q = 0; q < w; ++q) {
 		cmplx_ x = cmplx(*Z_real_(in[map_indx], b * w + q), *Z_imag_(in[map_indx], b * w + q));
-		acc = acc + x * gpu_root(p * q, w);
+		acc = acc + x * conj_(gpu_root(p * q, w));   // CPU UnityRoots uses e^{-i...}
 	}
 	*Z_real_(out[map_indx], pos) = acc.real / scale;
 	*Z_imag_(out[map_indx], pos) = acc.imag / scale;
@@ -595,7 +595,7 @@ __global__ void gpu_segfourier_backward__(GpuInVar *in, GpuOutVar *out, int leng
 	for (int p = 0; p < w; ++p) {
 		cmplx_ dLdz      = dZ_(out[map_indx], b * w + p);
 		cmplx_ dLdz_star = dZ_star_(out[map_indx], b * w + p);
-		cmplx_ r = gpu_root(p * q, w);
+		cmplx_ r = conj_(gpu_root(p * q, w));   // CPU UnityRoots uses e^{-i...}
 		sum_dz      = sum_dz + dLdz * r;
 		sum_star_dz = sum_star_dz + dLdz_star * conj_(r);
 	}
@@ -609,6 +609,136 @@ void SegFourierGpu::gpu_segfourier_backward() {
 	int total_threads = in_.size() * length();
 	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
 	gpu_segfourier_backward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, length(), total_threads, window_);
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+}
+
+// ---- HadamardConv: multi-plane spectral conv (see impl/hadamardconv.h) ----
+// Input (per clone) is the concatenation [ X : C*D | taps : F*C*K | bias : F ];
+// output is F*D. root(m) = e^{i2pi m/D}. All maps are holomorphic so dOut/d(.)* = 0.
+__global__ void gpu_hadamardconv_forward__(GpuInVar *in, GpuOutVar *out, int *kidx,
+		int C, int D, int F, int K, size_t max_threads) {
+	size_t t = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+	if (t >= max_threads) return;
+	int outlen = F * D;
+	int m = t / outlen, o = t % outlen, f = o / D, k = o % D;
+	int tb = C * D, bb = C * D + F * C * K;
+	cmplx_ acc = cmplx(0.0f, 0.0f);
+	for (int p = 0; p < C; ++p) {
+		cmplx_ W = cmplx(0.0f, 0.0f);
+		for (int j = 0; j < K; ++j) {
+			int ti = tb + f * C * K + p * K + j;
+			cmplx_ tap = cmplx(*Z_real_(in[m], ti), *Z_imag_(in[m], ti));
+			W = W + tap * conj_(gpu_root((kidx[j] * k) % D, D));
+		}
+		cmplx_ x = cmplx(*Z_real_(in[m], p * D + k), *Z_imag_(in[m], p * D + k));
+		acc = acc + x * W;
+	}
+	if (k == 0) {
+		cmplx_ b = cmplx(*Z_real_(in[m], bb + f), *Z_imag_(in[m], bb + f));
+		acc = acc + cmplx((float) D, 0.0f) * b;
+	}
+	*Z_real_(out[m], o) = acc.real;
+	*Z_imag_(out[m], o) = acc.imag;
+}
+
+__global__ void gpu_hadamardconv_backward_x__(GpuInVar *in, GpuOutVar *out, int *kidx,
+		int C, int D, int F, int K, size_t max_threads) {
+	size_t t = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+	if (t >= max_threads) return;
+	int xlen = C * D;
+	int m = t / xlen, idx2 = t % xlen, p = idx2 / D, k = idx2 % D;
+	int tb = C * D;
+	cmplx_ sdz = cmplx(0.0f, 0.0f), sdzs = cmplx(0.0f, 0.0f);
+	for (int f = 0; f < F; ++f) {
+		cmplx_ W = cmplx(0.0f, 0.0f);
+		for (int j = 0; j < K; ++j) {
+			int ti = tb + f * C * K + p * K + j;
+			cmplx_ tap = cmplx(*Z_real_(in[m], ti), *Z_imag_(in[m], ti));
+			W = W + tap * conj_(gpu_root((kidx[j] * k) % D, D));
+		}
+		cmplx_ dz  = dZ_(out[m], f * D + k);
+		cmplx_ dzs = dZ_star_(out[m], f * D + k);
+		sdz  = sdz  + dz  * W;
+		sdzs = sdzs + dzs * conj_(W);
+	}
+	atomicAdd(dZ_real_(in[m], p * D + k), sdz.real);
+	atomicAdd(dZ_imag_(in[m], p * D + k), sdz.imag);
+	atomicAdd(dZ_star_real_(in[m], p * D + k), sdzs.real);
+	atomicAdd(dZ_star_imag_(in[m], p * D + k), sdzs.imag);
+}
+
+__global__ void gpu_hadamardconv_backward_taps__(GpuInVar *in, GpuOutVar *out, int *kidx,
+		int C, int D, int F, int K, size_t max_threads) {
+	size_t t = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+	if (t >= max_threads) return;
+	int plen = F * C * K;
+	int m = t / plen, idx2 = t % plen;
+	int f = idx2 / (C * K), r = idx2 % (C * K), p = r / K, j = r % K;
+	int tb = C * D;
+	cmplx_ sdz = cmplx(0.0f, 0.0f), sdzs = cmplx(0.0f, 0.0f);
+	for (int k = 0; k < D; ++k) {
+		cmplx_ x = cmplx(*Z_real_(in[m], p * D + k), *Z_imag_(in[m], p * D + k));
+		cmplx_ xr = x * conj_(gpu_root((kidx[j] * k) % D, D));
+		cmplx_ dz  = dZ_(out[m], f * D + k);
+		cmplx_ dzs = dZ_star_(out[m], f * D + k);
+		sdz  = sdz  + dz  * xr;
+		sdzs = sdzs + dzs * conj_(xr);
+	}
+	int ti = tb + f * C * K + p * K + j;
+	atomicAdd(dZ_real_(in[m], ti), sdz.real);
+	atomicAdd(dZ_imag_(in[m], ti), sdz.imag);
+	atomicAdd(dZ_star_real_(in[m], ti), sdzs.real);
+	atomicAdd(dZ_star_imag_(in[m], ti), sdzs.imag);
+}
+
+__global__ void gpu_hadamardconv_backward_bias__(GpuInVar *in, GpuOutVar *out,
+		int C, int D, int F, int K, size_t max_threads) {
+	size_t t = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+	if (t >= max_threads) return;
+	int m = t / F, f = t % F;
+	int bb = C * D + F * C * K;
+	cmplx_ dz  = dZ_(out[m], f * D + 0);
+	cmplx_ dzs = dZ_star_(out[m], f * D + 0);
+	atomicAdd(dZ_real_(in[m], bb + f), (float) D * dz.real);
+	atomicAdd(dZ_imag_(in[m], bb + f), (float) D * dz.imag);
+	atomicAdd(dZ_star_real_(in[m], bb + f), (float) D * dzs.real);
+	atomicAdd(dZ_star_imag_(in[m], bb + f), (float) D * dzs.imag);
+}
+
+void HadamardConvGpu::gpu_hadamardconv_forward() {
+	size_t nmap = in_.size();
+	size_t total = nmap * (size_t) F_ * D_;
+	unsigned no_blocks = (unsigned) ((total + maxNoThreads - 1) / maxNoThreads);
+	gpu_hadamardconv_forward__ CUDA2(no_blocks, maxNoThreads)
+		(gpu_in_ptr_, gpu_out_ptr_, gpu_kernel_index_, C_, D_, F_, K_, total);
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+}
+
+void HadamardConvGpu::gpu_hadamardconv_backward() {
+	size_t nmap = in_.size();
+	// dL/dX
+	{
+		size_t total = nmap * (size_t) C_ * D_;
+		unsigned nb = (unsigned) ((total + maxNoThreads - 1) / maxNoThreads);
+		gpu_hadamardconv_backward_x__ CUDA2(nb, maxNoThreads)
+			(gpu_in_ptr_, gpu_out_ptr_, gpu_kernel_index_, C_, D_, F_, K_, total);
+	}
+	// dL/dtaps
+	{
+		size_t total = nmap * (size_t) F_ * C_ * K_;
+		unsigned nb = (unsigned) ((total + maxNoThreads - 1) / maxNoThreads);
+		gpu_hadamardconv_backward_taps__ CUDA2(nb, maxNoThreads)
+			(gpu_in_ptr_, gpu_out_ptr_, gpu_kernel_index_, C_, D_, F_, K_, total);
+	}
+	// dL/dbias
+	{
+		size_t total = nmap * (size_t) F_;
+		unsigned nb = (unsigned) ((total + maxNoThreads - 1) / maxNoThreads);
+		gpu_hadamardconv_backward_bias__ CUDA2(nb, maxNoThreads)
+			(gpu_in_ptr_, gpu_out_ptr_, C_, D_, F_, K_, total);
+	}
 	gpuErrchk(cudaPeekAtLastError());
 	gpuErrchk(cudaDeviceSynchronize());
 }

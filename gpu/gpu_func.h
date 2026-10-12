@@ -379,6 +379,37 @@ class CNet {
 		return true;
 	}
 
+	// Mirror of allocatePadKernelIndex for HadamardConv: cache the conv dims
+	// (C,D,F,K) on each HadamardConvGpu and upload a device copy of its tap
+	// positions. One mapping groups filters + batch clones that share the same
+	// HadamardConv (hence the same dims and kernel_index).
+	bool allocateHadamardConvKernelIndex() {
+		long allocated = 0;
+		for (auto map : gpu_net_.gpu_maps_) {
+			if (auto hc = dynamic_cast<HadamardConvGpu*>(map)) {
+				HadamardConv *cpu = (HadamardConv*) hc->getCpuFun().front();
+				const std::vector<int> &kidx = cpu->kernelIndex();
+				for (auto f : hc->getCpuFun()) {
+					assert(((HadamardConv*) f)->kernelIndex() == kidx
+						   && "HadamardConvGpu mapping groups convs with differing kernel_index");
+				}
+				hc->setDims(cpu->inPlanes(), cpu->planeSize(), cpu->filters(), (int) kidx.size());
+				hc->gpu_kernel_index_ = helper_.int_allocate_on_gpu(kidx.size());
+				if (!hc->gpu_kernel_index_) {
+					return false;
+				}
+				if (!helper_.int_copy_to_gpu(kidx.size(), kidx.data(), hc->gpu_kernel_index_)) {
+					return false;
+				}
+				allocated += kidx.size() * sizeof(int);
+			}
+		}
+		if (allocated) {
+			std::cout << "Allocated: " << allocated << " bytes for hadamard-conv kernels." << std::endl;
+		}
+		return true;
+	}
+
 
 public:
 
@@ -795,6 +826,10 @@ public:
 
 		if (!allocatePadKernelIndex()) {
 			throw std::invalid_argument("AllocateNet error: allocatePadKernelIndex.");
+		}
+
+		if (!allocateHadamardConvKernelIndex()) {
+			throw std::invalid_argument("AllocateNet error: allocateHadamardConvKernelIndex.");
 		}
 
 		gpu_net_.addGpuOuts();

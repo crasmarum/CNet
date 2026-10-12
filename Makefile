@@ -89,7 +89,7 @@ FW_OBJS = $(addprefix $(OBJ_DIR)/, $(notdir $(FW_SRCS:.cpp=.o)))
 # --- Build Rules ---
 
 # Phony targets are not actual files. 'all' is the default goal.
-.PHONY: all clean run info dp_shakespeare generate gollm radioml test_conjlag_fd
+.PHONY: all clean run info dp_shakespeare generate gollm radioml test_conjlag_fd test_hadamardconv_fd test_hadamardconv_gpu
 .DEFAULT_GOAL := all
 
 # Standalone multi-GPU data-parallel tiny-shakespeare example (its own main).
@@ -131,6 +131,20 @@ test_conjlag_fd: $(FW_OBJS)
 	$(CXX) $(CXXFLAGS) -c examples/test_conjlag_fd.cpp -o $(OBJ_DIR)/test_conjlag_fd.o
 	$(CXX) $(FW_OBJS) $(OBJ_DIR)/test_conjlag_fd.o $(LDFLAGS) -o $(TARGET_DIR)/test_conjlag_fd
 	@echo "==> Built $(TARGET_DIR)/test_conjlag_fd"
+
+# Standalone CPU finite-difference gradient check for HadamardConv (no NCCL).
+test_hadamardconv_fd: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/test_hadamardconv_fd.cpp -o $(OBJ_DIR)/test_hadamardconv_fd.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/test_hadamardconv_fd.o $(LDFLAGS) -o $(TARGET_DIR)/test_hadamardconv_fd
+	@echo "==> Built $(TARGET_DIR)/test_hadamardconv_fd"
+
+# Standalone GPU-vs-CPU parity check for HadamardConv (needs a GPU; no NCCL).
+test_hadamardconv_gpu: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/test_hadamardconv_gpu.cpp -o $(OBJ_DIR)/test_hadamardconv_gpu.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/test_hadamardconv_gpu.o $(LDFLAGS) -o $(TARGET_DIR)/test_hadamardconv_gpu
+	@echo "==> Built $(TARGET_DIR)/test_hadamardconv_gpu"
 
 # Default target: build the final executable.
 all: $(TARGET)

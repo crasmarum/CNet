@@ -388,6 +388,36 @@ public:
 	}
 };
 
+// GPU multi-plane spectral conv (see HadamardConv in impl/hadamardconv.h):
+// out[f,k] = sum_{p,j} taps[f,p,j]*X[p,k]*root(index[j]*k) (+ D*bias[f] at k=0),
+// all operands read from the one concatenated input [X | taps | bias]. Dims
+// (C,D,F) and the tap positions are read from the CPU func; gpu_kernel_index_ is
+// a device copy of its kernel_index, uploaded once in
+// GpuFunc::allocateHadamardConvKernelIndex() (mirrors PadGpu).
+class HadamardConvGpu : public GpuMapping {
+public:
+	int *gpu_kernel_index_ = 0;   // device int array, length == K taps
+	int C_ = 0, D_ = 0, F_ = 0, K_ = 0;   // set in allocateHadamardConvKernelIndex()
+
+	HadamardConvGpu(int depth) : GpuMapping(depth) {}
+
+	void setDims(int C, int D, int F, int K) { C_ = C; D_ = D; F_ = F; K_ = K; }
+
+	virtual ~HadamardConvGpu() {}
+
+	void gpu_hadamardconv_forward();
+
+	virtual void forward() {
+		gpu_hadamardconv_forward();
+	}
+
+	void gpu_hadamardconv_backward();
+
+	virtual void backward(int label) {
+		gpu_hadamardconv_backward();
+	}
+};
+
 // GPU |z|^2 magnitude nonlinearity (see CModulus2 in impl/relu.h).
 class CModulus2Gpu : public GpuMapping {
 

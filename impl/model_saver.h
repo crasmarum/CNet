@@ -704,6 +704,37 @@ private:
 		return true;
 	}
 
+	bool Write(HadamardConv *hc, BinaryWriter &writer) {
+		writer.write_int32(isHadamardConv);
+		writeFuncInfo(writer, hc);
+		writer.write_int32(hc->inPlanes());    // C
+		writer.write_int32(hc->planeSize());   // D
+		writer.write_int32(hc->filters());     // F
+		const std::vector<int> &kidx = hc->kernelIndex();   // K structural tap positions
+		writer.write_int32((int) kidx.size());
+		for (int i = 0; i < (int) kidx.size(); ++i) {
+			writer.write_int32(kidx[i]);
+		}
+		return true;
+	}
+
+	bool RestoreHadamardConv(ComplexNet &net, BinaryReader &reader) {
+		L_(lDebug) << "RestoreHadamardConv";
+		std::vector<int> prev;
+		readFuncInfo(reader, prev);
+		int C = 0, D = 0, F = 0, k_len = 0;
+		assert(reader.read_int32(&C));
+		assert(reader.read_int32(&D));
+		assert(reader.read_int32(&F));
+		assert(reader.read_int32(&k_len));
+		std::vector<int> kidx(k_len);
+		for (int i = 0; i < k_len; ++i) {
+			int v = 0; assert(reader.read_int32(&v)); kidx[i] = v;
+		}
+		net.add(new HadamardConv(Uid(uid), C, D, F, kidx), prev);
+		return true;
+	}
+
 	bool Write(CModulus2 *mod, BinaryWriter &writer) {
 		writer.write_int32(isModulus2);
 		writeFuncInfo(writer, mod);
