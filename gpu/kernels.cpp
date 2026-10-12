@@ -1004,8 +1004,8 @@ void gpu_update_true_adam_input(CFunc *func, float l_rate, float beta1,
 }
 
 
-__global__ void gpu_copy_to_clones__(GpuCloneVar *in, int max_input_len, int total_threads) {
-	int thread_indx = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void gpu_copy_to_clones__(GpuCloneVar *in, int max_input_len, size_t total_threads) {
+	size_t thread_indx = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
 	if (thread_indx >= total_threads) {
 		return;
 	}
@@ -1036,8 +1036,8 @@ void gpu_copy_to_clones(GpuCloneVar *in, int no_ancestors, int max_input_len) {
 	int len = max_input_len
 		+ (MAX_BLOCK_SIZE - max_input_len % MAX_BLOCK_SIZE) % MAX_BLOCK_SIZE;
 
-	int total_threads = len * no_ancestors;
-	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
+	size_t total_threads = (size_t) len * no_ancestors;   // 64-bit: avoid int32 overflow at large channel counts
+	unsigned no_blocks = (unsigned) ((total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE);
 
 	gpu_copy_to_clones__ CUDA2(no_blocks, MAX_BLOCK_SIZE) (in, len, total_threads);
 
@@ -1045,8 +1045,8 @@ void gpu_copy_to_clones(GpuCloneVar *in, int no_ancestors, int max_input_len) {
 	gpuErrchk(cudaDeviceSynchronize());
 }
 
-__global__ void gpu_grad_from_clones__(GpuCloneVar *in, int max_input_len, int total_threads) {
-	int thread_indx = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void gpu_grad_from_clones__(GpuCloneVar *in, int max_input_len, size_t total_threads) {
+	size_t thread_indx = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
 	if (thread_indx >= total_threads) {
 		return;
 	}
@@ -1075,8 +1075,8 @@ void gpu_grad_from_clones(GpuCloneVar *in, int no_ancestors, int max_input_len) 
 	int len = max_input_len
 		+ (MAX_BLOCK_SIZE - max_input_len % MAX_BLOCK_SIZE) % MAX_BLOCK_SIZE;
 
-	int total_threads = len * no_ancestors;
-	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
+	size_t total_threads = (size_t) len * no_ancestors;   // 64-bit: avoid int32 overflow at large channel counts
+	unsigned no_blocks = (unsigned) ((total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE);
 
 	gpu_grad_from_clones__ CUDA2(no_blocks, MAX_BLOCK_SIZE) (in, len, total_threads);
 

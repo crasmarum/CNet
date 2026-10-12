@@ -180,8 +180,8 @@ void grad_reducing_kernel(int provider_id, GpuInVar *in, int input_length, GpuOu
 	int out_seg_len = out_length % block_size == 0 ? out_length
 			: (out_length + block_size - out_length % block_size);
 
-	size_t no_threads = out_seg_len * input_length * no_mappings;
-	unsigned grid = (no_threads + block_size - 1) / block_size;
+	size_t no_threads = (size_t) out_seg_len * input_length * no_mappings;   // 64-bit: avoid int32 overflow at large channel/mapping counts
+	unsigned grid = (unsigned) ((no_threads + block_size - 1) / block_size);
 
 	switch (block_size) {
 		case 1024:

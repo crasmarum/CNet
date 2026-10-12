@@ -289,8 +289,8 @@ void reducing_kernel(int provider_id, GpuInVar *in, cmplx_ *out,
 	seg_len = seg_len % block_size == 0 ? seg_len
 			: (seg_len + block_size - seg_len % block_size);
 
-	size_t no_threads = seg_len * no_segments * no_mappings;
-	unsigned grid = (no_threads + block_size - 1) / block_size;
+	size_t no_threads = (size_t) seg_len * no_segments * no_mappings;   // 64-bit: avoid int32 overflow at large channel/mapping counts
+	unsigned grid = (unsigned) ((no_threads + block_size - 1) / block_size);
 
 //	std::cout << "Launching reducing_kernel: "
 //			 << " Grid size: " << grid << " Block Size: " << block_size
