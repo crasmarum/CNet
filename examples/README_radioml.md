@@ -86,6 +86,7 @@ the **held-out** test split (never augmented) and prints `RadioML TEST accuracy`
 | `-grad_clip` | `1.0` | true-Adam clip-by-value per grad component (`0` = off) |
 | `-gauss_init` | `true` | scaled complex-Gaussian **per-input** init — essential (a shared init keeps all channels symmetric and the net never learns) |
 | `-init_scale` | `1.0` | init variance = `init_scale / length` |
+| `-seed` | `12345` | RNG seed for weight init (vary across runs for mean ± std) |
 | `-augment` | `false` | training-time random phase-rotation + time-reversal (the held-out test split is **never** augmented) |
 | `-radioml_train` / `-radioml_test` | — | train / test `.bin` paths |
 | `-model_path` | — | save (train) / restore (infer) path |

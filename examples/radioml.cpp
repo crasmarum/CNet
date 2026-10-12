@@ -76,6 +76,7 @@ FLAG_FLOAT(eps, 1e-8)       // true-Adam epsilon
 FLAG_FLOAT(grad_clip, 1.0)  // true-Adam clip-by-value per grad component (0 = off)
 FLAG_BOOL(gauss_init, true) // scaled complex-Gaussian init (per-input; essential for multi-channel nets)
 FLAG_FLOAT(init_scale, 1.0) // init variance = init_scale / length
+FLAG_INT(seed, 12345)       // RNG seed for weight init (vary across runs for mean +/- std)
 FLAG_BOOL(augment, false)   // training-time random phase-rotation + time-reversal (held-out eval is NEVER augmented)
 
 // ---- Mode / IO --------------------------------------------------------------
@@ -238,9 +239,9 @@ static void trainRadioML() {
 	CInput *inp = (CInput*) cnet[cinp];
 	CrossEntropy *cen = (CrossEntropy*) cnet[coutp];
 	if (gauss_init) {
-		cnet.cpuNet().gaussInit(init_scale, 12345);   // distinct per-input seeding
+		cnet.cpuNet().gaussInit(init_scale, seed);   // distinct per-input seeding
 	} else {
-		cnet.init_inputs(12345);
+		cnet.init_inputs(seed);
 	}
 	assert(cnet.allocateOnGpu(batch_size));
 
