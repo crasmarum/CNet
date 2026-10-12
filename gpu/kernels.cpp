@@ -554,6 +554,65 @@ void ConjLagGpu::gpu_conjlag_backward() {
 	gpuErrchk(cudaDeviceSynchronize());
 }
 
+// ---- segmented (windowed) Fourier / STFT: block-diagonal DFT, window w ----
+__device__ inline cmplx_ gpu_root(int k, int w) {   // e^{i 2pi k / w}
+	float a = 6.2831853071795864f * ((float) (k % w)) / ((float) w);
+	return cmplx(cosf(a), sinf(a));
+}
+
+__global__ void gpu_segfourier_forward__(GpuInVar *in, GpuOutVar *out, int length, int max_len, int w) {
+	int thread_indx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (thread_indx >= max_len) return;
+	int map_indx = thread_indx / length;
+	int pos = thread_indx % length;
+	int b = pos / w, p = pos % w;
+	float scale = sqrtf((float) w);
+	cmplx_ acc = cmplx(0.0f, 0.0f);
+	for (int q = 0; q < w; ++q) {
+		cmplx_ x = cmplx(*Z_real_(in[map_indx], b * w + q), *Z_imag_(in[map_indx], b * w + q));
+		acc = acc + x * gpu_root(p * q, w);
+	}
+	*Z_real_(out[map_indx], pos) = acc.real / scale;
+	*Z_imag_(out[map_indx], pos) = acc.imag / scale;
+}
+
+void SegFourierGpu::gpu_segfourier_forward() {
+	int total_threads = in_.size() * length();
+	int no_blocks = (total_threads + maxNoThreads - 1) / maxNoThreads;
+	gpu_segfourier_forward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, length(), total_threads, window_);
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+}
+
+__global__ void gpu_segfourier_backward__(GpuInVar *in, GpuOutVar *out, int length, int max_len, int w) {
+	int thread_indx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (thread_indx >= max_len) return;
+	int map_indx = thread_indx / length;
+	int pos = thread_indx % length;
+	int b = pos / w, q = pos % w;
+	float scale = sqrtf((float) w);
+	cmplx_ sum_dz = cmplx(0.0f, 0.0f), sum_star_dz = cmplx(0.0f, 0.0f);
+	for (int p = 0; p < w; ++p) {
+		cmplx_ dLdz      = dZ_(out[map_indx], b * w + p);
+		cmplx_ dLdz_star = dZ_star_(out[map_indx], b * w + p);
+		cmplx_ r = gpu_root(p * q, w);
+		sum_dz      = sum_dz + dLdz * r;
+		sum_star_dz = sum_star_dz + dLdz_star * conj_(r);
+	}
+	atomicAdd(dZ_real_(in[map_indx], pos), sum_dz.real / scale);
+	atomicAdd(dZ_imag_(in[map_indx], pos), sum_dz.imag / scale);
+	atomicAdd(dZ_star_real_(in[map_indx], pos), sum_star_dz.real / scale);
+	atomicAdd(dZ_star_imag_(in[map_indx], pos), sum_star_dz.imag / scale);
+}
+
+void SegFourierGpu::gpu_segfourier_backward() {
+	int total_threads = in_.size() * length();
+	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
+	gpu_segfourier_backward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, length(), total_threads, window_);
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+}
+
 // ---- |z|^2 magnitude nonlinearity ----
 __global__ void gpu_modulus2_forward__(GpuInVar *in, GpuOutVar *out, int length, int max_len) {
 	int thread_indx = blockIdx.x * blockDim.x + threadIdx.x;

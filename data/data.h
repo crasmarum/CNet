@@ -32,12 +32,33 @@ struct DataRecord {
 class BatchedDataReader {
 	int current_ = 0;
 	std::vector<DataRecord> samples_;
+	bool augment_ = false;
+	std::mt19937 aug_rng_{12345};
 
 protected:
 	int sample_dim_ = 0;
 
 public:
 	BatchedDataReader(int sample_dim) : sample_dim_(sample_dim) {
+	}
+
+	// Enable per-batch training augmentation (for complex IQ modulation data):
+	// random carrier-phase rotation s(t) -> s(t)e^{j theta} and random time
+	// reversal s[n] -> s[N-1-n]. Both preserve the modulation class. (RadioLLM,
+	// arXiv:2501.17888.) Off by default; enable only on the TRAINING reader.
+	void setAugment(bool a) { augment_ = a; }
+
+	std::vector<std::complex<float> > augment(const std::vector<std::complex<float> > &in) {
+		std::uniform_real_distribution<float> U(0.0f, 6.2831853f);
+		float th = U(aug_rng_);
+		std::complex<float> rot(cosf(th), sinf(th));
+		bool rev = (aug_rng_() & 1u);
+		int n = (int) in.size();
+		std::vector<std::complex<float> > out(n);
+		for (int k = 0; k < n; ++k) {
+			out[k] = in[rev ? (n - 1 - k) : k] * rot;
+		}
+		return out;
 	}
 
 	virtual ~BatchedDataReader() {
@@ -62,7 +83,11 @@ public:
 		InputBatch batch(batch_size, sample_dim_);
 
 		for (int i = 0; i < batch_size; ++i) {
-			batch.add(samples_[current_].data_, samples_[current_].label_);
+			if (augment_) {
+				batch.add(augment(samples_[current_].data_), samples_[current_].label_);
+			} else {
+				batch.add(samples_[current_].data_, samples_[current_].label_);
+			}
 			current_ = (current_ + 1) % samples_.size();
 		}
 		return batch;

@@ -365,6 +365,29 @@ public:
 	}
 };
 
+// GPU segmented (windowed) Fourier / STFT: block-diagonal DFT of each length-w
+// window (see SegmentedFourier in impl/segfourier.h). Roots computed on the fly.
+class SegFourierGpu : public GpuMapping {
+	int window_;
+
+public:
+	SegFourierGpu(int depth, int window) : GpuMapping(depth), window_(window) {}
+
+	virtual ~SegFourierGpu() {}
+
+	void gpu_segfourier_forward();
+
+	virtual void forward() {
+		gpu_segfourier_forward();
+	}
+
+	void gpu_segfourier_backward();
+
+	virtual void backward(int label) {
+		gpu_segfourier_backward();
+	}
+};
+
 // GPU |z|^2 magnitude nonlinearity (see CModulus2 in impl/relu.h).
 class CModulus2Gpu : public GpuMapping {
 

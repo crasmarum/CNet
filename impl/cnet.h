@@ -33,6 +33,7 @@
 #include "bornattn.h"
 #include "dropout.h"
 #include "conjlag.h"
+#include "segfourier.h"
 #include "tokennorm.h"
 #include "rotary.h"
 #include "l2out.h"
@@ -61,6 +62,7 @@ const int isTokenNorm = 21;
 const int isRotary = 22;
 const int isDropout = 23;
 const int isConjLag = 24;
+const int isSegFourier = 25;
 
 const int isUnknown = INT_MAX;
 
@@ -95,7 +97,8 @@ const int isUnknown = INT_MAX;
 	X(TokenNorm,           isTokenNorm,      RestoreTokenNorm)           \
 	X(RotaryEmbed,         isRotary,         RestoreRotary)              \
 	X(ComplexDropout,      isDropout,        RestoreDropout)              \
-	X(ConjLagProduct,      isConjLag,        RestoreConjLag)
+	X(ConjLagProduct,      isConjLag,        RestoreConjLag)              \
+	X(SegmentedFourier,    isSegFourier,     RestoreSegFourier)
 
 
 /*

@@ -471,6 +471,26 @@ auto Rt  = cnet.add(new MeanPool(InSize(N), OutSize(4)), {r});    // pooled auto
 
 This is the a-priori signal structure the pooled-power features miss. On held-out RML2016.10a (11-way modulation), adding a small bank of `ConjLagProduct` lags (`R(tau)` and `|R(tau)|^2`) to the arch-11 spectral-conv classifier raised accuracy from **0.340 to 0.363** under an identical recipe — a modest but real gain in the predicted direction (separating the same-band QAM16/QAM64 and 8PSK/QPSK confusions that linear/power features cannot). A note on scaling: read out the time-mean `R(tau)` (O(1)), not the raw `|FFT(r_tau)|^2` (energy ~N), which otherwise saturates the Born-rule logits.
 
+The full cyclostationary front end adds a **SoftMax-normalised cyclic spectrum** on top of this: `SoftMax(FFT(r_tau))`, an O(1) read-out of the spectral-line pattern that keeps the Born logits well-scaled. On the artifact-corrected **RML22** benchmark this cyclostationary classifier reaches **~0.50 overall — on par with the VT-CNN2 real-valued baseline** (held-out RML2016.10a ~0.49), closing most of the pooled-power gap.
+
+## Segmented (Windowed) Fourier / STFT Layer
+
+`SegmentedFourier` is a short-time Fourier transform expressed as a block-diagonal DFT: the length-`N` input is split into `N/window` contiguous windows of length `window`, and each window is DFT'd independently (unitary, `1/sqrt(window)` scaling). Output index `b*w+p` (window `b`, frequency bin `p`):
+
+$$\mathrm{SegmentedFourier}(x)_{b,p} = \frac{1}{\sqrt{w}} \sum_{q=0}^{w-1} x_{b,q}\, e^{\,i 2\pi p q / w}.$$
+
+With a following `CModulus2` and `MeanPool` it yields a spectrogram (`N/window` time steps × `window` frequency bins) — a time–frequency feature that keeps local temporal structure the global `FourierTrans` averages away. It is the exact (unitary) `FourierTrans` when `window = N`; its Wirtinger backward mirrors `FourierTrans` per window and is verified to ~2e-4 against central finite differences on CPU, and exactly against the CUDA kernel (roots are computed on the fly in the kernel). The constructor takes the input length and the window length (which must divide it):
+
+```c++
+#include "impl/segfourier.h"
+
+int N = 128, window = 32;
+auto stft = cnet.add(new SegmentedFourier(InSize(N), window), {x});   // 4 windows x 32 bins
+auto mag  = cnet.add(new CModulus2(InSize(N)), {stft});               // |.|^2 spectrogram
+```
+
+Empirically, on RML a segmented-Fourier branch (windows `{16, 32}`) gave **no gain over the cyclic spectrum** above — the two features are redundant — which we record as an honest negative. It is provided as a general-purpose spectral/time–frequency primitive.
+
 ## L2Out Loss function
 
 This loss function is simply the square of the $L2$ norm:
