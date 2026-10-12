@@ -89,7 +89,7 @@ FW_OBJS = $(addprefix $(OBJ_DIR)/, $(notdir $(FW_SRCS:.cpp=.o)))
 # --- Build Rules ---
 
 # Phony targets are not actual files. 'all' is the default goal.
-.PHONY: all clean run info dp_shakespeare generate gollm test_conjlag_fd
+.PHONY: all clean run info dp_shakespeare generate gollm radioml test_conjlag_fd
 .DEFAULT_GOAL := all
 
 # Standalone multi-GPU data-parallel tiny-shakespeare example (its own main).
@@ -109,6 +109,14 @@ gollm: $(FW_OBJS)
 	$(CXX) $(CXXFLAGS) $(GOLLM_DEF) -c examples/gollm.cpp -o $(OBJ_DIR)/gollm.o
 	$(CXX) $(FW_OBJS) $(OBJ_DIR)/gollm.o $(LDFLAGS) -lcurand $(GOLLM_LIB) -o $(TARGET_DIR)/gollm
 	@echo "==> Built $(TARGET_DIR)/gollm (NCCL=$(if $(filter 0,$(NCCL)),off,on))"
+
+# Radio modulation classifier (examples/radioml.cpp). Single-GPU, no NCCL;
+# links the framework objects + cuFFT/cuBLAS (via LDFLAGS). Run: ./radioml ...
+radioml: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/radioml.cpp -o $(OBJ_DIR)/radioml.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/radioml.o $(LDFLAGS) -o $(TARGET_DIR)/radioml
+	@echo "==> Built $(TARGET_DIR)/radioml"
 
 # Standalone CPU-only text generator (its own main; no CUDA/NCCL).
 generate: $(FW_OBJS) $(OBJ_DIR)/generate.o
