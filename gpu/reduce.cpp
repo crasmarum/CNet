@@ -260,9 +260,9 @@ __global__ void softmax_kernel_end__(int no_mappings, cmplx_ *tmp_in, GpuInVar *
 //				map_length, map_indx, pos, in_stride, no_mappings, thread_indx, out_len, sum.real, sum.imag, out[map_indx].out_ptr_);
 //	}
 
-	if (pos < in->input_length_) {
+	if (pos < in[map_indx].input_length_) {   // per-entry length (defensive: grouped mappings may differ)
 		out[map_indx].out_ptr_[pos] = in[map_indx].input_ptr_[pos] / sum.real;
-		out[map_indx].out_ptr_[out_len + pos] = in[map_indx].input_ptr_[in->input_length_ + pos] / sum.real;
+		out[map_indx].out_ptr_[out_len + pos] = in[map_indx].input_ptr_[in[map_indx].input_length_ + pos] / sum.real;
 	}
 }
 
@@ -1140,7 +1140,7 @@ __global__ void new_l_kernel_end__(int no_mappings, cmplx_ *tmp_in, GpuInVar *in
 
 	if (pos < out_len && map_indx < no_mappings) {
 		out[map_indx].out_ptr_[pos] = sum.real;
-		out[map_indx].out_ptr_[out->out_length_ + pos] = sum.imag;
+		out[map_indx].out_ptr_[out[map_indx].out_length_ + pos] = sum.imag;   // per-entry imag-plane offset (defensive)
 	}
 }
 
