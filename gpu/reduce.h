@@ -53,23 +53,26 @@ inline int getPaddedOutLength(int block_size, GpuMapping *mp) {
 
 // Shared batched-cuBLAS GEMM helpers for the complex "position-wise linear"
 // pattern Out[N,E_out] = Data[N,E_in] * W[E_out,E_in]^T. Used by TokenwiseLinear
-// and by the dense Linear (which is the same layout with N = 1). The caller owns
-// a pointer-array pool (16 slots); it is (re)allocated by tw_ensure_pool.
-void tw_ensure_pool(float **&pool, int &cap, int B);
+// and by the dense Linear (which is the same layout with N = 1). The caller owns a
+// batched-pointer pool that tw_gemm_{forward,backward} (re)allocate and populate ONCE
+// per batch size (pointers are static after allocateOnGpu), freed via tw_free_pool.
 void tw_free_pool(float **&pool, int &cap);
 void tw_gemm_forward(int N, int e_in, int e_out,
-		const std::vector<GpuInVar> &in_, const std::vector<GpuOutVar> &out_, float **pool);
+		const std::vector<GpuInVar> &in_, const std::vector<GpuOutVar> &out_, float **&pool, int &cap);
 void tw_gemm_backward(int N, int e_in, int e_out,
-		const std::vector<GpuInVar> &in_, const std::vector<GpuOutVar> &out_, float **pool);
+		const std::vector<GpuInVar> &in_, const std::vector<GpuOutVar> &out_, float **&pool, int &cap);
 
 class LinearGpu : public GpuMapping {
-	float **d_pool_ = 0;
+	float **d_pool_ = 0;             // forward GEMM pointer pool (built once; CUDA-graph-capturable)
 	int tw_cap_ = 0;
+	float **d_pool_bwd_ = 0;         // backward GEMM pointer pool (separate so fwd/bwd don't clobber)
+	int tw_cap_bwd_ = 0;
 public:
 	LinearGpu(int depth) : GpuMapping(depth) {
 	}
 	virtual ~LinearGpu() {
 		tw_free_pool(d_pool_, tw_cap_);
+		tw_free_pool(d_pool_bwd_, tw_cap_bwd_);
 	}
 
 	void gpu_linear_forward(int block_size);
@@ -89,13 +92,16 @@ public:
 // n_tokens contiguous e_in slices. Direct kernels (the contraction e_in and the
 // output width e_out are small); the weight gradient is accumulated over tokens.
 class TokenwiseLinearGpu : public GpuMapping {
-	float **d_pool_ = 0;             // 16 batched-pointer slots for the cuBLAS GEMMs
+	float **d_pool_ = 0;             // forward GEMM pointer pool (built once; CUDA-graph-capturable)
 	int tw_cap_ = 0;
+	float **d_pool_bwd_ = 0;         // backward GEMM pointer pool (separate so fwd/bwd don't clobber)
+	int tw_cap_bwd_ = 0;
 public:
 	TokenwiseLinearGpu(int depth) : GpuMapping(depth) {
 	}
 	virtual ~TokenwiseLinearGpu() {
 		tw_free_pool(d_pool_, tw_cap_);
+		tw_free_pool(d_pool_bwd_, tw_cap_bwd_);
 	}
 
 	void gpu_tokenwise_forward();

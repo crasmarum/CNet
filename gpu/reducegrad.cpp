@@ -487,8 +487,7 @@ void LinearGpu::gpu_linear_backward(int label, int block_size) {
 #ifdef __CUDACC__
 	// Dense Linear is the position-wise linear with a single token (N = 1).
 	if (tw_cublas && no_mappings > 0) {
-		tw_ensure_pool(d_pool_, tw_cap_, no_mappings);
-		tw_gemm_backward(1, N, M, in_, out_, d_pool_);
+		tw_gemm_backward(1, N, M, in_, out_, d_pool_bwd_, tw_cap_bwd_);
 		return;
 	}
 #endif
@@ -609,24 +608,30 @@ __global__ void gpu_tokenwise_vec_grad__(GpuInVar *in, GpuOutVar *out,
 //   weight grad: gW[E_in,E_out] += (conj)D[E_in,N]    * dOut[E_out,N]^T  (sum over tokens)
 // split into two real GEMMs per Wirtinger component (dz and dz*).
 void tw_gemm_backward(int N, int e_in, int e_out,
-		const std::vector<GpuInVar> &in_, const std::vector<GpuOutVar> &out_, float **pool) {
+		const std::vector<GpuInVar> &in_, const std::vector<GpuOutVar> &out_, float **&pool, int &cap) {
 	const int B = (int) in_.size();
-	const int wbase = N * e_in;
-	std::vector<float*> hp((size_t) 16 * B, nullptr);
-	for (int b = 0; b < B; ++b) {
-		const int L = in_[b].input_length_;         // per-entry (see tw_gemm_forward): out_length_ differs
-		const int outlen = out_[b].out_length_;     // across Q/K (N*d) vs V (3*N*d) grouped mapping under rope
-		float *base = in_[b].input_ptr_, *ob = out_[b].out_ptr_;
-		hp[0*B+b]=base;              hp[1*B+b]=base+L;                 // Dr, Di
-		hp[2*B+b]=base+wbase;        hp[3*B+b]=base+L+wbase;           // Wr, Wi
-		hp[4*B+b]=ob+2*outlen;       hp[5*B+b]=ob+3*outlen;            // dOut r/i  (dz)
-		hp[6*B+b]=ob+4*outlen;       hp[7*B+b]=ob+5*outlen;            // dOut r/i  (dz*)
-		hp[8*B+b]=base+2*L;          hp[9*B+b]=base+3*L;               // gData dz r/i
-		hp[10*B+b]=base+4*L;         hp[11*B+b]=base+5*L;              // gData dz* r/i
-		hp[12*B+b]=base+2*L+wbase;   hp[13*B+b]=base+3*L+wbase;        // gWeight dz r/i
-		hp[14*B+b]=base+4*L+wbase;   hp[15*B+b]=base+5*L+wbase;        // gWeight dz* r/i
+	// Static pointers after allocateOnGpu() -> build+upload the pool ONCE (graph-capturable).
+	if (cap != B) {
+		tw_free_pool(pool, cap);
+		cap = B;
+		gpuErrchk(cudaMalloc((void**) &pool, (size_t) 16 * B * sizeof(float*)));
+		const int wbase = N * e_in;
+		std::vector<float*> hp((size_t) 16 * B, nullptr);
+		for (int b = 0; b < B; ++b) {
+			const int L = in_[b].input_length_;         // per-entry (see tw_gemm_forward): out_length_ differs
+			const int outlen = out_[b].out_length_;     // across Q/K (N*d) vs V (3*N*d) grouped mapping under rope
+			float *base = in_[b].input_ptr_, *ob = out_[b].out_ptr_;
+			hp[0*B+b]=base;              hp[1*B+b]=base+L;                 // Dr, Di
+			hp[2*B+b]=base+wbase;        hp[3*B+b]=base+L+wbase;           // Wr, Wi
+			hp[4*B+b]=ob+2*outlen;       hp[5*B+b]=ob+3*outlen;            // dOut r/i  (dz)
+			hp[6*B+b]=ob+4*outlen;       hp[7*B+b]=ob+5*outlen;            // dOut r/i  (dz*)
+			hp[8*B+b]=base+2*L;          hp[9*B+b]=base+3*L;               // gData dz r/i
+			hp[10*B+b]=base+4*L;         hp[11*B+b]=base+5*L;              // gData dz* r/i
+			hp[12*B+b]=base+2*L+wbase;   hp[13*B+b]=base+3*L+wbase;        // gWeight dz r/i
+			hp[14*B+b]=base+4*L+wbase;   hp[15*B+b]=base+5*L+wbase;        // gWeight dz* r/i
+		}
+		gpuErrchk(cudaMemcpy(pool, hp.data(), (size_t) 16 * B * sizeof(float*), cudaMemcpyHostToDevice));
 	}
-	gpuErrchk(cudaMemcpy(pool, hp.data(), (size_t) 16 * B * sizeof(float*), cudaMemcpyHostToDevice));
 	#define P(i) (pool + (size_t)(i) * B)
 	float **Dr=P(0),**Di=P(1),**Wr=P(2),**Wi=P(3),**GOr=P(4),**GOi=P(5),**GSr=P(6),**GSi=P(7),
 		  **gDr=P(8),**gDi=P(9),**gSDr=P(10),**gSDi=P(11),**gWr=P(12),**gWi=P(13),**gWSr=P(14),**gWSi=P(15);
@@ -661,8 +666,7 @@ void TokenwiseLinearGpu::gpu_tokenwise_backward() {
 	int no_mappings = getNoMappings();
 #ifdef __CUDACC__
 	if (tw_cublas && no_mappings > 0) {
-		tw_ensure_pool(d_pool_, tw_cap_, no_mappings);
-		tw_gemm_backward(n_tokens, e_in, e_out, in_, out_, d_pool_);
+		tw_gemm_backward(n_tokens, e_in, e_out, in_, out_, d_pool_bwd_, tw_cap_bwd_);
 		return;
 	}
 #endif

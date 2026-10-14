@@ -1214,8 +1214,7 @@ void LinearGpu::gpu_linear_forward(int block_size) {
 #ifdef __CUDACC__
 	// Dense Linear is the position-wise linear with a single token (N = 1).
 	if (tw_cublas && getNoMappings() > 0) {
-		tw_ensure_pool(d_pool_, tw_cap_, getNoMappings());
-		tw_gemm_forward(1, seg_in_len, no_segments, in_, out_, d_pool_);
+		tw_gemm_forward(1, seg_in_len, no_segments, in_, out_, d_pool_, tw_cap_);
 		return;
 	}
 #endif
@@ -1312,15 +1311,6 @@ static cublasHandle_t tw_blas_handle() {
 }
 #endif
 
-#define TW_SLOTS 16
-void tw_ensure_pool(float **&pool, int &cap, int B) {
-#ifdef __CUDACC__
-	if (cap == B) return;                 // B (clone count) is constant per instance
-	tw_free_pool(pool, cap);
-	cap = B;
-	gpuErrchk(cudaMalloc((void**) &pool, (size_t) TW_SLOTS * B * sizeof(float*)));
-#endif
-}
 void tw_free_pool(float **&pool, int &cap) {
 #ifdef __CUDACC__
 	if (pool) cudaFree(pool);
@@ -1334,19 +1324,27 @@ void tw_free_pool(float **&pool, int &cap) {
 // matrices cuBLAS expects): Out_cm[E_out,N] = W_cm[E_in,E_out]^T * D_cm[E_in,N].
 // slots: 0 Dr, 1 Di, 2 Wr, 3 Wi, 4 Or, 5 Oi. Linear calls this with N = 1.
 void tw_gemm_forward(int N, int e_in, int e_out,
-		const std::vector<GpuInVar> &in_, const std::vector<GpuOutVar> &out_, float **pool) {
+		const std::vector<GpuInVar> &in_, const std::vector<GpuOutVar> &out_, float **&pool, int &cap) {
 	const int B = (int) in_.size();
-	const int wbase = N * e_in;
-	std::vector<float*> hp((size_t) 6 * B, nullptr);
-	for (int b = 0; b < B; ++b) {
-		const int L = in_[b].input_length_;         // per-entry: Q/K/V share input len,
-		const int outlen = out_[b].out_length_;     // but out_length_ differs (V -> 3*N*d concat vs Q/K -> N*d under rope)
-		float *base = in_[b].input_ptr_, *ob = out_[b].out_ptr_;
-		hp[0*B+b]=base;         hp[1*B+b]=base+L;
-		hp[2*B+b]=base+wbase;   hp[3*B+b]=base+L+wbase;
-		hp[4*B+b]=ob;           hp[5*B+b]=ob+outlen;
+	// Clone pointers/lengths are static after allocateOnGpu(), so build+upload the
+	// batched-pointer pool ONCE (on first call / batch change). Steady-state issues no
+	// host->device copy, so the GEMMs are CUDA-graph-capturable.
+	if (cap != B) {
+		tw_free_pool(pool, cap);
+		cap = B;
+		gpuErrchk(cudaMalloc((void**) &pool, (size_t) 6 * B * sizeof(float*)));
+		const int wbase = N * e_in;
+		std::vector<float*> hp((size_t) 6 * B, nullptr);
+		for (int b = 0; b < B; ++b) {
+			const int L = in_[b].input_length_;         // per-entry: Q/K/V share input len,
+			const int outlen = out_[b].out_length_;     // but out_length_ differs (V -> 3*N*d concat vs Q/K -> N*d under rope)
+			float *base = in_[b].input_ptr_, *ob = out_[b].out_ptr_;
+			hp[0*B+b]=base;         hp[1*B+b]=base+L;
+			hp[2*B+b]=base+wbase;   hp[3*B+b]=base+L+wbase;
+			hp[4*B+b]=ob;           hp[5*B+b]=ob+outlen;
+		}
+		gpuErrchk(cudaMemcpy(pool, hp.data(), (size_t) 6 * B * sizeof(float*), cudaMemcpyHostToDevice));
 	}
-	gpuErrchk(cudaMemcpy(pool, hp.data(), (size_t) 6 * B * sizeof(float*), cudaMemcpyHostToDevice));
 	float **Dr=pool,**Di=pool+B,**Wr=pool+2*B,**Wi=pool+3*B,**Or=pool+4*B,**Oi=pool+5*B;
 	cublasHandle_t h = tw_blas_handle();
 	const float one=1.f, neg=-1.f, zero=0.f;
@@ -1364,8 +1362,7 @@ void TokenwiseLinearGpu::gpu_tokenwise_forward() {
 	int B = getNoMappings();
 #ifdef __CUDACC__
 	if (tw_cublas && B > 0) {
-		tw_ensure_pool(d_pool_, tw_cap_, B);
-		tw_gemm_forward(n_tokens, e_in, e_out, in_, out_, d_pool_);
+		tw_gemm_forward(n_tokens, e_in, e_out, in_, out_, d_pool_, tw_cap_);
 		return;
 	}
 #endif
