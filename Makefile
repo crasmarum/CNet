@@ -89,7 +89,7 @@ FW_OBJS = $(addprefix $(OBJ_DIR)/, $(notdir $(FW_SRCS:.cpp=.o)))
 # --- Build Rules ---
 
 # Phony targets are not actual files. 'all' is the default goal.
-.PHONY: all clean run info dp_shakespeare generate gollm radioml test_conjlag_fd test_hadamardconv_fd test_hadamardconv_gpu
+.PHONY: all clean run info dp_shakespeare generate gollm radioml mnist_hadamard bench_mixer bench_clone test_conjlag_fd test_hadamardconv_fd test_hadamardconv_gpu
 .DEFAULT_GOAL := all
 
 # Standalone multi-GPU data-parallel tiny-shakespeare example (its own main).
@@ -117,6 +117,27 @@ radioml: $(FW_OBJS)
 	$(CXX) $(CXXFLAGS) -c examples/radioml.cpp -o $(OBJ_DIR)/radioml.o
 	$(CXX) $(FW_OBJS) $(OBJ_DIR)/radioml.o $(LDFLAGS) -o $(TARGET_DIR)/radioml
 	@echo "==> Built $(TARGET_DIR)/radioml"
+
+# Graph-cloning systems benchmark (examples/bench_clone.cpp). Single-GPU, no NCCL.
+bench_clone: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/bench_clone.cpp -o $(OBJ_DIR)/bench_clone.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/bench_clone.o $(LDFLAGS) -o $(TARGET_DIR)/bench_clone
+	@echo "==> Built $(TARGET_DIR)/bench_clone"
+
+# Causal-mixer latency benchmark (examples/bench_mixer.cpp). Single-GPU, no NCCL.
+bench_mixer: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/bench_mixer.cpp -o $(OBJ_DIR)/bench_mixer.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/bench_mixer.o $(LDFLAGS) -o $(TARGET_DIR)/bench_mixer
+	@echo "==> Built $(TARGET_DIR)/bench_mixer"
+
+# Shallow Hadamard-conv MNIST trainer (examples/mnist_hadamard.cpp). Single-GPU, no NCCL.
+mnist_hadamard: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/mnist_hadamard.cpp -o $(OBJ_DIR)/mnist_hadamard.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/mnist_hadamard.o $(LDFLAGS) -o $(TARGET_DIR)/mnist_hadamard
+	@echo "==> Built $(TARGET_DIR)/mnist_hadamard"
 
 # Standalone CPU-only text generator (its own main; no CUDA/NCCL).
 generate: $(FW_OBJS) $(OBJ_DIR)/generate.o

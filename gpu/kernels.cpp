@@ -456,11 +456,17 @@ __global__ void gpu_dropout_forward__(GpuInVar *in, GpuOutVar *out, int no_func,
 	out_fc_start[out_len + pos] = in_fc_start[length + pos] * c;   // imag
 }
 
+// When true, DropoutGpu is the identity (keep=1): set around held-out eval /
+// inference so dropout is a no-op there, matching the CPU (eval) path. The GPU
+// forward otherwise always applies the training mask.
+bool g_dropout_infer = false;
+
 void DropoutGpu::gpu_dropout_forward() {
 	int total_threads = in_.size() * length();
 	int no_blocks = (total_threads + maxNoThreads - 1) / maxNoThreads;
+	float eff_keep = g_dropout_infer ? 1.0f : keep_;    // keep=1 -> factor 1 -> identity
 	gpu_dropout_forward__ CUDA2(no_blocks, maxNoThreads)
-		(gpu_in_ptr_, gpu_out_ptr_, in_.size(), length(), total_threads, seed_, step_, keep_);
+		(gpu_in_ptr_, gpu_out_ptr_, in_.size(), length(), total_threads, seed_, step_, eff_keep);
 	gpuErrchk(cudaPeekAtLastError());
 	gpuErrchk(cudaDeviceSynchronize());
 }

@@ -90,6 +90,26 @@ FLAG_INT(infer_dims, 4)     // Vars::dims_ for inference (4 is safe for every ne
 // Ports the arch 11 / 15 / 16 lineage (pooled-power -> + cyclic-correlation ->
 // + normalized cyclic spectrum). arch 16 is the default and the one documented
 // in the paper / README_radioml.md.
+FLAG_STRING(conv_act, "u")   // arch 20 conv activation: u (per-plane TokenNorm, amplitude-removing)
+                             // | crelu | cgelu (amplitude-preserving, like VT-CNN2's ReLU)
+FLAG_FLOAT(dropout, 0.0)     // arch 20: ComplexDropout prob after conv activations + dense (VT-CNN2 uses 0.5)
+
+extern bool g_dropout_infer;   // (kernels.cpp) set true around eval so dropout is identity
+
+// arch 20 helper: the post-conv activation. `u` is the Hadamard-net L2 norm
+// (TokenNorm, per-plane); crelu/cgelu are pointwise and keep amplitude.
+static int addConvAct(CNet& cnet, int node, int planes, int D) {
+	if (conv_act == "crelu") return cnet.add(new CRelu(InSize(planes * D)), {node});
+	if (conv_act == "cgelu") return cnet.add(new CGelu(InSize(planes * D)), {node});
+	return cnet.add(new TokenNorm(planes, D), {node});
+}
+
+// optional ComplexDropout after a node (identity when -dropout 0; off at eval via g_dropout_infer)
+static int maybeDrop(CNet& cnet, int node, int len) {
+	if (dropout > 0.0f) return cnet.add(new ComplexDropout(InSize(len), dropout), {node});
+	return node;
+}
+
 static void buildRadioMLNet(CNet& cnet, int *inp, int *outp) {
 	const int L = seq_len;
 
@@ -209,8 +229,46 @@ static void buildRadioMLNet(CNet& cnet, int *inp, int *outp) {
 		return;
 	}
 
+	if (arch == 20) {
+		// VT-CNN2 (radioML notebook) translated to the complex Hadamard-conv
+		// framework. Input is the 2xW IQ image flattened row-major into D=2W reals
+		// ([I_0..I_{W-1}, Q_0..Q_{W-1}], imag 0; see data/rml22_to_2dbin.py), so a
+		// 2D (h,w) kernel is realized by kernel_index positions spanning the layout
+		// (row stride W): (1,3) -> {0,1,2}; (2,3) -> {0,1,2, W,W+1,W+2} (the 2nd row
+		// mixes Q into the conv, exactly VT-CNN2's height-2 I/Q-mixing kernel).
+		//   FFT -> HConv(1->256, (1,3)) -> U -> HConv(256->80, (2,3)) -> U
+		//        -> Linear(80*D -> 256) -> CGelu -> Linear(256 -> classes) -> Born
+		const int W = L / 2;                       // image width (128); L = seq_len = 256
+		std::vector<int> k1 = {0, 1, 2};           // (1,3)
+		std::vector<int> k2 = {0, 1, 2, W, W + 1, W + 2};   // (2,3): spans both IQ rows
+		const int F1 = 256, F2 = 80, H = 256;
+
+		*inp = cnet.add(new CInput(OutSize(L)));
+		int fft = cnet.add(new FourierTrans(InSize(L)), {*inp});
+
+		int w1 = cnet.add(new CInput(OutSize(F1 * 1 * (int) k1.size() + F1)));   // conv1 taps + bias
+		int c1 = cnet.add(new HadamardConv(1, L, F1, k1), {fft, w1});
+		int n1 = addConvAct(cnet, c1, F1, L);                                    // activation (u/crelu/cgelu)
+		n1 = maybeDrop(cnet, n1, F1 * L);
+
+		int w2 = cnet.add(new CInput(OutSize(F2 * F1 * (int) k2.size() + F2)));  // conv2 taps + bias (C=F1)
+		int c2 = cnet.add(new HadamardConv(F1, L, F2, k2), {n1, w2});            // multi-plane 256 -> 80
+		int n2 = addConvAct(cnet, c2, F2, L);
+		n2 = maybeDrop(cnet, n2, F2 * L);
+
+		const int feat = F2 * L;                   // 80 * 256 = 20480
+		int d1 = cnet.add(new CInput(OutSize(feat * H)));
+		int h1 = cnet.cpuNet().add(new Linear(InSize(feat), InSize(feat * H)), {n2, d1});
+		int g1 = cnet.add(new CGelu(InSize(H)), {h1});
+		g1 = maybeDrop(cnet, g1, H);
+		int d2 = cnet.add(new CInput(OutSize(H * n_classes)));
+		int lin = cnet.add(new Linear(InSize(H), InSize(H * n_classes)), {g1, d2});
+		*outp = cnet.add(new CrossEntropy(InSize(n_classes)), {lin});
+		return;
+	}
+
 	std::cerr << "radioml: unsupported -arch " << arch
-			  << " (use 11, 15, or 16)." << std::endl;
+			  << " (use 11, 15, 16, or 20)." << std::endl;
 	exit(1);
 }
 
@@ -277,7 +335,8 @@ static void trainRadioML() {
 		std::cout << "Final model saved at: " << model_path << std::endl;
 	}
 
-	// Held-out evaluation (never augmented).
+	// Held-out evaluation (never augmented; dropout off via inference mode).
+	g_dropout_infer = true;
 	RadioMLDataReader test_reader;
 	if (test_reader.Open(radioml_test) && test_reader.readData()) {
 		int tcorrect = 0, tseen = 0;
@@ -299,6 +358,7 @@ static void trainRadioML() {
 // C x C confusion matrix with per-class recall.
 static void inferRadioML() {
 	Vars::dims_ = infer_dims;          // set before the net is restored/built
+	g_dropout_infer = true;            // dropout is identity at inference
 
 	RadioMLDataReader reader;
 	if (!reader.Open(radioml_test) || !reader.readData()) {

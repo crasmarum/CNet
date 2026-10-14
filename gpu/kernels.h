@@ -317,6 +317,8 @@ public:
 // with a per-element mask = hash(seed, step, element); `step_` bumps each forward
 // for a fresh mask, and backward reuses the same step_ so the masks match. seed_
 // folds in the layer depth so different dropout layers get independent masks.
+extern bool g_dropout_infer;   // set true around eval/inference -> DropoutGpu is identity
+
 class DropoutGpu : public GpuMapping {
 	float keep_;        // 1 - p
 	unsigned seed_;
