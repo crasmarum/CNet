@@ -342,8 +342,7 @@ void reducing_kernel(int provider_id, GpuInVar *in, cmplx_ *out,
 
 
 #ifdef __CUDACC__
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 #else
 #endif
 
@@ -363,8 +362,7 @@ void fft_kernel_end(int provider_id, cmplx_ *temp_in, GpuInVar *in, GpuOutVar *o
 			(provider_id, no_mappings, temp_in, in, out, in_stride, no_threads);
 
 #ifdef __CUDACC__
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 #else
 #endif
 
@@ -384,8 +382,7 @@ void norm_kernel_end(int provider_id, cmplx_ *temp_in, GpuInVar *in, GpuOutVar *
 			(provider_id, no_mappings, temp_in, in, out, in_stride, no_threads);
 
 #ifdef __CUDACC__
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 #else
 #endif
 
@@ -405,8 +402,7 @@ void softmax_kernel_end(cmplx_ *temp_in, GpuInVar *in, GpuOutVar *out, int seg_l
 			(no_mappings, temp_in, in, out, in_stride, no_threads);
 
 #ifdef __CUDACC__
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 #else
 #endif
 
@@ -486,12 +482,12 @@ void FourierGpu::gpu_fft_forward(int block_size) {
 		float scale = 1.0f / sqrtf((float) N);
 
 		gpu_fft_gather__ CUDA2(grid, tb) (gpu_in_ptr_, fft_buf_, N, M);
+		cufftSetStream((cufftHandle) fft_plan_, g_cnet_stream);
 		cufftExecC2C((cufftHandle) fft_plan_, (cufftComplex*) fft_buf_,
 				(cufftComplex*) fft_buf_, CUFFT_FORWARD);
 		gpu_fft_scatter_out__ CUDA2(grid, tb) (fft_buf_, gpu_out_ptr_, N, M, scale);
 
-		gpuErrchk(cudaPeekAtLastError());
-		gpuErrchk(cudaDeviceSynchronize());
+		CNET_KSYNC();
 		return;
 #endif
 	}
@@ -628,8 +624,7 @@ void BornAttentionGpu::gpu_born_forward() {
 	int total = B * N, tb = 128;
 	unsigned grid = (total + tb - 1) / tb;
 	gpu_born_forward__ CUDA2(grid, tb) (gpu_in_ptr_, gpu_out_ptr_, ba_c_, ba_A_, ba_S_, N, d, B, f->causal() ? 1 : 0, f->eps());
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 #endif
 }
 
@@ -640,8 +635,7 @@ void BornAttentionGpu::gpu_born_backward() {
 	int total = B * N, tb = 128;
 	unsigned grid = (total + tb - 1) / tb;
 	gpu_born_backward__ CUDA2(grid, tb) (gpu_in_ptr_, gpu_out_ptr_, ba_c_, ba_A_, ba_S_, N, d, B, f->causal() ? 1 : 0, f->eps());
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 #endif
 }
 
@@ -733,8 +727,7 @@ void TokenNormGpu::gpu_tn_forward() {
 	int total = B * N, tb = 128;
 	unsigned grid = (total + tb - 1) / tb;
 	gpu_tn_forward__ CUDA2(grid, tb) (gpu_in_ptr_, gpu_out_ptr_, tn_r_, N, d, f->eps(), B);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 #endif
 }
 
@@ -745,8 +738,7 @@ void TokenNormGpu::gpu_tn_backward() {
 	int total = B * N, tb = 128;
 	unsigned grid = (total + tb - 1) / tb;
 	gpu_tn_backward__ CUDA2(grid, tb) (gpu_in_ptr_, gpu_out_ptr_, tn_r_, N, d, B);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 #endif
 }
 
@@ -799,8 +791,7 @@ void RotaryEmbedGpu::gpu_rope_forward() {
 	int total = B * N * d, tb = 128;
 	unsigned grid = (total + tb - 1) / tb;
 	gpu_rope_forward__ CUDA2(grid, tb) (gpu_in_ptr_, gpu_out_ptr_, N, d, (float) f->base(), B);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 #endif
 }
 
@@ -811,8 +802,7 @@ void RotaryEmbedGpu::gpu_rope_backward() {
 	int total = B * N * d, tb = 128;
 	unsigned grid = (total + tb - 1) / tb;
 	gpu_rope_backward__ CUDA2(grid, tb) (gpu_in_ptr_, gpu_out_ptr_, N, d, (float) f->base(), B);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 #endif
 }
 
@@ -832,12 +822,12 @@ void InverseFourierGpu::gpu_ifft_forward(int block_size) {
 		float scale = 1.0f / sqrtf((float) N);
 
 		gpu_fft_gather__ CUDA2(grid, tb) (gpu_in_ptr_, fft_buf_, N, M);
+		cufftSetStream((cufftHandle) fft_plan_, g_cnet_stream);
 		cufftExecC2C((cufftHandle) fft_plan_, (cufftComplex*) fft_buf_,
 				(cufftComplex*) fft_buf_, CUFFT_INVERSE);
 		gpu_fft_scatter_out__ CUDA2(grid, tb) (fft_buf_, gpu_out_ptr_, N, M, scale);
 
-		gpuErrchk(cudaPeekAtLastError());
-		gpuErrchk(cudaDeviceSynchronize());
+		CNET_KSYNC();
 		return;
 #endif
 	}
@@ -933,10 +923,11 @@ void TrianFourierGpu::ensure_bluestein(int N, int M) {
 	std::vector<cmplx_> *srcs[3] = { &hpad, &krA, &krB };
 	for (int i = 0; i < 3; ++i) {
 		gpuErrchk(cudaMemcpy(dsts[i], srcs[i]->data(), sizeof(cmplx_) * L, cudaMemcpyHostToDevice));
+		cufftSetStream(kplan, g_cnet_stream);
 		cufftExecC2C(kplan, (cufftComplex*) dsts[i], (cufftComplex*) dsts[i], CUFFT_FORWARD);
 	}
 	cufftDestroy(kplan);
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 #endif
 }
 
@@ -966,13 +957,14 @@ void TrianFourierGpu::gpu_T_fft_forward(int block_size) {
 		float scale = 1.0f / ((float) L * sqrtf((float) N));   // cuFFT IFFT is unnormalised (x L)
 
 		gpu_bl_gather_chirp__ CUDA2(gridL, tb) (gpu_in_ptr_, bl_chirp_, bl_buf_, N, L, M);
+		cufftSetStream((cufftHandle) bl_plan_, g_cnet_stream);
 		cufftExecC2C((cufftHandle) bl_plan_, (cufftComplex*) bl_buf_, (cufftComplex*) bl_buf_, CUFFT_FORWARD);
 		gpu_bl_kmul__ CUDA2(gridL, tb) (bl_buf_, bl_Hf_, L, M);
+		cufftSetStream((cufftHandle) bl_plan_, g_cnet_stream);
 		cufftExecC2C((cufftHandle) bl_plan_, (cufftComplex*) bl_buf_, (cufftComplex*) bl_buf_, CUFFT_INVERSE);
 		gpu_bl_scatter_out__ CUDA2(gridN, tb) (bl_buf_, bl_chirp_, gpu_out_ptr_, N, L, M, scale);
 
-		gpuErrchk(cudaPeekAtLastError());
-		gpuErrchk(cudaDeviceSynchronize());
+		CNET_KSYNC();
 		return;
 #endif
 	}
@@ -992,13 +984,22 @@ void TrianFourierGpu::gpu_T_fft_forward(int block_size) {
 void L2Gpu::gpu_norm_forward(int block_size) {
 	int b_out_length = getPaddedLength(block_size, this);
 
-	// TODO: make this global
+	cmplx_* gpu_buffer;
+#ifdef __CUDACC__
+	// Persistent scratch: allocate once (first/warmup call), reuse thereafter, so
+	// the steady-state forward issues no cudaMalloc and is CUDA-graph capturable.
+	if (!l2_scratch_ || l2_scratch_len_ < b_out_length) {
+		if (l2_scratch_) cudaFree(l2_scratch_);
+		gpuErrchk(cudaMalloc((void**) &l2_scratch_, sizeof(cmplx_) * (size_t) b_out_length));
+		l2_scratch_len_ = b_out_length;
+	}
+	gpu_buffer = l2_scratch_;
+#else
 	std::vector<cmplx_> output(b_out_length);
 	GpuHelper helper;
-	auto gpu_buffer = helper.cmplx_allocate_on_gpu(output.size());
-	if (!gpu_buffer) {
-		assert(gpu_buffer);
-	}
+	gpu_buffer = helper.cmplx_allocate_on_gpu(output.size());
+	assert(gpu_buffer);
+#endif
 
 	reducing_kernel(NORM_DATA_PROVIDER, gpu_in_ptr_, gpu_buffer, 1, length(), getNoMappings(), block_size);
 	norm_kernel_end(NORM_DATA_PROVIDER, gpu_buffer, gpu_in_ptr_, gpu_out_ptr_, length(), getNoMappings(), block_size);
@@ -1025,8 +1026,7 @@ void L2Gpu::gpu_norm_backward() {
 	int total_threads = length() * getNoMappings();
 	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
 	gpu_norm_backward__ CUDA2(no_blocks, MAX_BLOCK_SIZE) (gpu_in_ptr_, gpu_out_ptr_, length(), total_threads);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 
@@ -1109,8 +1109,7 @@ void CrossEntropyGpu::gpu_cross_ent_forward(int block_size) {
 	cross_ent_end__ CUDA( grid, block_size, block_size * sizeof(cmplx_) )
 		(getNoMappings(), gpu_buffer, gpu_in_ptr_, gpu_out_ptr_, gpu_labels_, in_stride, no_threads);
 
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 __global__ void new_l_kernel_end__(int no_mappings, cmplx_ *tmp_in, GpuInVar *in, GpuOutVar *out,
@@ -1155,8 +1154,7 @@ void new_l_kernel_end(cmplx_ *temp_in, GpuInVar *in, GpuOutVar *out, int seg_len
 			(no_mappings, temp_in, in, out, in_stride, out_length, no_threads);
 
 #ifdef __CUDACC__
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 #else
 #endif
 
@@ -1242,8 +1240,7 @@ void LinearGpu::gpu_linear_forward(int block_size) {
 				(gpu_in_ptr_, gpu_out_ptr_, seg_in_len, no_segments, getNoMappings(), blocks_per_map);
 
 #ifdef __CUDACC__
-		gpuErrchk(cudaPeekAtLastError());
-		gpuErrchk(cudaDeviceSynchronize());
+		CNET_KSYNC();
 #endif
 		return;
 	}
@@ -1351,8 +1348,7 @@ void tw_gemm_forward(int N, int e_in, int e_out,
 	cublasSgemmBatched(h, CUBLAS_OP_T, CUBLAS_OP_N, e_out, N, e_in, &neg, (const float* const*)Wi, e_in, (const float* const*)Di, e_in, &one,  Or, e_out, B);
 	cublasSgemmBatched(h, CUBLAS_OP_T, CUBLAS_OP_N, e_out, N, e_in, &one, (const float* const*)Wi, e_in, (const float* const*)Dr, e_in, &zero, Oi, e_out, B);
 	cublasSgemmBatched(h, CUBLAS_OP_T, CUBLAS_OP_N, e_out, N, e_in, &one, (const float* const*)Wr, e_in, (const float* const*)Di, e_in, &one,  Oi, e_out, B);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 #endif
 
@@ -1373,8 +1369,7 @@ void TokenwiseLinearGpu::gpu_tokenwise_forward() {
 	gpu_tokenwise_forward__ CUDA2(grid, tb)
 			(gpu_in_ptr_, gpu_out_ptr_, n_tokens, e_in, e_out, B);
 #ifdef __CUDACC__
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 #endif
 }
 
@@ -1425,8 +1420,7 @@ void CrossEntropyGpu::gpu_cross_ent_backward(int label) {
 	gpu_cross_ent_backward__ CUDA2( grid, MAX_BLOCK_SIZE )
 			(gpu_in_ptr_, gpu_out_ptr_, length(), label, gpu_labels_, no_threads);
 
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 // ======== SequenceCrossEntropy (autoregressive per-position loss) ============
@@ -1557,8 +1551,7 @@ void SequenceCrossEntropyGpu::gpu_seq_ce_forward() {
 	unsigned grid = (total + tb - 1) / tb;
 	seq_ce_forward__ CUDA2(grid, tb)
 			(gpu_in_ptr_, vocab_, n_pos_, targets, gpu_sqnorm_, gpu_poss_loss_, cpu->smooth(), total);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 void SequenceCrossEntropyGpu::gpu_seq_ce_backward() {
@@ -1572,8 +1565,7 @@ void SequenceCrossEntropyGpu::gpu_seq_ce_backward() {
 	unsigned grid = (total + tb - 1) / tb;
 	seq_ce_backward__ CUDA2(grid, tb)
 			(gpu_in_ptr_, vocab_, n_pos_, targets, gpu_sqnorm_, inv_n, eps, smooth, total);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 float SequenceCrossEntropyGpu::readLoss() {
@@ -1614,8 +1606,7 @@ void gpu_argmax_correct(GpuInVar *in, int *labels, int *out_correct, int N, int 
 	int block = 256;
 	unsigned grid = (no_mappings + block - 1) / block;
 	gpu_argmax_correct__ CUDA2(grid, block) (in, labels, out_correct, N, no_mappings);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 // Like gpu_argmax_correct but writes the predicted class (Born argmax of |z_k|^2)
@@ -1643,7 +1634,6 @@ void gpu_argmax_predict(GpuInVar *in, int *out_pred, int N, int no_mappings) {
 	int block = 256;
 	unsigned grid = (no_mappings + block - 1) / block;
 	gpu_argmax_predict__ CUDA2(grid, block) (in, out_pred, N, no_mappings);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 

@@ -22,6 +22,14 @@ int getMaxNoThread() {
 }
 
 #ifdef __CUDACC__
+// CUDA Graphs support (declared extern in kernels.h). Eager mode uses the
+// per-thread default stream (0) and real syncs; the graph driver swaps in a
+// dedicated capture stream and flips g_cnet_capturing while recording.
+cudaStream_t g_cnet_stream = 0;
+bool         g_cnet_capturing = false;
+#endif
+
+#ifdef __CUDACC__
 int getSPcores(cudaDeviceProp devProp)
 {
 	int cores = 0;

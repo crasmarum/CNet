@@ -368,6 +368,9 @@ public:
 	}
 
 	virtual ~L2Gpu() {
+#ifdef __CUDACC__
+		if (l2_scratch_) { cudaFree(l2_scratch_); l2_scratch_ = NULL; }
+#endif
 	}
 
 	void gpu_norm_forward(int block_size);
@@ -381,6 +384,12 @@ public:
 	virtual void backward(int label) {
 		gpu_norm_backward();
 	}
+
+private:
+	// Persistent reduction scratch (allocated once, reused): a per-call cudaMalloc
+	// here would both churn and break CUDA-graph capture.
+	cmplx_* l2_scratch_ = NULL;
+	int     l2_scratch_len_ = 0;
 };
 
 

@@ -12,8 +12,17 @@
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 
-#define CUDA(x, y, z) <<< x, y, z >>>
-#define CUDA2(x, y) <<< x, y >>>
+// --- CUDA Graphs support ---------------------------------------------------
+// All kernel launches go through g_cnet_stream (0 == per-thread default stream
+// in eager mode; the capture stream while a graph is being recorded). While a
+// graph is being captured, g_cnet_capturing is true and the per-kernel device
+// syncs (CNET_KSYNC) become no-ops, since host-side syncs are illegal during
+// stream capture. In eager mode CNET_KSYNC preserves the original behaviour
+// (a device-wide barrier after every launch).
+extern cudaStream_t g_cnet_stream;
+extern bool         g_cnet_capturing;
+#define CUDA(x, y, z) <<< x, y, z, g_cnet_stream >>>
+#define CUDA2(x, y) <<< x, y, 0, g_cnet_stream >>>
 
 #define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
@@ -27,6 +36,14 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
    }
 }
 
+// Post-launch sync: real stream sync in eager mode, no-op while capturing a graph.
+#define CNET_KSYNC() do { \
+    if (!g_cnet_capturing) { \
+        gpuErrchk(cudaPeekAtLastError()); \
+        gpuErrchk(cudaStreamSynchronize(g_cnet_stream)); \
+    } \
+} while (0)
+
 #else
 
 #include <stdio.h>
@@ -34,6 +51,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 //Mocking CUDA for compiling it locally with g++ only.
 #define CUDA(x, y, z)
 #define CUDA2(x, y)
+#define CNET_KSYNC()
 #define __global__
 
 #define __device__

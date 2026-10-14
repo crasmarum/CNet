@@ -227,8 +227,7 @@ void grad_reducing_kernel(int provider_id, GpuInVar *in, int input_length, GpuOu
 
 
 #ifdef __CUDACC__
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 #else
 #endif
 
@@ -279,8 +278,7 @@ void grad_kernel_end(int provider_id, Grads *buff, GpuInVar *in, int seg_len, in
 			(provider_id, no_mappings, buff, in, in_stride, no_threads);
 
 #ifdef __CUDACC__
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 #else
 #endif
 
@@ -363,15 +361,13 @@ void SoftMaxGpu::gpu_soft_max_backward(int label, int block_size) {
 		int pqt = 256;   // power of two for the tree reduction
 		gpu_softmax_pq__ CUDA(M, pqt, 2 * pqt * sizeof(cmplx_))
 				(gpu_in_ptr_, gpu_out_ptr_, pq, N, M);
-		gpuErrchk(cudaPeekAtLastError());
-		gpuErrchk(cudaDeviceSynchronize());
+		CNET_KSYNC();
 
 		int total = N * M;
 		int tb = 256;
 		unsigned grid = (total + tb - 1) / tb;
 		gpu_softmax_apply_grad__ CUDA2(grid, tb) (gpu_in_ptr_, gpu_out_ptr_, pq, N, M);
-		gpuErrchk(cudaPeekAtLastError());
-		gpuErrchk(cudaDeviceSynchronize());
+		CNET_KSYNC();
 		return;
 #endif
 	}
@@ -403,8 +399,7 @@ void linear_kernel_end(int provider_id, Grads *buff, GpuInVar *in, int seg_len, 
 			(provider_id, no_mappings, buff, in, in_stride, no_threads);
 
 #ifdef __CUDACC__
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 #else
 #endif
 
@@ -510,8 +505,7 @@ void LinearGpu::gpu_linear_backward(int label, int block_size) {
 		gpu_linear_mat_grad__ CUDA2(mgrid, mt)
 				(gpu_in_ptr_, gpu_out_ptr_, N, M, no_mappings);
 #ifdef __CUDACC__
-		gpuErrchk(cudaPeekAtLastError());
-		gpuErrchk(cudaDeviceSynchronize());
+		CNET_KSYNC();
 #endif
 		// (2) vector gradient: one thread per column, output grad cached in shared.
 		int vt = 128;
@@ -526,8 +520,7 @@ void LinearGpu::gpu_linear_backward(int label, int block_size) {
 		gpu_linear_vec_grad__ CUDA(vgrid, vt, shmem)
 				(gpu_in_ptr_, gpu_out_ptr_, N, M, no_mappings, blocks_per_map);
 #ifdef __CUDACC__
-		gpuErrchk(cudaPeekAtLastError());
-		gpuErrchk(cudaDeviceSynchronize());
+		CNET_KSYNC();
 #endif
 		return;
 	}
@@ -656,8 +649,7 @@ void tw_gemm_backward(int N, int e_in, int e_out,
 	GW( 1.f, Dr, GSr, gWSr); GW( 1.f, Di, GSi, gWSr);
 	GW( 1.f, Dr, GSi, gWSi); GW(-1.f, Di, GSr, gWSi);
 	#undef P
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 #endif
 
@@ -679,8 +671,7 @@ void TokenwiseLinearGpu::gpu_tokenwise_backward() {
 	gpu_tokenwise_mat_grad__ CUDA2(mgrid, mt)
 			(gpu_in_ptr_, gpu_out_ptr_, n_tokens, e_in, e_out, no_mappings);
 #ifdef __CUDACC__
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 #endif
 
 	size_t vtot = (size_t) no_mappings * n_tokens * e_in;
@@ -689,8 +680,7 @@ void TokenwiseLinearGpu::gpu_tokenwise_backward() {
 	gpu_tokenwise_vec_grad__ CUDA2(vgrid, vt)
 			(gpu_in_ptr_, gpu_out_ptr_, n_tokens, e_in, e_out, no_mappings);
 #ifdef __CUDACC__
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 #endif
 }
 
@@ -755,8 +745,7 @@ void FourierGpu::gpu_fft_backward(int label, int block_size) {
 				(cufftComplex*) fft_buf_, CUFFT_INVERSE);
 		gpu_fft_scatter_grad__ CUDA2(grid, tb) (fft_buf_, gpu_in_ptr_, N, M, scale, 1);
 
-		gpuErrchk(cudaPeekAtLastError());
-		gpuErrchk(cudaDeviceSynchronize());
+		CNET_KSYNC();
 		return;
 #endif
 	}
@@ -802,8 +791,7 @@ void InverseFourierGpu::gpu_ifft_backward(int label, int block_size) {
 				(cufftComplex*) fft_buf_, CUFFT_FORWARD);
 		gpu_fft_scatter_grad__ CUDA2(grid, tb) (fft_buf_, gpu_in_ptr_, N, M, scale, 1);
 
-		gpuErrchk(cudaPeekAtLastError());
-		gpuErrchk(cudaDeviceSynchronize());
+		CNET_KSYNC();
 		return;
 #endif
 	}
@@ -887,8 +875,7 @@ void TrianFourierGpu::gpu_T_fft_backward(int label, int block_size) {
 		cufftExecC2C((cufftHandle) bl_plan_, (cufftComplex*) bl_buf_, (cufftComplex*) bl_buf_, CUFFT_INVERSE);
 		gpu_blb_scatter_grad__ CUDA2(gridN, tb) (bl_buf_, bl_chirp_, gpu_in_ptr_, N, L, M, scale, 1);
 
-		gpuErrchk(cudaPeekAtLastError());
-		gpuErrchk(cudaDeviceSynchronize());
+		CNET_KSYNC();
 		return;
 #endif
 	}

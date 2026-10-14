@@ -42,8 +42,7 @@ void ReluGpu::gpu_relu_forward() {
 	// gpu_in_ptr_, gpu_out_ptr_, in_.size(), length()
 	gpu_relu_forward__ CUDA2(no_blocks, maxNoThreads)
 		(gpu_in_ptr_, gpu_out_ptr_, in_.size(), length(), total_threads);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 __global__ void gpu_relu_backward__(GpuInVar *in, GpuOutVar *out, int no_func,
@@ -73,8 +72,7 @@ void ReluGpu::gpu_relu_backward() {
 	// gpu_in_ptr_, gpu_out_ptr_, in_.size(), length()
 	gpu_relu_backward__ CUDA2(no_blocks, maxNoThreads)
 		(gpu_in_ptr_, gpu_out_ptr_, in_.size(), length(), total_threads);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 /*
@@ -113,8 +111,7 @@ void InputGpu::gpu_input_forward() {
 	int total_threads = in_.size() * length();
 	int no_blocks = (total_threads + maxNoThreads - 1) / maxNoThreads;
 	gpu_input_forward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, in_.size(), length(), total_threads);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 __global__ void gpu_input_backward__(GpuInVar *in, GpuOutVar *out, int no_maps, int length, int max_len) {
@@ -138,8 +135,7 @@ void InputGpu::gpu_input_backward() {
 	int total_threads = in_.size() * length();
 	int no_blocks = (total_threads + maxNoThreads - 1) / maxNoThreads;
 	gpu_input_backward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, in_.size(), length(), total_threads);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 __global__ void gpu_residual_forward__ (GpuInVar *in, GpuOutVar *out, int no_maps,
@@ -161,8 +157,7 @@ void ResidualGpu::gpu_residual_forward() {
 	int total_threads = in_.size() * length() / 2;
 	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
 	gpu_residual_forward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, in_.size(), length() / 2, total_threads);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 __global__ void gpu_residual_backward__ (GpuInVar *in, GpuOutVar *out, int length, int max_len) {
@@ -197,8 +192,7 @@ void ResidualGpu::gpu_residual_backward(int label) {
 	int total_threads = in_.size() * length() / 2;
 	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
 	gpu_residual_backward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, length() / 2, total_threads);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 __global__ void gpu_hadamard_forward__ (GpuInVar *in, GpuOutVar *out, int no_func,
@@ -236,8 +230,7 @@ void HadamardGpu::gpu_hadamard_forward() {
 	int total_threads = in_.size() * length() / 2;
 	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
 	gpu_hadamard_forward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, in_.size(), length() / 2, total_threads);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 __global__ void gpu_hadamard_backward__ (GpuInVar *in, GpuOutVar *out, int length, int max_len) {
@@ -269,8 +262,7 @@ void HadamardGpu::hadamard_backward(int label) {
 	int total_threads = in_.size() * length() / 2;
 	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
 	gpu_hadamard_backward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, length() / 2, total_threads);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 // ---- Pad: scatter `length` taps into an `out_length` zero vector ----
@@ -306,15 +298,13 @@ void PadGpu::gpu_pad_forward() {
 	int zero_threads = in_.size() * out_len;
 	int zero_blocks = (zero_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
 	gpu_pad_zero__ CUDA2(zero_blocks, maxNoThreads) (gpu_out_ptr_, out_len, zero_threads);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 
 	int total_threads = in_.size() * length();  // one thread per tap (length() == 49)
 	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
 	gpu_pad_forward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_,
 			gpu_kernel_index_, length(), total_threads);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 __global__ void gpu_pad_backward__(GpuInVar *in, GpuOutVar *out, int *kidx,
@@ -339,8 +329,7 @@ void PadGpu::gpu_pad_backward(int label) {
 	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
 	gpu_pad_backward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_,
 			gpu_kernel_index_, length(), total_threads);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 __device__ const float GPU_GELU_SCALING_FACTOR = 0.7978845608; // sqrtf(2.0f / M_PI);
@@ -391,8 +380,7 @@ void GeluGpu::gpu_gelu_forward() {
 
 	gpu_gelu_forward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, in_.size(), length(), total_threads);
 
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 __global__ void gpu_gelu_backward__ (GpuInVar *in, GpuOutVar *out, int length, int max_len) {
@@ -425,8 +413,7 @@ void GeluGpu::gpu_gelu_backward() {
 	int total_threads = in_.size() * length();
 	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
 	gpu_gelu_backward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, length(), total_threads);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 // ---- complex dropout (inverted; mask = hash(seed, step, element)) ----
@@ -467,8 +454,7 @@ void DropoutGpu::gpu_dropout_forward() {
 	float eff_keep = g_dropout_infer ? 1.0f : keep_;    // keep=1 -> factor 1 -> identity
 	gpu_dropout_forward__ CUDA2(no_blocks, maxNoThreads)
 		(gpu_in_ptr_, gpu_out_ptr_, in_.size(), length(), total_threads, seed_, step_, eff_keep);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 __global__ void gpu_dropout_backward__(GpuInVar *in, GpuOutVar *out, int length,
@@ -495,8 +481,7 @@ void DropoutGpu::gpu_dropout_backward() {
 	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
 	gpu_dropout_backward__ CUDA2(no_blocks, maxNoThreads)
 		(gpu_in_ptr_, gpu_out_ptr_, length(), total_threads, seed_, step_, keep_);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 // ---- conjugate lag product y_t = x_t * conj(x_{t-tau}) ----
@@ -521,8 +506,7 @@ void ConjLagGpu::gpu_conjlag_forward() {
 	int total_threads = in_.size() * length();
 	int no_blocks = (total_threads + maxNoThreads - 1) / maxNoThreads;
 	gpu_conjlag_forward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, length(), total_threads, tau_);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 __global__ void gpu_conjlag_backward__(GpuInVar *in, GpuOutVar *out, int length, int max_len, int tau) {
@@ -556,8 +540,7 @@ void ConjLagGpu::gpu_conjlag_backward() {
 	int total_threads = in_.size() * length();
 	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
 	gpu_conjlag_backward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, length(), total_threads, tau_);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 // ---- segmented (windowed) Fourier / STFT: block-diagonal DFT, window w ----
@@ -586,8 +569,7 @@ void SegFourierGpu::gpu_segfourier_forward() {
 	int total_threads = in_.size() * length();
 	int no_blocks = (total_threads + maxNoThreads - 1) / maxNoThreads;
 	gpu_segfourier_forward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, length(), total_threads, window_);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 __global__ void gpu_segfourier_backward__(GpuInVar *in, GpuOutVar *out, int length, int max_len, int w) {
@@ -615,8 +597,7 @@ void SegFourierGpu::gpu_segfourier_backward() {
 	int total_threads = in_.size() * length();
 	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
 	gpu_segfourier_backward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, length(), total_threads, window_);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 // ---- HadamardConv: multi-plane spectral conv (see impl/hadamardconv.h) ----
@@ -718,8 +699,7 @@ void HadamardConvGpu::gpu_hadamardconv_forward() {
 	unsigned no_blocks = (unsigned) ((total + maxNoThreads - 1) / maxNoThreads);
 	gpu_hadamardconv_forward__ CUDA2(no_blocks, maxNoThreads)
 		(gpu_in_ptr_, gpu_out_ptr_, gpu_kernel_index_, C_, D_, F_, K_, total);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 void HadamardConvGpu::gpu_hadamardconv_backward() {
@@ -745,8 +725,7 @@ void HadamardConvGpu::gpu_hadamardconv_backward() {
 		gpu_hadamardconv_backward_bias__ CUDA2(nb, maxNoThreads)
 			(gpu_in_ptr_, gpu_out_ptr_, C_, D_, F_, K_, total);
 	}
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 // ---- |z|^2 magnitude nonlinearity ----
@@ -767,8 +746,7 @@ void CModulus2Gpu::gpu_modulus2_forward() {
 	int total_threads = in_.size() * length();
 	int no_blocks = (total_threads + maxNoThreads - 1) / maxNoThreads;
 	gpu_modulus2_forward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, length(), total_threads);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 __global__ void gpu_modulus2_backward__(GpuInVar *in, GpuOutVar *out, int length, int max_len) {
@@ -796,8 +774,7 @@ void CModulus2Gpu::gpu_modulus2_backward() {
 	int total_threads = in_.size() * length();
 	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
 	gpu_modulus2_backward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, length(), total_threads);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 // ---- mean pooling over time ----
@@ -823,8 +800,7 @@ void MeanPoolGpu::gpu_meanpool_forward() {
 	int total_threads = in_.size() * P;
 	int no_blocks = (total_threads + maxNoThreads - 1) / maxNoThreads;
 	gpu_meanpool_forward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, P, width, total_threads);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 __global__ void gpu_meanpool_backward__(GpuInVar *in, GpuOutVar *out, int L, int width, int max_len) {
@@ -847,8 +823,7 @@ void MeanPoolGpu::gpu_meanpool_backward() {
 	int total_threads = in_.size() * L;
 	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
 	gpu_meanpool_backward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, L, width, total_threads);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 // ---- holomorphic power w = z^M ----
@@ -877,8 +852,7 @@ void CPowerGpu::gpu_power_forward() {
 	int total_threads = in_.size() * length();
 	int no_blocks = (total_threads + maxNoThreads - 1) / maxNoThreads;
 	gpu_power_forward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, power_, length(), total_threads);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 __global__ void gpu_power_backward__(GpuInVar *in, GpuOutVar *out, int power, int length, int max_len) {
@@ -905,8 +879,7 @@ void CPowerGpu::gpu_power_backward() {
 	int total_threads = in_.size() * length();
 	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
 	gpu_power_backward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, power_, length(), total_threads);
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 __global__ void gpu_embedding_forward__(GpuInVar *in, int *tokens, int no_out_tokens, GpuOutVar *out,
@@ -949,8 +922,7 @@ void EmbeddingGpu::gpu_embedding_forward() {
 	gpu_embedding_forward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_tokens_, no_out_tokens_, gpu_out_ptr_,
 			embedding_dim_, no_out_tokens_ * embedding_dim_, total_threads);
 
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 __global__ void gpu_embedding_backward__(GpuInVar *in, int *tokens, int no_out_tokens, GpuOutVar *out,
@@ -986,8 +958,7 @@ void EmbeddingGpu::gpu_embedding_backward(int label) {
 	gpu_embedding_backward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_tokens_, no_out_tokens_, gpu_out_ptr_,
 			embedding_dim_, no_out_tokens_ * embedding_dim_, total_threads);
 
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 __global__ void gpu_zero_gradients__(GpuInVar *in, int map_length, int max_len) {
@@ -1013,8 +984,7 @@ void GpuMapping::zeroGradients() {
 
 	gpu_zero_gradients__ CUDA2(no_blocks, MAX_BLOCK_SIZE) (gpu_in_ptr_, length(), total_threads);
 
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 __global__ void gpu_update_input__(GpuInVar in, float l_rate, int max_len) {
@@ -1036,8 +1006,7 @@ void gpu_update_input(CFunc *func, float l_rate) {
 
 	gpu_update_input__ CUDA2(no_blocks, MAX_BLOCK_SIZE) (func->gpu_var_, l_rate, total_threads);
 
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 __global__ void gpu_adam_update_input__(GpuInVar in, float l_rate, float beta, int t, int max_len) {
@@ -1074,8 +1043,7 @@ void gpu_update_adam_input(CFunc *func, float l_rate, float beta, int t) {
 
 	gpu_adam_update_input__ CUDA2(no_blocks, MAX_BLOCK_SIZE) (func->gpu_var_, l_rate, beta, t, total_threads);
 
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 // True Adam: first moment m (dz slots 2,3) AND second moment v (slots 6,7),
@@ -1135,8 +1103,7 @@ void gpu_update_true_adam_input(CFunc *func, float l_rate, float beta1,
 	gpu_true_adam_update_input__ CUDA2(no_blocks, MAX_BLOCK_SIZE)
 			(func->gpu_var_, l_rate, beta1, beta2, eps, t, grad_clip, total_threads);
 
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 
@@ -1177,8 +1144,7 @@ void gpu_copy_to_clones(GpuCloneVar *in, int no_ancestors, int max_input_len) {
 
 	gpu_copy_to_clones__ CUDA2(no_blocks, MAX_BLOCK_SIZE) (in, len, total_threads);
 
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 
 __global__ void gpu_grad_from_clones__(GpuCloneVar *in, int max_input_len, size_t total_threads) {
@@ -1216,7 +1182,6 @@ void gpu_grad_from_clones(GpuCloneVar *in, int no_ancestors, int max_input_len) 
 
 	gpu_grad_from_clones__ CUDA2(no_blocks, MAX_BLOCK_SIZE) (in, len, total_threads);
 
-	gpuErrchk(cudaPeekAtLastError());
-	gpuErrchk(cudaDeviceSynchronize());
+	CNET_KSYNC();
 }
 

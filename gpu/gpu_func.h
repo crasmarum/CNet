@@ -35,6 +35,39 @@
 #endif
 
 
+#ifdef __CUDACC__
+// Holds the captured CUDA graphs for the forward and backward clone passes, plus
+// the dedicated stream they are captured/replayed on. Capture is valid because the
+// GPU arena allocated by allocateOnGpu() is static across steps: device pointers for
+// activations, weights, and Wirtinger gradients never move, so a single capture of
+// the level-by-level launch schedule can be replayed with one cudaGraphLaunch.
+struct CudaGraphState {
+	cudaStream_t    stream = nullptr;
+	cudaGraph_t     fwd_graph = nullptr;
+	cudaGraphExec_t fwd_exec = nullptr;
+	cudaGraph_t     bwd_graph = nullptr;
+	cudaGraphExec_t bwd_exec = nullptr;
+	bool            fwd_captured = false;
+	bool            bwd_captured = false;
+
+	void init() {
+		if (!stream) {
+			cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+		}
+	}
+	// Invalidate captured graphs (e.g. if the net is re-allocated at a new batch size).
+	void reset() {
+		if (fwd_exec)  { cudaGraphExecDestroy(fwd_exec);  fwd_exec = nullptr; }
+		if (fwd_graph) { cudaGraphDestroy(fwd_graph);     fwd_graph = nullptr; }
+		if (bwd_exec)  { cudaGraphExecDestroy(bwd_exec);  bwd_exec = nullptr; }
+		if (bwd_graph) { cudaGraphDestroy(bwd_graph);     bwd_graph = nullptr; }
+		fwd_captured = false;
+		bwd_captured = false;
+	}
+};
+#endif
+
+
 /**
  * Assume 1 GPU for now.
  */
@@ -54,6 +87,9 @@ class CNet {
 	int *gpu_seq_targets_ = NULL;   // B*n_pos per-position targets (SequenceCrossEntropy)
 	int *gpu_correct_ = NULL;   // cached device buffer for in-training accuracy
 	int gpu_correct_cap_ = 0;
+#ifdef __CUDACC__
+	CudaGraphState graph_;      // captured forward/backward CUDA graphs (opt-in)
+#endif
 
 	void createExecutionGraph() {
 		std::set<GpuMapping*> inputs;
@@ -869,19 +905,55 @@ public:
 		return "Net successfully allocated on GPU.";
 	}
 
-	std::string GpuForward(bool& was_failure) {
-		//StopWatch sw;
+	// Forward clone pass: run each mapping in depth order (zeroing non-input
+	// gradient buffers as we go). Factored out so the CUDA-graph driver can
+	// record the exact same launch schedule it later replays.
+	void runForwardOnce() {
 		for (auto mp : maps_) {
-//			std::cout << mp->getCpuFun()[0]->getName() << std::endl;
 			mp->forward();
 			if (!mp->getCpuFun().front()->isInput()) {
 				mp->zeroGradients();
 			}
 		}
-//		auto ss = "GPU Forward done in " + std::to_string(sw.ElapsedTimeMicros()) + "ms.";
-//		std::cout << ss << std::endl;
+	}
+
+	std::string GpuForward(bool& was_failure) {
+		runForwardOnce();
 		return "";
 	}
+
+#ifdef __CUDACC__
+	// CUDA-graph forward: capture the clone forward schedule once, then replay it
+	// with a single launch on every subsequent call. The first call also does one
+	// eager warmup pass so any lazy device allocations (e.g. cuFFT work areas)
+	// happen outside the capture region, where cudaMalloc is forbidden.
+	std::string GpuForwardGraphed(bool& was_failure) {
+		graph_.init();
+		cudaStream_t saved = g_cnet_stream;
+		g_cnet_stream = graph_.stream;
+		if (!graph_.fwd_captured) {
+			g_cnet_capturing = false;
+			runForwardOnce();                                   // warmup (eager, on the stream)
+			gpuErrchk(cudaStreamSynchronize(graph_.stream));
+			g_cnet_capturing = true;
+			gpuErrchk(cudaStreamBeginCapture(graph_.stream, cudaStreamCaptureModeThreadLocal));
+			runForwardOnce();
+			gpuErrchk(cudaStreamEndCapture(graph_.stream, &graph_.fwd_graph));
+			g_cnet_capturing = false;
+#if CUDART_VERSION >= 12000
+			gpuErrchk(cudaGraphInstantiate(&graph_.fwd_exec, graph_.fwd_graph, 0));
+#else
+			gpuErrchk(cudaGraphInstantiate(&graph_.fwd_exec, graph_.fwd_graph, NULL, NULL, 0));
+#endif
+			graph_.fwd_captured = true;
+		}
+		gpuErrchk(cudaGraphLaunch(graph_.fwd_exec, graph_.stream));
+		gpuErrchk(cudaStreamSynchronize(graph_.stream));
+		g_cnet_stream = saved;
+		was_failure = false;
+		return "";
+	}
+#endif
 
 	std::string GpuInfer(bool& was_failure) {
 		//StopWatch sw;
@@ -893,19 +965,46 @@ public:
 		return "";
 	}
 
-	std::string GpuBackward(int label, bool& was_failure) {
-		//StopWatch sw;
-
-		for (auto it = maps_.rbegin(); it != maps_.rend(); ++it)
-		{
-//			std::cout << "GPU bck: " << (*it)->cpu_func_.front()->getName() << std::endl;
+	void runBackwardOnce(int label) {
+		for (auto it = maps_.rbegin(); it != maps_.rend(); ++it) {
 			(*it)->backward(label);
 		}
+	}
 
-//		auto ss = "Backward done in " + std::to_string(sw.ElapsedTimeMicros()) + "ms.";
-//		std::cout << ss << std::endl;
+	std::string GpuBackward(int label, bool& was_failure) {
+		runBackwardOnce(label);
 		return "";
 	}
+
+#ifdef __CUDACC__
+	// CUDA-graph backward: same capture-once / replay pattern as GpuForwardGraphed.
+	std::string GpuBackwardGraphed(int label, bool& was_failure) {
+		graph_.init();
+		cudaStream_t saved = g_cnet_stream;
+		g_cnet_stream = graph_.stream;
+		if (!graph_.bwd_captured) {
+			g_cnet_capturing = false;
+			runBackwardOnce(label);                             // warmup (eager, on the stream)
+			gpuErrchk(cudaStreamSynchronize(graph_.stream));
+			g_cnet_capturing = true;
+			gpuErrchk(cudaStreamBeginCapture(graph_.stream, cudaStreamCaptureModeThreadLocal));
+			runBackwardOnce(label);
+			gpuErrchk(cudaStreamEndCapture(graph_.stream, &graph_.bwd_graph));
+			g_cnet_capturing = false;
+#if CUDART_VERSION >= 12000
+			gpuErrchk(cudaGraphInstantiate(&graph_.bwd_exec, graph_.bwd_graph, 0));
+#else
+			gpuErrchk(cudaGraphInstantiate(&graph_.bwd_exec, graph_.bwd_graph, NULL, NULL, 0));
+#endif
+			graph_.bwd_captured = true;
+		}
+		gpuErrchk(cudaGraphLaunch(graph_.bwd_exec, graph_.stream));
+		gpuErrchk(cudaStreamSynchronize(graph_.stream));
+		g_cnet_stream = saved;
+		was_failure = false;
+		return "";
+	}
+#endif
 
 	void printMappingFromGpu(GpuMapping *mp, int from_indx = 0) {
 		assert(mp && mp->gpu_in_ptr_);
