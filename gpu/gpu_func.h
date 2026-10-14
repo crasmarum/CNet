@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cmath>
 #include <memory>
 #include <map>
 #include <set>
@@ -1385,6 +1386,28 @@ public:
 			}
 		}
 		return 0;
+	}
+
+	// Sample one token from a SequenceCrossEntropy head at position `pos` after a GPU
+	// forward, reading the per-position logit amplitudes straight off the device (Born
+	// probability p_k = |z_{pos,k}|^2 / sum, temperature-scaled). `coin` is a uniform
+	// draw in [0,1). Mirrors sample()'s readback but indexed to one sequence position,
+	// so generation can run the fast GPU forward (Bluestein mixer) instead of the
+	// O(N^2) CPU reference.
+	int sampleSeqPos(CFunc* seq, int pos, int vocab, double temp, double coin) {
+		int len = seq->input().length_;                 // N * vocab complex logits
+		std::vector<float> buf((size_t) len * 2);
+		helper_.float_copy_from_gpu(len * 2, seq->gpu_var_.input_ptr_, buf.data());
+		std::vector<double> q(vocab); double Z = 0;
+		for (int k = 0; k < vocab; ++k) {
+			int gi = pos * vocab + k;
+			double pr = (double) buf[gi] * buf[gi] + (double) buf[len + gi] * buf[len + gi];
+			pr = std::pow(pr < 1e-12 ? 1e-12 : pr, 1.0 / temp);
+			q[k] = pr; Z += pr;
+		}
+		double c = coin * Z, s = 0;
+		for (int k = 0; k < vocab; ++k) { s += q[k]; if (c <= s) return k; }
+		return vocab - 1;
 	}
 
 	int add(CFunc* func) {

@@ -89,7 +89,7 @@ FW_OBJS = $(addprefix $(OBJ_DIR)/, $(notdir $(FW_SRCS:.cpp=.o)))
 # --- Build Rules ---
 
 # Phony targets are not actual files. 'all' is the default goal.
-.PHONY: all clean run info dp_shakespeare generate gollm radioml mnist_hadamard bench_mixer bench_clone test_conjlag_fd test_hadamardconv_fd test_hadamardconv_gpu
+.PHONY: all clean run info dp_shakespeare generate gollm radioml mnist_hadamard bench_mixer bench_clone bench_bornattn test_conjlag_fd test_hadamardconv_fd test_hadamardconv_gpu
 .DEFAULT_GOAL := all
 
 # Standalone multi-GPU data-parallel tiny-shakespeare example (its own main).
@@ -131,6 +131,13 @@ bench_mixer: $(FW_OBJS)
 	$(CXX) $(CXXFLAGS) -c examples/bench_mixer.cpp -o $(OBJ_DIR)/bench_mixer.o
 	$(CXX) $(FW_OBJS) $(OBJ_DIR)/bench_mixer.o $(LDFLAGS) -o $(TARGET_DIR)/bench_mixer
 	@echo "==> Built $(TARGET_DIR)/bench_mixer"
+
+# Born-attention micro-benchmark (examples/bench_bornattn.cpp). Single-GPU, no NCCL.
+bench_bornattn: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/bench_bornattn.cpp -o $(OBJ_DIR)/bench_bornattn.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/bench_bornattn.o $(LDFLAGS) -o $(TARGET_DIR)/bench_bornattn
+	@echo "==> Built $(TARGET_DIR)/bench_bornattn"
 
 # Shallow Hadamard-conv MNIST trainer (examples/mnist_hadamard.cpp). Single-GPU, no NCCL.
 mnist_hadamard: $(FW_OBJS)

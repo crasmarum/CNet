@@ -26,6 +26,8 @@
 #include <iterator>
 #include <vector>
 #include <string>
+#include <set>
+#include <sstream>
 #include <map>
 #include <random>
 #include <cmath>
@@ -73,6 +75,8 @@ FLAG_FLOAT(grad_norm_clip, 0.0) // GLOBAL gradient-norm clip on the all-reduced 
                                 // every rank (same summed gradient), so replicas stay in sync.
 FLAG_STRING(data, "tiny_shakespear2.txt")
 FLAG_BOOL(born, false)      // use Born-rule attention mixer instead of causal Fourier
+FLAG_STRING(attn_at, "")    // hybrid: comma-separated block indices that use Born attention
+                            // (the rest use TriangFourier). Empty = all blocks follow -born.
 FLAG_BOOL(block_norm, false) // L2-normalize (SoftMax) each block output (deep nets)
 FLAG_BOOL(token_norm, false) // per-token complex RMS pre-norm (pre-LN transformer)
 FLAG_BOOL(rope, false)      // rotary position embedding on Born-attention Q,K
@@ -87,6 +91,7 @@ FLAG_BOOL(eval_loss, false) // eval mode: restore -model, report exact-Born held
 FLAG_STRING(model, "")      // model file to restore in -generate mode
 FLAG_STRING(prompt, "ROMEO:")// seed text for generation
 FLAG_INT(gen_len, 600)      // number of characters to generate
+FLAG_BOOL(gen_gpu, false)   // generate using the GPU forward (fast Bluestein mixer) instead of CPU
 FLAG_FLOAT(temp, 0.8)       // sampling temperature (lower = greedier)
 FLAG_BOOL(print_net, false) // build the LM and print its layer graph, then exit
 FLAG_INT(seed, 1000)        // base seed for the per-rank data sampler (rank r uses seed+r)
@@ -109,6 +114,32 @@ struct CharData {
 		ntrain = (int) ((data.size() / 10) * 9);
 	}
 };
+
+// ---- sidecar vocab: <model>.vocab stores the char<->id table so -generate/-eval
+// are self-contained and do NOT depend on re-deriving the (insertion-order, hence
+// corpus-order-dependent) char vocab from a -data file. Byte k of the file is the
+// character whose id is k, so it round-trips every byte value exactly. ----
+static std::string vocabPath(const std::string &model) { return model + ".vocab"; }
+
+static bool writeVocabSidecar(const std::string &model, const std::vector<char> &i2c) {
+	std::ofstream f(vocabPath(model), std::ios::binary);
+	if (!f) return false;
+	f.write(i2c.data(), (std::streamsize) i2c.size());
+	return (bool) f;
+}
+
+// Fill i2c (id->char) and c2i (char->id) from the sidecar if present; false if none.
+static bool readVocabSidecar(const std::string &model, std::vector<char> &i2c,
+							 std::map<char, int> &c2i) {
+	std::ifstream f(vocabPath(model), std::ios::binary);
+	if (!f) return false;
+	std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+	if (s.empty()) return false;
+	i2c.assign(s.begin(), s.end());
+	c2i.clear();
+	for (int k = 0; k < (int) i2c.size(); ++k) c2i[i2c[k]] = k;
+	return true;
+}
 
 // ---- sub-word token dataset: <dir>/train.bin + <dir>/val.bin, uint16 ids ----
 // train ids occupy [0, ntrain); val ids are appended at [ntrain, end), so the
@@ -149,9 +180,16 @@ static int buildLM(ComplexNet &net, int embId, int E, int N, int L, int vocab) {
 	// normalized residual-stream input; the residual still adds to the un-normed
 	// stream (standard pre-LN), which is what lets depth train stably.
 	auto norm = [&](int x) { return token_norm ? net.add(new TokenNorm(N, E), {x}) : x; };
+	// Hybrid mixer selection: attn_at lists block indices that use Born attention; the
+	// remaining blocks use the cheap TriangFourier (Bluestein) mixer. Empty => all blocks
+	// follow the global -born flag.
+	std::set<int> attn_set;
+	{ std::stringstream ss((std::string) attn_at); std::string tok;
+	  while (std::getline(ss, tok, ',')) if (!tok.empty()) attn_set.insert(std::stoi(tok)); }
 	for (int b = 0; b < L; ++b) {
 		int mixout;
-		if (born) {                                                        // Born-rule attention
+		bool useBorn = attn_set.empty() ? (bool) born : (attn_set.count(b) > 0);
+		if (useBorn) {                                                     // Born-rule attention
 			int pre = net.add(new CGelu(InSize(size)), {norm(last)});
 			int wQ = net.add(new CInput(OutSize(E * dh))); int Q  = net.add(new TokenwiseLinear(N, E, dh), {pre, wQ});
 			int wK = net.add(new CInput(OutSize(E * dh))); int K  = net.add(new TokenwiseLinear(N, E, dh), {pre, wK});
@@ -205,9 +243,20 @@ static int sampleNext(SequenceCrossEntropy *seq, int p, int vocab, double temp, 
 static int runGenerate() {
 	FILELog::ReportingLevel() = lWarning;   // quiet per-layer restore/forward debug logs
 	if (((std::string) model).empty()) { std::cerr << "-generate requires -model <file>\n"; return 1; }
-	CharData ds; ds.load(data);
-	std::vector<char> i2c(ds.vocab);
-	for (auto &kv : ds.c2i) i2c[kv.second] = kv.first;
+	// Prefer the sidecar vocab saved next to the model (exact, corpus-independent);
+	// fall back to deriving it from -data for older models that have no sidecar.
+	std::vector<char> i2c; std::map<char, int> c2i;
+	if (readVocabSidecar((std::string) model, i2c, c2i)) {
+		std::cerr << "[vocab] loaded " << i2c.size() << " chars from "
+				  << vocabPath((std::string) model) << "\n";
+	} else {
+		CharData ds; ds.load(data);
+		i2c.assign(ds.vocab, 0);
+		for (auto &kv : ds.c2i) i2c[kv.second] = kv.first;
+		c2i = ds.c2i;
+		std::cerr << "[vocab] no sidecar; derived " << i2c.size()
+				  << " chars from -data " << (std::string) data << "\n";
+	}
 
 	CNet net;
 	if (!net.restore((std::string) model)) { std::cerr << "cannot restore model: " << (std::string) model << "\n"; return 1; }
@@ -218,8 +267,39 @@ static int runGenerate() {
 
 	std::mt19937 rng(std::random_device{}());
 	std::vector<int> ctx;
-	for (char c : (std::string) prompt) if (ds.c2i.count(c)) ctx.push_back(ds.c2i[c]);
-	std::string out = prompt;
+	for (char c : (std::string) prompt) if (c2i.count(c)) ctx.push_back(c2i[c]);
+	// Stream the generation live: print the header + prompt, then flush each sampled
+	// character as it is produced, so output appears incrementally (and survives an
+	// early kill) instead of being buffered until the end.
+	std::cout << "=== generated (model=" << model << " temp=" << temp << ") ===\n"
+			  << prompt << std::flush;
+
+#ifdef __CUDACC__
+	// GPU generation: run the full forward on the device (fast Bluestein mixer) and
+	// read the per-position logits straight off the device to sample. Avoids the
+	// O(N^2) CPU TriangFourier reference, so a hybrid/FNet model samples in seconds.
+	if (gen_gpu) {
+		// batch 2 (>=1 clone required by the clone/batchToGpu path); feed the same
+		// window to both examples so whichever the ancestor holds is the real one.
+		net.allocateOnGpu(2);                                           // weights already restored
+		std::uniform_real_distribution<double> U(0.0, 1.0);
+		for (int g = 0; g < gen_len; ++g) {
+			std::vector<int> win(Ngen, 0);
+			int ctxn = (int) ctx.size(), take = std::min(ctxn, Ngen);
+			for (int i = 0; i < take; ++i) win[i] = ctx[ctxn - take + i];
+			EmbeddingBatch b(2, Ngen);
+			b.add(win, 0); b.addTargets(std::vector<int>(Ngen, 0));     // targets unused for sampling
+			b.add(win, 0); b.addTargets(std::vector<int>(Ngen, 0));
+			net.gpuForward(em, seq, b);
+			int nxt = net.sampleSeqPos(seq, take - 1, vocab, temp, U(rng));
+			ctx.push_back(nxt);
+			std::cout << i2c[nxt] << std::flush;
+		}
+		std::cout << std::endl;
+		return 0;
+	}
+#endif
+
 	for (int g = 0; g < gen_len; ++g) {
 		std::vector<int> win(Ngen, 0);
 		int ctxn = (int) ctx.size(), take = std::min(ctxn, Ngen);
@@ -227,10 +307,10 @@ static int runGenerate() {
 		em->setInput(win);
 		net.cpuNet().forward();
 		int nxt = sampleNext(seq, take - 1, vocab, temp, rng);           // next after last real token
-		ctx.push_back(nxt); out += i2c[nxt];
+		ctx.push_back(nxt);
+		std::cout << i2c[nxt] << std::flush;                             // stream one char at a time
 	}
-	std::cout << "=== generated (model=" << model << " temp=" << temp << ") ===\n"
-			  << out << std::endl;
+	std::cout << std::endl;
 	return 0;
 }
 
@@ -317,13 +397,26 @@ int main(int argc, char **argv) {
 	if (ncclCommInitRank(&comm, W, id, R) != ncclSuccess) { std::cerr << "rank " << R << ": nccl init failed\n"; return 1; }
 
 	std::vector<int> ids; int vocab, ntrainTok;
+	std::vector<char> charVocab;   // id->char for char mode, persisted as the model's .vocab sidecar
 	if (token_lm) { TokenData d; d.load(data, vocab_size); ids = std::move(d.data); vocab = d.vocab; ntrainTok = d.ntrain; }
-	else          { CharData  d; d.load(data);             ids = std::move(d.data); vocab = d.vocab; ntrainTok = d.ntrain; }
+	else          { CharData  d; d.load(data);             ids = std::move(d.data); vocab = d.vocab; ntrainTok = d.ntrain;
+	                charVocab.assign(vocab, 0); for (auto &kv : d.c2i) charVocab[kv.second] = kv.first; }
+	// Persist the char<->id table beside the model so -generate/-eval are self-contained
+	// (char mode only; token_lm uses an external BPE vocab). Written once by rank 0.
+	if (R == 0 && !token_lm && !((std::string) save_path).empty()) {
+		if (writeVocabSidecar((std::string) save_path, charVocab))
+			std::cout << "[vocab] wrote " << charVocab.size() << " chars to "
+					  << vocabPath((std::string) save_path) << "\n";
+		else
+			std::cerr << "WARNING: could not write vocab sidecar "
+					  << vocabPath((std::string) save_path) << "\n";
+	}
 	if (R == 0)
 		std::cout << (token_lm ? "token-LM: tokens=" : "tiny-shakespeare: chars=") << ids.size() << " vocab=" << vocab
 				  << "  model E=" << E << " N=" << N << " L=" << L
 				  << "  global_batch=" << batch << " world=" << W
-				  << "  born=" << born << " block_norm=" << block_norm
+				  << "  born=" << born << " attn_at=[" << (std::string) attn_at << "]"
+				  << " block_norm=" << block_norm
 				  << " token_norm=" << token_norm << " rope=" << rope
 				  << "  grad_clip=" << grad_clip << " ce_eps=" << ce_eps
 				  << "  chance=ln(vocab)=" << std::log((double) vocab) << std::endl;

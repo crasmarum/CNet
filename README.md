@@ -160,21 +160,38 @@ In the following image you can see how a batch of size 32 is deployed on a GPU:
 Because the clones execute concurrently across the batch, GPU memory grows linearly with the
 batch size while the per-step wall-clock time stays essentially flat. The table below measures
 this cost for a 6-block complex FNet (flattened token-major stream of `T * E = 16384` complex
-values) on a single NVIDIA A100:
+values) on a single NVIDIA H100 (eager):
 
 | batch | GPU mem (MB) | fwd (ms/step) | bwd (ms/step) |
 |------:|-------------:|--------------:|--------------:|
-|    16 |        167.8 |          1.05 |          0.59 |
-|    32 |        335.5 |          1.08 |          0.52 |
-|    64 |        671.1 |          1.06 |          0.50 |
-|   128 |       1342.2 |          1.01 |          0.49 |
-|   256 |       2684.4 |          1.13 |          0.49 |
+|    16 |        167.8 |          0.33 |          0.32 |
+|    32 |        335.5 |          0.33 |          0.32 |
+|    64 |        671.1 |          0.33 |          0.32 |
+|   128 |       1342.2 |          0.33 |          0.32 |
+|   256 |       2684.4 |          0.33 |          0.32 |
 
 Memory is linear in the batch size — each clone holds its own activations — while the forward and
 backward times per step remain near-constant from batch 16 up to 256, since the clones are launched
 level by level and run in parallel. Throughput therefore scales with the batch at roughly fixed
 latency. A reduced-memory inference layout (`Vars::INFER_DIMS`) drops the per-example footprint
 further by not allocating the gradient/optimizer buffers that only training needs.
+
+## CUDA Graphs
+
+Because the clone arena is static across steps — device pointers for activations, weights, and
+Wirtinger gradients never move after `allocateOnGpu` — the entire level-by-level launch schedule
+can be captured once into a CUDA graph and replayed with a single `cudaGraphLaunch`
+(`CNet::GpuForwardGraphed` / `GpuBackwardGraphed`). This removes the per-kernel launch/sync
+overhead: on an H100 the forward+backward step drops from **0.65 ms to 0.32 ms (~2×, flat across
+batch)** while staying **bit-identical** to eager execution, and the captured step runs faster than
+eager `torch.complex64`. The standalone `bench_clone` example reproduces this:
+
+```bash
+make bench_clone
+./bench_clone -fft_fast true              # eager
+./bench_clone -fft_fast true -bc_graph 1  # replay captured CUDA graphs
+./bench_clone -fft_fast true -bc_check 1  # verify graph replay == eager (bit-identical)
+```
 
 # Complex Layers
 
@@ -387,6 +404,8 @@ int N = 64, E = 128, H = 4 * E;        // N tokens, width E, hidden H
 auto w1 = cnet.add(new CInput(OutSize(E * H)));
 auto ff = cnet.add(new TokenwiseLinear(N, E, H), {hidden, w1});
 ```
+
+On the GPU, `TokenwiseLinear` has two kernel paths: a naive per-element complex multiply-accumulate, and a batched cuBLAS GEMM path (the complex product is four real `cublasSgemmBatched` calls). The batched path is a large win once the projection is wide — most visibly a language-model head at vocabulary width — where it measured **≈3.4× faster** (607 → 177 ms/step) on a vocab-8192, `N=256`, `E=256` model on an H100; at small output widths (e.g. a character vocabulary) the two paths are indistinguishable. The `dp_shakespeare` example selects it with `-tw_cublas true`.
 
 ## CRelu Layer
 
@@ -706,10 +725,10 @@ By default the example uses the parameter-free `TriangFourier` causal mixer. Fla
     -emb 160 -tokens 64 -blocks 8 -batch 64 -steps 8000 -grad_clip 0.5
 ```
 
-The trained model can be checkpointed (`-save_path model.mod`) and then sampled without retraining:
+The trained model can be checkpointed (`-save_path model.mod`) and then sampled without retraining. Training also writes a `model.mod.vocab` sidecar holding the character⟷id table, so generation is **self-contained** and no longer needs the training corpus to reconstruct the (insertion-order) vocabulary; older checkpoints without a sidecar fall back to `-data`. Add `-gen_gpu true` to sample on the device through the fast Bluestein/Born forward instead of the CPU reference — seconds rather than minutes for a hybrid/FNet model:
 
 ```bash
-./dp_shakespeare -generate true -model model.mod -prompt "ROMEO:" -gen_len 600 -temp 0.8
+./dp_shakespeare -generate true -gen_gpu true -model model.mod -prompt "ROMEO:" -gen_len 600 -temp 0.8
 ```
 
 A pretrained fully-complex Born-rule model (Born attention + RoPE + TokenNorm, ~2.1M complex parameters, val 1.52 nats/char on tiny-shakespeare) is available as a [GitHub release asset](https://github.com/crasmarum/CNet/releases/download/v0.1/rope20k.mod) and on the [Hugging Face Hub](https://huggingface.co/crasmarum/born-attention-lm) — download it and generate directly:
@@ -733,7 +752,7 @@ global batch:
 # Caveat
 
 The current version of the CNet framework has some limitations:
-* multi-GPU training is data-parallel only (no model/tensor parallelism yet), and single-GPU throughput is bounded by per-layer kernel-launch overhead;
+* multi-GPU training is data-parallel only (no model/tensor parallelism yet); per-layer kernel-launch overhead on the single-GPU path is eliminated by optional CUDA Graph capture (see above);
 * APIs to create new functions / layers are for CPU-only. Support for APIs for implementing CUDA layers, to follow.
 * supported only on Linux/MacOS. 
 
