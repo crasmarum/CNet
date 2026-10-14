@@ -611,9 +611,11 @@ __global__ void gpu_tokenwise_vec_grad__(GpuInVar *in, GpuOutVar *out,
 void tw_gemm_backward(int N, int e_in, int e_out,
 		const std::vector<GpuInVar> &in_, const std::vector<GpuOutVar> &out_, float **pool) {
 	const int B = (int) in_.size();
-	const int L = in_[0].input_length_, wbase = N * e_in, outlen = out_[0].out_length_;
+	const int wbase = N * e_in;
 	std::vector<float*> hp((size_t) 16 * B, nullptr);
 	for (int b = 0; b < B; ++b) {
+		const int L = in_[b].input_length_;         // per-entry (see tw_gemm_forward): out_length_ differs
+		const int outlen = out_[b].out_length_;     // across Q/K (N*d) vs V (3*N*d) grouped mapping under rope
 		float *base = in_[b].input_ptr_, *ob = out_[b].out_ptr_;
 		hp[0*B+b]=base;              hp[1*B+b]=base+L;                 // Dr, Di
 		hp[2*B+b]=base+wbase;        hp[3*B+b]=base+L+wbase;           // Wr, Wi
@@ -733,6 +735,7 @@ void FourierGpu::gpu_fft_backward(int label, int block_size) {
 		unsigned grid = (total + tb - 1) / tb;
 		float scale = 1.0f / sqrtf((float) N);
 
+		cufftSetStream((cufftHandle) fft_plan_, g_cnet_stream);   // bind to capture/exec stream (graph-safe)
 		// dz += FFT_forward(dLdz) / sqrt(N)
 		gpu_fft_gather_grad__ CUDA2(grid, tb) (gpu_out_ptr_, fft_buf_, N, M, 0);
 		cufftExecC2C((cufftHandle) fft_plan_, (cufftComplex*) fft_buf_,
@@ -779,6 +782,7 @@ void InverseFourierGpu::gpu_ifft_backward(int label, int block_size) {
 		unsigned grid = (total + tb - 1) / tb;
 		float scale = 1.0f / sqrtf((float) N);
 
+		cufftSetStream((cufftHandle) fft_plan_, g_cnet_stream);   // bind to capture/exec stream (graph-safe)
 		// dz += FFT_inverse(dLdz) / sqrt(N)
 		gpu_fft_gather_grad__ CUDA2(grid, tb) (gpu_out_ptr_, fft_buf_, N, M, 0);
 		cufftExecC2C((cufftHandle) fft_plan_, (cufftComplex*) fft_buf_,
@@ -861,6 +865,7 @@ void TrianFourierGpu::gpu_T_fft_backward(int label, int block_size) {
 		unsigned gridN = ((size_t) N * M + tb - 1) / tb;
 		float scale = 1.0f / ((float) L * sqrtf((float) N));
 
+		cufftSetStream((cufftHandle) bl_plan_, g_cnet_stream);   // bind to capture/exec stream (graph-safe)
 		// dz += L^T dLdz  (kernel KrA = FFT(reverse(conj chirp)))
 		gpu_blb_gather_grad__ CUDA2(gridL, tb) (gpu_out_ptr_, bl_chirp_, bl_buf_, N, L, M, 0);
 		cufftExecC2C((cufftHandle) bl_plan_, (cufftComplex*) bl_buf_, (cufftComplex*) bl_buf_, CUFFT_FORWARD);

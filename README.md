@@ -2,7 +2,7 @@
 # CNet
 
 CNet is a C++/CUDA framework for building and researching deep complex valued neural networks, as well as for optimization of complex valued functions using  gradient descent with [Wirtinger derivatives.](https://en.wikipedia.org/wiki/Wirtinger_derivatives) 
-In the current version it should be relatively straighforward to implement new CPU-only functions / layers. In subsequent releases support will be added to easily implement CUDA layers, too.
+Every built-in layer ships both a CPU reference and a CUDA kernel. Adding a new operator means writing its CPU forward/backward class and a CUDA kernel, then wiring the kernel into the GPU dispatch via `GpuMapping` (`gpu/gpumapping.h`) and the `GPU_LAYER_TABLE` registration macro (`gpu/gpu_data.h`) — there is no automatic CPU→GPU codegen; the kernel is written once, by hand.
 
 Why are the complex valued neural network (CVNN) interesting? For one, it is a research area that is currently neglected due to the huge commercial success of
 the real valued ones.  This [Medium article](https://machine-learning-made-simple.medium.com/complex-valued-neural-networks-might-be-the-future-of-deep-learning-c51f71f4c835) summarizes well why CVNN might be the future of Deep Learning: _"complex numbers work very well for phasic data... The fields where these can be implemented most readily are: Signal Communications; Healthcare (both medical image and ECG); Deep Fake Detections; and Acoustic Analysis for Industrial Maintenance and expansion."_  
@@ -753,6 +753,6 @@ global batch:
 
 The current version of the CNet framework has some limitations:
 * multi-GPU training is data-parallel only (no model/tensor parallelism yet); per-layer kernel-launch overhead on the single-GPU path is eliminated by optional CUDA Graph capture (see above);
-* APIs to create new functions / layers are for CPU-only. Support for APIs for implementing CUDA layers, to follow.
+* adding a layer means hand-writing both its CPU reference and its CUDA kernel (wired through `GpuMapping` / `GPU_LAYER_TABLE`); there is no higher-level CPU→GPU codegen yet.
 * supported only on Linux/MacOS. 
 

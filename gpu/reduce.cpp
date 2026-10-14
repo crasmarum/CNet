@@ -11,20 +11,24 @@
 
 FLAG_INT(reduce_block_size, 512);
 
-// When off, TokenwiseLinear falls back to the naive element-wise CUDA kernels;
-// when on it uses batched cuBLAS GEMMs. The cuBLAS path is NUMERICALLY CORRECT:
-// its forward and backward match the element-wise reference to float rounding
-// (~1e-3), verified by -tw_gpu (testTokenwiseGpuVsCpu) with a full Born block,
-// asymmetric FFN dims, and distinct per-clone data; it is NOT a gradient bug and
-// NOT TF32 (CUBLAS_PEDANTIC_MATH is set below). HOWEVER, for the Born-attention
-// language model the training reliably gets stuck at the unigram/chance loss with
-// cuBLAS on (char: 3.35 stuck vs ~2.1 and falling with it off; same at lr 2e-3),
-// because the Born loss's unigram saddle is hypersensitive: the tiny difference in
-// GEMM summation order between cuBLAS and the element-wise kernel deterministically
-// decides whether the model escapes the saddle. Default OFF so the flagship Born LM
-// trains out-of-box; cuBLAS (faster) is fine to enable for non-saddle tasks
-// (classification) or once the saddle-escape is made robust (symmetry-breaking
-// init / loss reformulation -- same landscape issue as the WikiText cliff).
+// When off, TokenwiseLinear uses the naive element-wise complex CUDA kernels; when on it
+// uses batched cuBLAS GEMMs (~3x faster at LM-head width). Both are numerically equivalent
+// (forward+backward match to ~1e-3, -tw_gpu; CUBLAS_PEDANTIC_MATH is set, so no TF32).
+// HISTORICAL BUG (fixed): enabling cuBLAS used to collapse the Born-rule LM to the unigram
+// loss under rope=true. The cause was NOT summation order -- it was a pointer-offset bug in
+// tw_gemm_{forward,backward}: L and outlen were hoisted from entry 0, but Q, K, V are grouped
+// into ONE batched TokenwiseLinearGpu mapping with DIFFERENT out_length_ per entry when
+// rope=true (Q,K feed RotaryEmbed, out_length N*d; V feeds the BornAttention [Q;K;V] concat,
+// out_length 3*N*d). Using entry 0's (Q's) outlen for V's writes/reads corrupted the [Q;K;V]
+// buffer -- overwriting Im(Q) with Im(V) in the forward and misreading V's gradient segments
+// in the backward -- which destroyed content-based routing while the lone output head learned
+// the position-independent unigram marginal. (The element-wise kernels index per mapping entry,
+// so they, rope=false, and single-layer unit tests were all fine.) Fixed by computing L/outlen
+// per batch entry inside the loop (below). With the fix, -tw_cublas true trains identically to
+// the element-wise path (char WikiText escapes the unigram floor and descends normally, 3.22 ->
+// 2.19 by step 1200) at ~3x throughput. Default OFF only because the batched-GEMM pointer pool
+// still issues a per-step cudaMemcpy (not CUDA-graph capturable); enable it for faster non-graph
+// training.
 FLAG_BOOL(tw_cublas, false)
 
 // When set, the Linear layer uses the direct shared-memory GEMV kernels
@@ -1332,9 +1336,11 @@ void tw_free_pool(float **&pool, int &cap) {
 void tw_gemm_forward(int N, int e_in, int e_out,
 		const std::vector<GpuInVar> &in_, const std::vector<GpuOutVar> &out_, float **pool) {
 	const int B = (int) in_.size();
-	const int L = in_[0].input_length_, wbase = N * e_in, outlen = out_[0].out_length_;
+	const int wbase = N * e_in;
 	std::vector<float*> hp((size_t) 6 * B, nullptr);
 	for (int b = 0; b < B; ++b) {
+		const int L = in_[b].input_length_;         // per-entry: Q/K/V share input len,
+		const int outlen = out_[b].out_length_;     // but out_length_ differs (V -> 3*N*d concat vs Q/K -> N*d under rope)
 		float *base = in_[b].input_ptr_, *ob = out_[b].out_ptr_;
 		hp[0*B+b]=base;         hp[1*B+b]=base+L;
 		hp[2*B+b]=base+wbase;   hp[3*B+b]=base+L+wbase;
