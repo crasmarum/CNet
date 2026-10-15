@@ -89,6 +89,7 @@ FLAG_STRING(save_path, "")  // if set, rank 0 saves the trained model here after
 FLAG_BOOL(generate, false)  // generation mode: restore -model and sample text (no training)
 FLAG_BOOL(eval_loss, false) // eval mode: restore -model, report exact-Born held-out loss
 FLAG_STRING(model, "")      // model file to restore in -generate mode
+FLAG_STRING(init_model, "") // warm-restart: restore these weights before training (continue a checkpoint)
 FLAG_STRING(prompt, "ROMEO:")// seed text for generation
 FLAG_INT(gen_len, 600)      // number of characters to generate
 FLAG_BOOL(gen_gpu, false)   // generate using the GPU forward (fast Bluestein mixer) instead of CPU
@@ -422,32 +423,48 @@ int main(int argc, char **argv) {
 				  << "  chance=ln(vocab)=" << std::log((double) vocab) << std::endl;
 
 	CNet net;
-	int embId = net.cpuNet().add(new CEmbedding(E, N, vocab));
-	int ceId  = buildLM(net.cpuNet(), embId, E, N, L, vocab);
-	((CEmbedding*) net.cpuNet()[embId])->setIsMainInput(true);
-	((SequenceCrossEntropy*) net.cpuNet()[ceId])->setIsMainOutput(true);
-	((SequenceCrossEntropy*) net.cpuNet()[ceId])->setEps(ce_eps);  // 0 = exact Born
-	((SequenceCrossEntropy*) net.cpuNet()[ceId])->setSmooth(ce_smooth);  // Laplace-smoothed Born
-	net.cpuNet().init_inputs(1234);                // identical init on every rank
-	// Optional symmetry-breaking embedding init: zero-mean complex (real AND imag
-	// random), giving DISTINCT per-token embeddings so the model does not start
-	// pinned at the unigram saddle. The default CEmbedding init biases every
-	// component to a common +imag direction (tokens cluster), which makes escaping
-	// the unigram saddle numerically knife-edge (cuBLAS vs element-wise rounding
-	// then decides it). Deterministic across ranks (fixed seed).
-	if (emb_gauss) {
-		CEmbedding *e0 = (CEmbedding*) net.cpuNet()[embId];
-		std::mt19937 er(98765);
-		std::uniform_real_distribution<float> U(-1.f, 1.f);
-		float s = 1.f / std::sqrt((float) E);
-		for (int i = 0; i < e0->input().length_; ++i) {
-			e0->mutable_input()->real_[i] = U(er) * s;
-			e0->mutable_input()->imag_[i] = U(er) * s;
+	CEmbedding *em; SequenceCrossEntropy *seq;
+	if (!((std::string) init_model).empty()) {
+		// Warm-restart: restore() REBUILDS the net (layers + weights) from the checkpoint, so we
+		// skip buildLM/init_inputs here. Only weights are restored (not Adam moments / LR), so
+		// expect a brief re-warm bump. Architecture flags must match the checkpoint.
+		if (!net.restore((std::string) init_model)) {
+			std::cerr << "rank " << R << ": cannot restore -init_model " << (std::string) init_model << "\n";
+			return 1;
 		}
+		em  = (CEmbedding*) net.cpuNet().findFirstOfType(isEmbedding);
+		seq = (SequenceCrossEntropy*) net.cpuNet().findFirstOfType(isSeqCrossEntropy);
+		if (!em || !seq) { std::cerr << "rank " << R << ": -init_model missing embedding/seq head\n"; return 1; }
+		em->setIsMainInput(true);
+		seq->setIsMainOutput(true);
+		seq->setEps(ce_eps);
+		seq->setSmooth(ce_smooth);
+		if (R == 0) std::cout << "[resume] restored weights from " << (std::string) init_model << "\n";
+	} else {
+		int embId = net.cpuNet().add(new CEmbedding(E, N, vocab));
+		int ceId  = buildLM(net.cpuNet(), embId, E, N, L, vocab);
+		((CEmbedding*) net.cpuNet()[embId])->setIsMainInput(true);
+		((SequenceCrossEntropy*) net.cpuNet()[ceId])->setIsMainOutput(true);
+		((SequenceCrossEntropy*) net.cpuNet()[ceId])->setEps(ce_eps);  // 0 = exact Born
+		((SequenceCrossEntropy*) net.cpuNet()[ceId])->setSmooth(ce_smooth);  // Laplace-smoothed Born
+		net.cpuNet().init_inputs(1234);                // identical init on every rank
+		// Optional symmetry-breaking embedding init: zero-mean complex (real AND imag
+		// random), giving DISTINCT per-token embeddings so the model does not start pinned at
+		// the unigram saddle. Deterministic across ranks (fixed seed).
+		if (emb_gauss) {
+			CEmbedding *e0 = (CEmbedding*) net.cpuNet()[embId];
+			std::mt19937 er(98765);
+			std::uniform_real_distribution<float> U(-1.f, 1.f);
+			float s = 1.f / std::sqrt((float) E);
+			for (int i = 0; i < e0->input().length_; ++i) {
+				e0->mutable_input()->real_[i] = U(er) * s;
+				e0->mutable_input()->imag_[i] = U(er) * s;
+			}
+		}
+		em  = (CEmbedding*) net.cpuNet()[embId];
+		seq = (SequenceCrossEntropy*) net.cpuNet()[ceId];
 	}
 	net.allocateOnGpu(per);
-	CEmbedding *em = (CEmbedding*) net.cpuNet()[embId];
-	SequenceCrossEntropy *seq = (SequenceCrossEntropy*) net.cpuNet()[ceId];
 
 	// Ancestor-gradient buffers coalesced into one scratch -> a single all-reduce.
 	auto gradBufs = net.ancestorGradBuffers();
