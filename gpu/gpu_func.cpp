@@ -27,6 +27,8 @@ int getMaxNoThread() {
 // dedicated capture stream and flips g_cnet_capturing while recording.
 cudaStream_t g_cnet_stream = 0;
 bool         g_cnet_capturing = false;
+bool         g_cnet_nosync = false;
+bool         g_cnet_tf32 = false;
 #endif
 
 #ifdef __CUDACC__

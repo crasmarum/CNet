@@ -235,6 +235,7 @@ class BornAttentionGpu : public GpuMapping {
 	// M [2][d2][dh] and Z [d2], and the per-chunk-start snapshots Mhist/Zhist for the backward.
 	float *lin_cQ_ = NULL, *lin_cK_ = NULL, *lin_U_ = NULL, *lin_num_ = NULL, *lin_den_ = NULL;
 	float *lin_M_ = NULL, *lin_Z_ = NULL, *lin_Mhist_ = NULL, *lin_Zhist_ = NULL, *lin_ones_ = NULL;
+	float *lin_Qp_ = NULL, *lin_Kp_ = NULL, *lin_Cr_ = NULL;   // GEMM forward: raw Q/K planes [bh][2][C][dh], scores [bh][2][C][C]
 	float *lin_cKw_ = NULL, *lin_cQd_ = NULL;   // decay: keys lifted then weighted by gamma^(C-1-j), queries by gamma^(i+1)
 	int *lin_idx_ = NULL;   // feature a -> (m, n) pair table, 2*d2 ints
 	// backward scratch (see gpu_born_linear_backward): packed output grads / values per chunk,

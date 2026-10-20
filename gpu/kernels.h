@@ -1,6 +1,53 @@
 #ifndef GPU_GPURELU_H_
 #define GPU_GPURELU_H_
 
+#ifndef CNET_LAYER_PROFILER_DEFINED
+#define CNET_LAYER_PROFILER_DEFINED
+#include <map>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+// ---- optional per-layer GPU profiler (off by default; enabled by the trainer's -profile_steps) ----
+// Records CUDA events around every mapping's forward and backward and accumulates elapsed time by
+// layer type (the CPU function name with its numeric uid suffix stripped). The events force a host
+// wait per layer, so the absolute step time while profiling is a little higher than without.
+struct CnetLayerProfiler {
+	bool on = false;
+	std::map<std::string, double> fwd_ms, bwd_ms;
+	std::map<std::string, long> fwd_n, bwd_n;
+	double grad_ms = 0;
+	std::map<std::string, double> sub_ms;   // optional sub-sections recorded inside a layer (not in TOTAL)
+	static std::string typeOf(const std::string &name) {
+		size_t e = name.size();
+		while (e > 0 && (isdigit((unsigned char) name[e - 1]) || name[e - 1] == '_' || name[e - 1] == ' ')) --e;
+		return name.substr(0, e);
+	}
+	void reset() { fwd_ms.clear(); bwd_ms.clear(); fwd_n.clear(); bwd_n.clear(); grad_ms = 0; sub_ms.clear(); }
+	void print(int steps) const {
+		std::map<std::string, double> tot;
+		double T = grad_ms;
+		for (auto &kv : fwd_ms) { tot[kv.first] += kv.second; T += kv.second; }
+		for (auto &kv : bwd_ms) { tot[kv.first] += kv.second; T += kv.second; }
+		std::vector<std::pair<double, std::string>> order;
+		for (auto &kv : tot) order.push_back({kv.second, kv.first});
+		std::sort(order.rbegin(), order.rend());
+		printf("PROFILE per step over %d steps (ms): layer type | forward | backward | total | share\n", steps);
+		for (auto &o : order) {
+			const std::string &k = o.second;
+			double f = fwd_ms.count(k) ? fwd_ms.at(k) : 0, b = bwd_ms.count(k) ? bwd_ms.at(k) : 0;
+			printf("PROFILE %-28s %9.2f %9.2f %9.2f %5.1f%%\n", k.c_str(), f / steps, b / steps, (f + b) / steps, 100.0 * (f + b) / T);
+		}
+		printf("PROFILE %-28s %9s %9s %9.2f %5.1f%%\n", "grad from clones", "", "", grad_ms / steps, 100.0 * grad_ms / T);
+		printf("PROFILE %-28s %9s %9s %9.2f\n", "TOTAL (layers + grad)", "", "", T / steps);
+		for (auto &kv : sub_ms) printf("SUBSECTION %-40s %9.2f\n", kv.first.c_str(), kv.second / steps);
+	}
+};
+inline CnetLayerProfiler &cnetProfiler() { static CnetLayerProfiler p; return p; }
+#endif
+
+
 #include "gpumapping.h"
 #include "compl.h"
 #include "../utils/stopwatch.h"
@@ -21,6 +68,13 @@
 // (a device-wide barrier after every launch).
 extern cudaStream_t g_cnet_stream;
 extern bool         g_cnet_capturing;
+// When true, eager-mode CNET_KSYNC only checks for launch errors and does not block the host:
+// kernels on one stream already run in order, and every host read of device memory synchronizes
+// on its own (cudaMemcpy). Off by default; dp_shakespeare -ksync false turns it on.
+extern bool         g_cnet_nosync;
+// When true, the shared cuBLAS handles use TF32 tensor cores (CUBLAS_TF32_TENSOR_OP_MATH) instead of
+// strict FP32 (CUBLAS_PEDANTIC_MATH). Must be set before the first GEMM; dp_shakespeare -tf32 true.
+extern bool         g_cnet_tf32;
 #define CUDA(x, y, z) <<< x, y, z, g_cnet_stream >>>
 #define CUDA2(x, y) <<< x, y, 0, g_cnet_stream >>>
 
@@ -40,7 +94,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 #define CNET_KSYNC() do { \
     if (!g_cnet_capturing) { \
         gpuErrchk(cudaPeekAtLastError()); \
-        gpuErrchk(cudaStreamSynchronize(g_cnet_stream)); \
+        if (!g_cnet_nosync) gpuErrchk(cudaStreamSynchronize(g_cnet_stream)); \
     } \
 } while (0)
 

@@ -33,7 +33,12 @@ ifeq ($(NVCC_TEST),nvcc)
     # -MMD -MP: emit a .d file per object listing the headers it includes, so
     # header edits trigger the right recompiles (-MP adds phony header targets
     # so a removed header doesn't break the build).
-    CXXFLAGS = -x cu -std=c++11 -Xcompiler -fopenmp -O2 -MMD -MP --default-stream per-thread
+    # Native code for Ampere (A100, sm_80) and Hopper (H100/H200/GH200, sm_90), plus compute_90 PTX
+    # that newer GPUs JIT-compile. Without -gencode nvcc emits only sm_52 (Maxwell) code, which the
+    # driver JIT-compiles at startup and which cannot use any post-Maxwell instruction. Override with
+    # e.g. `make GPU_ARCH="-gencode arch=compute_100,code=sm_100"` for Blackwell.
+    GPU_ARCH ?= -gencode arch=compute_80,code=sm_80 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_90,code=compute_90
+    CXXFLAGS = -x cu -std=c++11 -Xcompiler -fopenmp -O2 -MMD -MP --default-stream per-thread $(GPU_ARCH)
     LDFLAGS = -lgomp -lcufft -lcublas # OpenMP + cuFFT + cuBLAS (TokenwiseLinear GEMMs).
     # NCCL is only needed by code that does multi-GPU all-reduce. The dp_shakespeare
     # example links it directly; MAINLIBS adds it to the dev main (gpu_tests.h uses
@@ -233,6 +238,9 @@ clean:
 	@echo "==> Cleanup complete."
 
 # Pull in the generated header dependencies (silently absent on a fresh build).
--include $(DEPS)
+# Every object's .d file (the framework sources AND the example / test programs, which DEPS above
+# does not list): without them an example object is not rebuilt when a header it includes changes,
+# and a class layout change then corrupts memory at run time.
+-include $(DEPS) $(wildcard $(OBJ_DIR)/*.d)
 
 

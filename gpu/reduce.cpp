@@ -801,6 +801,76 @@ __global__ void gpu_born_chunk_forward__(GpuInVar *in, GpuOutVar *out,
 	}
 }
 
+
+// ---- GEMM form of the linear-mode forward chunk step (same outputs as gpu_born_chunk_forward__) ----
+// raw Q and K planes of the chunk: P[bh][2][C][dh]; offset 0 for Q, N*d for K
+__global__ void gpu_born_packqk__(GpuInVar *in, float *Qp, float *Kp, int c0, int C, int N, int d, int H, int B) {
+	size_t tid = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+	const int dh = d / H;
+	if (tid >= (size_t) B * H * 2 * C * dh) return;
+	int j = (int) (tid % dh); size_t r = tid / dh;
+	int t = (int) (r % C); r /= C;
+	int pl = (int) (r % 2); r /= 2;
+	int h = (int) (r % H); int clone = (int) (r / H);
+	GpuInVar inv = in[clone];
+	const int p = (c0 + t) * d + h * dh + j;
+	const float *base = inv.input_ptr_ + (pl ? inv.input_length_ : 0);
+	Qp[tid] = base[p];
+	Kp[tid] = base[N * d + p];
+}
+// Cr holds <q_k, k_m> planar; write the complex score into Cs (zero above the diagonal) and the
+// unnormalized weight |c|^2 gamma^(k-m) into A. One thread per (bh, k, m), m fastest.
+__global__ void gpu_born_fwd_ew__(const float *Cr, cmplx_ *Cs, float *A, int c0, int C, int N, int H, int BH, int decay) {
+	size_t tid = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= (size_t) BH * C * C) return;
+	const int m = (int) (tid % C); size_t r = tid / C;
+	const int kc = (int) (r % C); const size_t bh = r / C;
+	const size_t cb = (bh * N + c0 + kc) * C + m;
+	if (m > kc) { Cs[cb] = cmplx(0.f, 0.f); A[cb] = 0.f; return; }
+	const size_t pr = (bh * 2 + 0) * C * C + (size_t) kc * C + m, pi = pr + (size_t) C * C;
+	const cmplx_ c = cmplx(Cr[pr], Cr[pi]);
+	Cs[cb] = c;
+	float sc = c.real * c.real + c.imag * c.imag;
+	if (decay) sc *= powf(born_gamma__((int) (bh % H), decay), (float) (kc - m));
+	A[cb] = sc;
+}
+// one warp per (bh, k): S_k = sum_m A + den; normalize the row of A and the inter-chunk numerator
+__global__ void gpu_born_fwd_rownorm__(float *A, float *S, float *num, const float *den, int c0, int C, int N, int dh, int BH, float eps) {
+	const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
+	if (row >= BH * C) return;
+	const int kc = row % C; const size_t bh = row / C;
+	float *Ar = A + (bh * N + c0 + kc) * C;
+	float part = 0.f;
+	for (int m = lane; m <= kc; m += 32) part += Ar[m];
+	for (int o = 16; o > 0; o >>= 1) part += __shfl_xor_sync(0xffffffffu, part, o);
+	const float Sk = part + den[bh * C + kc];
+	const float denomF = Sk + eps, invS = denomF > 0.f ? 1.f / denomF : 0.f;
+	if (lane == 0) S[bh * N + c0 + kc] = Sk;
+	for (int m = lane; m <= kc; m += 32) Ar[m] *= invS;
+	float *nr = num + ((bh * 2 + 0) * C + kc) * dh, *ni = num + ((bh * 2 + 1) * C + kc) * dh;
+	for (int j = lane; j < dh; j += 32) { nr[j] *= invS; ni[j] *= invS; }
+}
+// write the chunk output planes O[bh][2][C][dh] into the layer output
+__global__ void gpu_born_out_scatter__(GpuOutVar *out, const float *O, int c0, int C, int d, int H, int B) {
+	size_t tid = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+	const int dh = d / H;
+	if (tid >= (size_t) B * H * C * dh) return;
+	int j = (int) (tid % dh); size_t r = tid / dh;
+	int t = (int) (r % C); r /= C;
+	int h = (int) (r % H); int clone = (int) (r / H);
+	const size_t bh = (size_t) clone * H + h;
+	GpuOutVar ov = out[clone];
+	const int p = (c0 + t) * d + h * dh + j;
+	ov.out_ptr_[p] = O[((bh * 2 + 0) * C + t) * dh + j];
+	ov.out_ptr_[ov.out_length_ + p] = O[((bh * 2 + 1) * C + t) * dh + j];
+}
+// row-major Z[n x m] = alpha op(X)[n x k] op(Y)[k x m] + beta Z, batched (cuBLAS column-major via transposes)
+static void born_rm_gemm(cublasHandle_t hb, bool tX, bool tY, int n, int m, int k, float alpha,
+		const float *X, int ldX, long long sX, const float *Y, int ldY, long long sY, float beta, float *Z, int ldZ, long long sZ, int batch) {
+	cublasSgemmStridedBatched(hb, tY ? CUBLAS_OP_T : CUBLAS_OP_N, tX ? CUBLAS_OP_T : CUBLAS_OP_N, m, n, k, &alpha,
+		Y, ldY, sY, X, ldX, sX, &beta, Z, ldZ, sZ, batch);
+}
+
 void BornAttentionGpu::ensure_linear_scratch(int N, int d, int H, int C, int B) {
 #ifdef __CUDACC__
 	const int dh = d / H, d2 = dh * dh, NC = N / C;
@@ -822,6 +892,9 @@ void BornAttentionGpu::ensure_linear_scratch(int N, int d, int H, int C, int B) 
 	gpuErrchk(cudaMalloc((void**) &lin_Mhist_, sizeof(float) * (size_t) NC * BH * 2 * d2 * dh));
 	gpuErrchk(cudaMalloc((void**) &lin_Zhist_, sizeof(float) * (size_t) NC * BH * d2));
 	gpuErrchk(cudaMalloc((void**) &lin_ones_,  sizeof(float) * C));
+	gpuErrchk(cudaMalloc((void**) &lin_Qp_,    sizeof(float) * BH * 2 * C * dh));
+	gpuErrchk(cudaMalloc((void**) &lin_Kp_,    sizeof(float) * BH * 2 * C * dh));
+	gpuErrchk(cudaMalloc((void**) &lin_Cr_,    sizeof(float) * BH * 2 * C * C));
 	gpuErrchk(cudaMalloc((void**) &lin_cKw_,   sizeof(float) * BH * C * d2));
 	gpuErrchk(cudaMalloc((void**) &lin_cQd_,   sizeof(float) * BH * C * d2));
 	gpuErrchk(cudaMalloc((void**) &lin_idx_,   sizeof(int) * 2 * d2));
@@ -850,7 +923,7 @@ void BornAttentionGpu::ensure_linear_scratch(int N, int d, int H, int C, int B) 
 
 void BornAttentionGpu::free_linear_scratch() {
 #ifdef __CUDACC__
-	float **ps[] = {&lin_cQ_, &lin_cK_, &lin_U_, &lin_num_, &lin_den_, &lin_M_, &lin_Z_, &lin_Mhist_, &lin_Zhist_, &lin_ones_, &lin_cKw_, &lin_cQd_, &carry_M_, &carry_Z_,
+	float **ps[] = {&lin_cQ_, &lin_cK_, &lin_U_, &lin_num_, &lin_den_, &lin_M_, &lin_Z_, &lin_Mhist_, &lin_Zhist_, &lin_ones_, &lin_cKw_, &lin_cQd_, &lin_Qp_, &lin_Kp_, &lin_Cr_, &carry_M_, &carry_Z_,
 		&bw_Gm_, &bw_Gt_, &bw_Ut_, &bw_Ug_, &bw_G4_, &bw_Am_, &bw_Bm_, &bw_W_, &bw_Gq_, &bw_Gk_, &bw_cQs_,
 		&bw_dV_, &bw_abar_, &bw_abarD_, &bw_Ms_, &bw_Zs_};
 	for (float **p : ps) if (*p) { cudaFree(*p); *p = NULL; }
@@ -911,8 +984,26 @@ void BornAttentionGpu::gpu_born_linear_forward() {
 		cublasSgemmStridedBatched(hb, CUBLAS_OP_N, CUBLAS_OP_N, 1, C, d2, &one,
 			lin_Z_, 1, (long long) d2, cQr, d2, (long long) C * d2, &zero,
 			lin_den_, 1, (long long) C, (int) BH);
-		gpu_born_chunk_forward__ CUDA2((unsigned) ((nChunk + tb - 1) / tb), tb) (gpu_in_ptr_, gpu_out_ptr_,
-			ba_c_, ba_A_, ba_S_, lin_num_, lin_den_, c0, C, N, d, H, B, f->eps(), decay);
+		{	// intra-chunk step as GEMMs: scores, mask/decay, row normalization, weights x values
+			const size_t nSq = BH * C * C, nQK = BH * 2 * C * dh;
+			gpu_born_packqk__ CUDA2((unsigned) ((nQK + tb - 1) / tb), tb) (gpu_in_ptr_, lin_Qp_, lin_Kp_, c0, C, N, d, H, B);
+			const float *Qr = lin_Qp_, *Qi = lin_Qp_ + (size_t) C * dh, *Kr = lin_Kp_, *Ki = lin_Kp_ + (size_t) C * dh;
+			float *Cr = lin_Cr_, *Ci = lin_Cr_ + (size_t) C * C;
+			const long long sP = 2LL * C * dh, sS = 2LL * C * C;
+			// <q,k> = Q conj(K)^T:  Re = Qr Kr^T + Qi Ki^T,  Im = Qi Kr^T - Qr Ki^T
+			born_rm_gemm(hb, false, true, C, C, dh,  1.f, Qr, dh, sP, Kr, dh, sP, 0.f, Cr, C, sS, (int) BH);
+			born_rm_gemm(hb, false, true, C, C, dh,  1.f, Qi, dh, sP, Ki, dh, sP, 1.f, Cr, C, sS, (int) BH);
+			born_rm_gemm(hb, false, true, C, C, dh,  1.f, Qi, dh, sP, Kr, dh, sP, 0.f, Ci, C, sS, (int) BH);
+			born_rm_gemm(hb, false, true, C, C, dh, -1.f, Qr, dh, sP, Ki, dh, sP, 1.f, Ci, C, sS, (int) BH);
+			gpu_born_fwd_ew__ CUDA2((unsigned) ((nSq + 255) / 256), 256) (lin_Cr_, ba_c_, ba_A_, c0, C, N, H, (int) BH, decay);
+			gpu_born_fwd_rownorm__ CUDA2((unsigned) ((nChunk + 7) / 8), 256) (ba_A_, ba_S_, lin_num_, lin_den_, c0, C, N, dh, (int) BH, f->eps());
+			// O = num * invS + A V  (A real, V complex planes)
+			const float *Ab = ba_A_ + (size_t) c0 * C;
+			const long long sA = (long long) N * C;
+			for (int pl = 0; pl < 2; ++pl)
+				born_rm_gemm(hb, false, false, C, dh, C, 1.f, Ab, C, sA, lin_U_ + (size_t) pl * C * dh, dh, sP, 1.f, lin_num_ + (size_t) pl * C * dh, dh, sP, (int) BH);
+			gpu_born_out_scatter__ CUDA2((unsigned) ((BH * C * dh + tb - 1) / tb), tb) (gpu_out_ptr_, lin_num_, c0, C, d, H, B);
+		}
 		// advance the state with this chunk's keys/values: M <- gamma^C M + cKw^T U ; Z <- gamma^C Z + cKw^T 1
 		if (decay) {
 			gpu_born_scale_bh__ CUDA2((unsigned) ((BH * 2 * d2 * dh + tb - 1) / tb), tb) (lin_M_, (size_t) 2 * d2 * dh, (int) BH, H, C);
@@ -1076,6 +1167,63 @@ __global__ void gpu_born_bw_v__(GpuInVar *in, const float *dV, int c0, int C, in
 	atomicAdd(dZ_star_imag_(inv, p), dv[3 * dh + m]);
 }
 
+// Warp-per-token form of gpu_born_bw_q__ (mode 0) and gpu_born_bw_k__ (mode 1): the packed Hermitian
+// Gamma is never materialized per thread. Each warp holds x (the token's Q or K) and y = Gamma x in
+// shared memory; lanes walk consecutive packed entries a (coalesced reads of the source rows) and
+// compute G[a] on the fly:  mode 0: G = Gq + (W - abar Zc0) invD;  mode 1: G = Gk - wj Zs.
+// 8 warps (tokens) per block; dh <= 64.
+__global__ void gpu_born_bw_qk_warp__(GpuInVar *in, const float *Gx, const float *W, const float *Z,
+		const float *S, const float *abar, const int *idx, int c0, int C, int N, int d, int H, int B, float eps, int decay, int mode) {
+	__shared__ float xs[8][2][64], ys[8][2][64];
+	const int w = threadIdx.x / 32, lane = threadIdx.x % 32;
+	const int tok = blockIdx.x * 8 + w;
+	const bool live = tok < B * H * C;
+	const int kc = live ? tok % C : 0, r = live ? tok / C : 0, h = r % H, clone = r / H;
+	const int dh = d / H, d2 = dh * dh, T = dh * (dh - 1) / 2;
+	const size_t bh = (size_t) clone * H + h;
+	float cst = 0.f, scale = 1.f;   // G[a] = gx[a] + scale * (w[a] - cst * z[a])
+	if (live) {
+		if (mode == 0) {
+			const float D = S[bh * N + c0 + kc] + eps;
+			scale = (D > 0.f ? 1.f / D : 0.f) * (decay ? powf(born_gamma__(h, 1), (float) (kc + 1)) : 1.f);
+			cst = abar[bh * C + kc];
+		} else {
+			scale = -(decay ? powf(born_gamma__(h, 1), (float) (C - 1 - kc)) : 1.f);   // - wj * Zs
+			cst = 0.f;
+		}
+	}
+	const int base = mode == 0 ? (c0 + kc) * d + h * dh : N * d + (c0 + kc) * d + h * dh;
+	GpuInVar inv = in[live ? clone : 0];
+	const float *gx = Gx + (bh * C + kc) * d2;
+	const float *wr = mode == 0 ? W + (bh * C + kc) * d2 : nullptr;
+	const float *zr = Z + bh * d2;
+	#define GVAL(a) (gx[a] + scale * ((mode == 0 ? wr[a] : 0.f) - (mode == 0 ? cst * zr[a] : -zr[a])))
+	if (live) for (int m = lane; m < dh; m += 32) {
+		cmplx_ x = Z_(inv, base + m);
+		xs[w][0][m] = x.real; xs[w][1][m] = x.imag;
+		const float g = GVAL(m);
+		ys[w][0][m] = g * x.real; ys[w][1][m] = g * x.imag;
+	}
+	__syncwarp();
+	const float r2 = 0.70710678118f;
+	if (live) for (int q = lane; q < T; q += 32) {
+		const int m = idx[2 * (dh + q)], n = idx[2 * (dh + q) + 1];
+		const float gr = GVAL(dh + q) * r2, gi = GVAL(dh + T + q) * r2;   // Gamma_mn = gr + i gi
+		const float xnr = xs[w][0][n], xni = xs[w][1][n], xmr = xs[w][0][m], xmi = xs[w][1][m];
+		atomicAdd(&ys[w][0][m], gr * xnr - gi * xni); atomicAdd(&ys[w][1][m], gr * xni + gi * xnr);   // y_m += g x_n
+		atomicAdd(&ys[w][0][n], gr * xmr + gi * xmi); atomicAdd(&ys[w][1][n], gr * xmi - gi * xmr);   // y_n += conj(g) x_m
+	}
+	#undef GVAL
+	__syncwarp();
+	if (live) for (int m = lane; m < dh; m += 32) {
+		const float yr = ys[w][0][m], yi = ys[w][1][m];
+		atomicAdd(dZ_star_real_(inv, base + m), yr);
+		atomicAdd(dZ_star_imag_(inv, base + m), yi);
+		atomicAdd(dZ_real_(inv, base + m), yr);
+		atomicAdd(dZ_imag_(inv, base + m), -yi);
+	}
+}
+
 void BornAttentionGpu::gpu_born_linear_backward() {
 #ifdef __CUDACC__
 	BornAttention *f = (BornAttention*) cpu_func_.front();
@@ -1123,8 +1271,8 @@ void BornAttentionGpu::gpu_born_linear_backward() {
 		cublasSgemmStridedBatched(hb, CUBLAS_OP_N, CUBLAS_OP_N, d2, C, C, &one,
 			lin_cK_, d2, (long long) C * d2, bw_Bm_, C, (long long) C * C, &zero,
 			bw_Gq_, d2, (long long) C * d2, (int) BH);
-		gpu_born_bw_q__ CUDA2((unsigned) ((nTok + tb - 1) / tb), tb) (gpu_in_ptr_, bw_Gq_, bw_W_, Zc0, ba_S_, bw_abar_,
-			lin_idx_, c0, C, N, d, H, B, eps, decay);
+		gpu_born_bw_qk_warp__ CUDA2((unsigned) ((nTok + 7) / 8), 256) (gpu_in_ptr_, bw_Gq_, bw_W_, Zc0, ba_S_, bw_abar_,
+			lin_idx_, c0, C, N, d, H, B, eps, decay, 0);
 		// Gk[j][a] = sum_k Bm[k][j] cQ[k][a]  +  sum_p Ug[j][p] Ms[a][p]
 		cublasSgemmStridedBatched(hb, CUBLAS_OP_N, CUBLAS_OP_T, d2, C, C, &one,
 			lin_cQ_, d2, (long long) C * d2, bw_Bm_, C, (long long) C * C, &zero,
@@ -1132,7 +1280,8 @@ void BornAttentionGpu::gpu_born_linear_backward() {
 		cublasSgemmStridedBatched(hb, CUBLAS_OP_T, CUBLAS_OP_N, d2, C, 4 * dh, &one,
 			bw_Ms_, 4 * dh, (long long) d2 * 4 * dh, bw_Ug_, 4 * dh, (long long) C * 4 * dh, &one,
 			bw_Gk_, d2, (long long) C * d2, (int) BH);
-		gpu_born_bw_k__ CUDA2((unsigned) ((nTok + tb - 1) / tb), tb) (gpu_in_ptr_, bw_Gk_, bw_Zs_, lin_idx_, c0, C, N, d, H, B, decay);
+		gpu_born_bw_qk_warp__ CUDA2((unsigned) ((nTok + 7) / 8), 256) (gpu_in_ptr_, bw_Gk_, nullptr, bw_Zs_, ba_S_, bw_abar_,
+			lin_idx_, c0, C, N, d, H, B, eps, decay, 1);
 		// dV[j][p] = sum_k A[k][j] G4[k][p]  +  sum_a cK[j][a] Ms[a][p]
 		cublasSgemmStridedBatched(hb, CUBLAS_OP_N, CUBLAS_OP_T, 4 * dh, C, C, &one,
 			bw_G4_, 4 * dh, (long long) C * 4 * dh, Ablk, C, (long long) N * C, &zero,
@@ -1825,7 +1974,7 @@ cublasHandle_t tw_blas_handle() {
 		// SGEMM, whose ~10-bit mantissa is too coarse near the Born-loss unigram
 		// saddle and leaves training stuck at chance. The element-wise fallback uses
 		// full FP32; match it so the cuBLAS speedup does not cost correctness.
-		cublasSetMathMode(h, CUBLAS_PEDANTIC_MATH);
+		cublasSetMathMode(h, g_cnet_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH);
 	}
 	return h;
 }

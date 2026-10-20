@@ -680,6 +680,8 @@ git clone https://github.com/crasmarum/CNet.git
 cd CNet
 make
 ```
+
+With nvcc the build emits native code for Ampere (`sm_80`, A100) and Hopper (`sm_90`, H100/H200/GH200) plus `compute_90` PTX that newer GPUs JIT-compile. Override the targets with `GPU_ARCH`, for example `make GPU_ARCH="-gencode arch=compute_100,code=sm_100"` for Blackwell. Example programs (`make dp_shakespeare`, `make generate`, `make radioml`, the tests) are rebuilt when any header they include changes; if a binary misbehaves after a large edit, `rm -rf build/obj` and rebuild.
 # Training on GPU
 
 If the  NVIDIA CUDA Compiler is found, the make file will automatically compile CNet with CUDA support. For example, once you
@@ -822,6 +824,33 @@ make generate
 ```
 
 `-check K` feeds the first `K` prompt tokens (`K` at most the model's context) through both paths and reports the largest difference between their next-token distributions. On a 4-block, 4-head model with a 512-token context, 300 characters take 2.6 s streaming against 101 s through the full-window path. Keep `-threads` (default 8) at or below the physical cores: the per-token layers are tiny and a parallel region per layer per token over a hundred threads is pure overhead. Models with a learned positional table are limited to their training context; when it runs out the generator re-prefills from the last $N/2$ characters, a sliding window amortised over $N/2$ tokens rather than paid per token.
+
+### Speed: precision, profiling, and what a step costs
+
+Three trainer flags matter for speed:
+
+| flag | effect |
+|---|---|
+| `-tw_cublas true` | token-wise layers through batched cuBLAS GEMMs instead of the reference kernel; always use it |
+| `-tf32 true` | TF32 tensor cores for the cuBLAS GEMMs (default strict FP32). About 1.6x faster per step, but on the PG-19 byte model it trails FP32 by 0.04 validation nats at equal steps over 1,500 steps (it is ahead at equal wall-clock time); opt in deliberately |
+| `-profile_steps N` | after 20 warm-up steps, time N steps per layer type (forward, backward, share) and per phase (batch, forward, loss, backward, gradient reduce, Adam), print the table and exit |
+
+`-ksync false` skips the host synchronization after every kernel; results are identical, and on the models measured it does not change the step time (the GPU is the bottleneck, not launches).
+
+```bash
+./dp_shakespeare -data pg19_train.txt -emb 256 -heads 4 -tokens 4096 -blocks 6 -batch 8 -steps 100 \
+    -rope true -pos_table false -token_norm true -tw_cublas true -fft_fast true -born_chunk 512 -gla true -profile_steps 10
+# PHASE / PROFILE / SUBSECTION lines
+```
+
+The attention layers compute their within-chunk part with cuBLAS GEMMs (scores, decay and causal mask applied elementwise, then weights times values), so their cost no longer depends on per-thread register arrays. Measured on one H100 SXM, PG-19 byte model (E=256, 6 blocks, 4 heads, context 4096, batch 8), ms per training step:
+
+| mixer | FP32 | TF32 |
+|---|:--:|:--:|
+| gated complex mixer (`-gla true`) | 329 | 203 |
+| linear Born + decay (`-born true -born_linear true -born_decay true`) | 383 | 246 |
+
+In FP32 the token-wise layers are about 40% of the step: their backward runs 16 real GEMMs because CNet keeps both Wirtinger gradients.
 
 ### Large-window inference: scoring millions of bytes with a constant state
 

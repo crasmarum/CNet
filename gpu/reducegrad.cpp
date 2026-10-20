@@ -24,7 +24,7 @@ static cublasHandle_t twg_blas_handle() {
 		cublasCreate(&h);
 		cublasSetStream(h, cudaStreamPerThread);
 		cublasSetPointerMode(h, CUBLAS_POINTER_MODE_HOST);
-		cublasSetMathMode(h, CUBLAS_PEDANTIC_MATH);   // true FP32, no TF32 (see reduce.cpp)
+		cublasSetMathMode(h, g_cnet_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH);   // see reduce.cpp
 	}
 	return h;
 }

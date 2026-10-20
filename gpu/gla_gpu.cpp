@@ -68,27 +68,39 @@ __global__ void gla_pack__(GpuInVar *in, const float *L, float *Qs, float *Kt, f
 
 // one thread per (clone, head, i in chunk): intra-chunk amplitudes a_ij = s exp(L_i - L_j) <q_i,k_j>,
 // o_i = Oint_i + sum_j a_ij v_j
+// DHT > 0: head dimension known at compile time, so the per-thread arrays live in registers;
+// DHT == 0: generic fallback (arrays of GLA_MAX_DH, local memory).
+template <int DHT>
 __global__ void gla_intra_fwd__(GpuInVar *in, GpuOutVar *out, const float *L, const float *Oint,
 		int c0, int C, int N, int d, int H, int B, float s) {
 	int tid = blockIdx.x * blockDim.x + threadIdx.x;
 	if (tid >= B * H * C) return;
 	const int ic = tid % C, r = tid / C, h = r % H, clone = r / H;
-	const int i = c0 + ic, dh = d / H, d0 = h * dh, Mv = N * d;
+	const int dh = DHT > 0 ? DHT : d / H;
+	const int i = c0 + ic, d0 = h * dh, Mv = N * d;
 	const size_t bh = (size_t) clone * H + h;
 	GpuInVar inv = in[clone]; GpuOutVar ov = out[clone];
-	cmplx_ q[GLA_MAX_DH], o[GLA_MAX_DH];
-	for (int m = 0; m < dh; ++m) { q[m] = Z_(inv, i * d + d0 + m); o[m] = cmplx(0.f, 0.f); }
+	cmplx_ q[DHT > 0 ? DHT : GLA_MAX_DH], o[DHT > 0 ? DHT : GLA_MAX_DH];
+	
+		#pragma unroll
+		for (int m = 0; m < dh; ++m) { q[m] = Z_(inv, i * d + d0 + m); o[m] = cmplx(0.f, 0.f); }
 	const float Li = L[bh * N + i];
 	for (int jc = 0; jc <= ic; ++jc) {
 		const int j = c0 + jc;
 		cmplx_ c = cmplx(0.f, 0.f);
+		
+		#pragma unroll
 		for (int m = 0; m < dh; ++m) c = c + q[m] * conj_(Z_(inv, Mv + j * d + d0 + m));
 		const float w = s * expf(Li - L[bh * N + j]);
 		cmplx_ a = w * c;
+		
+		#pragma unroll
 		for (int v = 0; v < dh; ++v) o[v] = o[v] + a * Z_(inv, 2 * Mv + j * d + d0 + v);
 	}
 	const float *oir = Oint + ((bh * 2 + 0) * C + ic) * dh, *oii = Oint + ((bh * 2 + 1) * C + ic) * dh;
-	for (int v = 0; v < dh; ++v) {
+	
+		#pragma unroll
+		for (int v = 0; v < dh; ++v) {
 		ov.out_ptr_[i * d + d0 + v] = o[v].real + oir[v];
 		ov.out_ptr_[ov.out_length_ + i * d + d0 + v] = o[v].imag + oii[v];
 	}
@@ -121,25 +133,31 @@ __global__ void gla_pack_grad__(GpuOutVar *out, float *Gg, float *Gb, int c0, in
 
 // one thread per (clone, head, i in chunk): amplitudes A[i][j], weighted PW = p_ij s w_ij, PbW,
 // E[i][j] = Re(p a + pb conj a), eps_i = Re(g_i.Oint_i + gb_i.conj(Oint_i)); zeros above the diagonal
+template <int DHT>
 __global__ void gla_intra_bwd__(GpuInVar *in, const float *L, const float *Oint, const float *Gg, const float *Gb,
 		float *A, float *PW, float *PbW, float *E, float *eps_out,
 		int c0, int C, int N, int d, int H, int B, float s) {
 	int tid = blockIdx.x * blockDim.x + threadIdx.x;
 	if (tid >= B * H * C) return;
 	const int ic = tid % C, r = tid / C, h = r % H, clone = r / H;
-	const int i = c0 + ic, dh = d / H, d0 = h * dh, Mv = N * d;
+	const int dh = DHT > 0 ? DHT : d / H;
+	const int i = c0 + ic, d0 = h * dh, Mv = N * d;
 	const size_t bh = (size_t) clone * H + h;
 	GpuInVar inv = in[clone];
-	cmplx_ q[GLA_MAX_DH], g[GLA_MAX_DH], gb[GLA_MAX_DH];
+	cmplx_ q[DHT > 0 ? DHT : GLA_MAX_DH], g[DHT > 0 ? DHT : GLA_MAX_DH], gb[DHT > 0 ? DHT : GLA_MAX_DH];
 	const float *ggr = Gg + ((bh * 2 + 0) * C + ic) * dh, *ggi = Gg + ((bh * 2 + 1) * C + ic) * dh;
 	const float *gbr = Gb + ((bh * 2 + 0) * C + ic) * dh, *gbi = Gb + ((bh * 2 + 1) * C + ic) * dh;
-	for (int m = 0; m < dh; ++m) { q[m] = Z_(inv, i * d + d0 + m); g[m] = cmplx(ggr[m], ggi[m]); gb[m] = cmplx(gbr[m], gbi[m]); }
+	
+		#pragma unroll
+		for (int m = 0; m < dh; ++m) { q[m] = Z_(inv, i * d + d0 + m); g[m] = cmplx(ggr[m], ggi[m]); gb[m] = cmplx(gbr[m], gbi[m]); }
 	const float Li = L[bh * N + i];
 	const size_t row = (bh * C + ic) * C, pr = (bh * 2 + 0) * C * C + ic * C, pi = (bh * 2 + 1) * C * C + ic * C;
 	for (int jc = 0; jc < C; ++jc) {
 		if (jc > ic) { A[pr + jc] = A[pi + jc] = 0.f; PW[pr + jc] = PW[pi + jc] = 0.f; PbW[pr + jc] = PbW[pi + jc] = 0.f; E[row + jc] = 0.f; continue; }
 		const int j = c0 + jc;
 		cmplx_ c = cmplx(0.f, 0.f), p = cmplx(0.f, 0.f), pb = cmplx(0.f, 0.f);
+		
+		#pragma unroll
 		for (int m = 0; m < dh; ++m) {
 			cmplx_ v = Z_(inv, 2 * Mv + j * d + d0 + m);
 			c = c + q[m] * conj_(Z_(inv, Mv + j * d + d0 + m));
@@ -156,8 +174,78 @@ __global__ void gla_intra_bwd__(GpuInVar *in, const float *L, const float *Oint,
 	}
 	const float *oir = Oint + ((bh * 2 + 0) * C + ic) * dh, *oii = Oint + ((bh * 2 + 1) * C + ic) * dh;
 	float e = 0.f;
-	for (int v = 0; v < dh; ++v) { cmplx_ o = cmplx(oir[v], oii[v]); e += (g[v] * o).real + (gb[v] * conj_(o)).real; }
+	
+		#pragma unroll
+		for (int v = 0; v < dh; ++v) { cmplx_ o = cmplx(oir[v], oii[v]); e += (g[v] * o).real + (gb[v] * conj_(o)).real; }
 	eps_out[bh * C + ic] = e;
+}
+
+// GEMM form of gla_intra_bwd__ (same outputs). On entry A, PW, PbW hold the raw C x C products
+// <q_i,k_j> = Qr Kr^H, p_ij = Gg V^T, pb_ij = Gb V^H; this applies the causal mask and the decay
+// weight w_ij = s exp(L_i - L_j) and forms E_ij = Re(p a + pb conj a). One thread per (bh, i, j),
+// j fastest, so every access is coalesced.
+__global__ void gla_intra_bwd_ew__(const float *L, float *A, float *PW, float *PbW, float *E,
+		int c0, int C, int N, int BH, float s) {
+	size_t tid = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= (size_t) BH * C * C) return;
+	const int jc = (int) (tid % C); size_t r = tid / C;
+	const int ic = (int) (r % C); const size_t bh = r / C;
+	const size_t pr = (bh * 2 + 0) * C * C + (size_t) ic * C + jc, pi = pr + (size_t) C * C;
+	const size_t er = (bh * C + ic) * C + jc;
+	if (jc > ic) { A[pr] = A[pi] = 0.f; PW[pr] = PW[pi] = 0.f; PbW[pr] = PbW[pi] = 0.f; E[er] = 0.f; return; }
+	const float w = s * expf(L[bh * N + c0 + ic] - L[bh * N + c0 + jc]);
+	const cmplx_ a = cmplx(w * A[pr], w * A[pi]);
+	const cmplx_ pv = cmplx(PW[pr], PW[pi]), pb = cmplx(PbW[pr], PbW[pi]);
+	A[pr] = a.real; A[pi] = a.imag;
+	PW[pr] = w * pv.real; PW[pi] = w * pv.imag;
+	PbW[pr] = w * pb.real; PbW[pi] = w * pb.imag;
+	E[er] = (pv * a).real + (pb * conj_(a)).real;
+}
+
+// eps_i = Re sum_v (g_iv Oint_iv + gb_iv conj(Oint_iv)); one thread per (bh, i)
+__global__ void gla_eps__(const float *Gg, const float *Gb, const float *Oint, float *eps_out, int C, int dh, int BH) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= BH * C) return;
+	const int ic = tid % C, bh = tid / C;
+	const size_t r0 = ((size_t) bh * 2 + 0) * C * dh + (size_t) ic * dh, r1 = ((size_t) bh * 2 + 1) * C * dh + (size_t) ic * dh;
+	float e = 0.f;
+	for (int v = 0; v < dh; ++v) {
+		cmplx_ o = cmplx(Oint[r0 + v], Oint[r1 + v]), g = cmplx(Gg[r0 + v], Gg[r1 + v]), gb = cmplx(Gb[r0 + v], Gb[r1 + v]);
+		e += (g * o).real + (gb * conj_(o)).real;
+	}
+	eps_out[tid] = e;
+}
+
+// Same as gla_dc__, one block of 256 threads per bh with a shared-memory reduction.
+__global__ void gla_dc_block__(const float *G, const float *Gb, const float *S0, const float *L, float *Dc,
+		int c0, int C, int N, int dh, int BH, float s) {
+	const int bh = blockIdx.x;
+	if (bh >= BH) return;
+	const size_t base = (size_t) bh * 2 * dh * dh, n = (size_t) dh * dh;
+	float acc = 0.f;
+	for (size_t e = threadIdx.x; e < n; e += blockDim.x) {
+		cmplx_ g = cmplx(G[base + e], G[base + n + e]), gb = cmplx(Gb[base + e], Gb[base + n + e]), s0 = cmplx(S0[base + e], S0[base + n + e]);
+		acc += (g * s0).real + (gb * conj_(s0)).real;
+	}
+	__shared__ float red[256];
+	red[threadIdx.x] = acc; __syncthreads();
+	for (int w = blockDim.x / 2; w > 0; w >>= 1) { if ((int) threadIdx.x < w) red[threadIdx.x] += red[threadIdx.x + w]; __syncthreads(); }
+	if (threadIdx.x == 0) Dc[bh] = s * expf(L[(size_t) bh * N + c0 + C - 1]) * red[0];
+}
+
+// Same as gla_e_prefix__, one warp per row: each lane sums a contiguous segment, a shuffle scan
+// gives the exclusive offset of every segment, then each lane writes its segment's running sums.
+__global__ void gla_e_prefix_warp__(const float *E, float *Ecum, int C, int BH) {
+	const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
+	if (row >= BH * C) return;
+	const size_t base = (size_t) row * C;
+	const int seg = (C + 31) / 32, lo = lane * seg, hi = min(C, lo + seg);
+	float part = 0.f;
+	for (int u = lo; u < hi; ++u) part += E[base + u];
+	float incl = part;
+	for (int o = 1; o < 32; o <<= 1) { float v = __shfl_up_sync(0xffffffffu, incl, o); if (lane >= o) incl += v; }
+	float acc = incl - part;                                  // exclusive offset of this lane's segment
+	for (int u = lo; u < hi; ++u) { Ecum[base + u] = acc; acc += E[base + u]; }
 }
 
 // Ecum[k][u] = sum_{m<u} E[k][m]; one thread per (bh, k)
@@ -195,6 +283,35 @@ __global__ void gla_dc__(const float *G, const float *Gb, const float *S0, const
 		acc += (g * s0).real + (gb * conj_(s0)).real;
 	}
 	Dc[bh] = s * expf(L[(size_t) bh * N + c0 + C - 1]) * acc;
+}
+
+// GEMM form of the forward intra-chunk step: on entry A holds <q_i,k_j> = Qr Kr^H; apply the causal
+// mask and w_ij = s exp(L_i - L_j) in place. One thread per (bh, i, j), j fastest.
+__global__ void gla_intra_fwd_ew__(const float *L, float *A, int c0, int C, int N, int BH, float s) {
+	size_t tid = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= (size_t) BH * C * C) return;
+	const int jc = (int) (tid % C); size_t r = tid / C;
+	const int ic = (int) (r % C); const size_t bh = r / C;
+	const size_t pr = (bh * 2 + 0) * C * C + (size_t) ic * C + jc, pi = pr + (size_t) C * C;
+	if (jc > ic) { A[pr] = A[pi] = 0.f; return; }
+	const float w = s * expf(L[bh * N + c0 + ic] - L[bh * N + c0 + jc]);
+	A[pr] *= w; A[pi] *= w;
+}
+
+// write the chunk's output planes O[bh][2][C][dh] into the layer output, one thread per element
+__global__ void gla_out_scatter__(GpuOutVar *out, const float *O, int c0, int C, int d, int H, int B) {
+	size_t tid = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+	const int dh = d / H;
+	if (tid >= (size_t) B * H * C * dh) return;
+	int j = (int) (tid % dh); size_t r = tid / dh;
+	int t = (int) (r % C); r /= C;
+	int h = (int) (r % H); int clone = (int) (r / H);
+	const size_t bh = (size_t) clone * H + h;
+	GpuOutVar ov = out[clone];
+	const int p = (c0 + t) * d + h * dh + j;
+	const size_t o0 = ((bh * 2 + 0) * C + t) * dh + j, o1 = ((bh * 2 + 1) * C + t) * dh + j;
+	ov.out_ptr_[p] = O[o0];
+	ov.out_ptr_[ov.out_length_ + p] = O[o1];
 }
 
 // gate gradient per (bh, u in chunk): dlambda_u = sum_{k>=u} Ecum[k][u] + sum_{k>=u} eps_k + sum_{m<u} eta_m + D_c
@@ -270,6 +387,7 @@ static PlanesOut chunkO(float *p, int C, int dh) { return PlanesOut{p, p + (size
 static Planes stateP(const float *p, int dh) { return Planes{p, p + (size_t) dh * dh, dh, (long long) 2 * dh * dh}; }
 static PlanesOut stateO(float *p, int dh) { return PlanesOut{p, p + (size_t) dh * dh, dh, (long long) 2 * dh * dh}; }
 static Planes sqP(const float *p, int C) { return Planes{p, p + (size_t) C * C, C, (long long) 2 * C * C}; }
+static PlanesOut sqO(float *p, int C) { return PlanesOut{p, p + (size_t) C * C, C, (long long) 2 * C * C}; }
 
 #endif  // __CUDACC__
 
@@ -339,7 +457,14 @@ void GatedLinearAttentionGpu::gpu_gla_forward() {
 		gpuErrchk(cudaMemcpyAsync(gl_Shist_ + (size_t) c * state, gl_S_, sizeof(float) * state, cudaMemcpyDeviceToDevice, st));
 		// inter-chunk readout: Oint[C x dh] = s * Qs[C x dh] * S[dh x dh]   (o_i,v = s exp(L_i) sum_m q_im S[m,v])
 		cgemm(hb, false, false, false, false, C, dh, dh, s, chunkP(gl_Qs_, C, dh), stateP(gl_S_, dh), 0.f, chunkO(gl_Oint_, C, dh), (int) BH);
-		gla_intra_fwd__ CUDA2((unsigned) ((nTok + tb - 1) / tb), tb) (gpu_in_ptr_, gpu_out_ptr_, gl_L_, gl_Oint_, c0, C, N, d, H, B, s);
+		// intra-chunk as GEMMs: A = mask .* w .* (Qr Kr^H); O = Oint + A V; then write the output
+		cgemm(hb, false, false, true, true, C, C, dh, 1.f, chunkP(gl_Qr_, C, dh), chunkP(gl_Kr_, C, dh), 0.f, sqO(bw_A_, C), (int) BH);
+		{
+			const size_t nSq = BH * C * C;
+			gla_intra_fwd_ew__ CUDA2((unsigned) ((nSq + 255) / 256), 256) (gl_L_, bw_A_, c0, C, N, (int) BH, s);
+		}
+		cgemm(hb, false, false, false, false, C, dh, C, 1.f, sqP(bw_A_, C), chunkP(gl_V_, C, dh), 1.f, chunkO(gl_Oint_, C, dh), (int) BH);
+		gla_out_scatter__ CUDA2((unsigned) ((nPack + tb - 1) / tb), tb) (gpu_out_ptr_, gl_Oint_, c0, C, d, H, B);
 		// state: S <- exp(LC) S + Kt^H V
 		gla_scale_state__ CUDA2((unsigned) ((state + tb - 1) / tb), tb) (gl_S_, gl_L_, c0, C, N, dh, (int) BH);
 		cgemm(hb, true, true, false, false, dh, dh, C, 1.f, chunkP(gl_Kt_, C, dh), chunkP(gl_V_, C, dh), 1.f, stateO(gl_S_, dh), (int) BH);
@@ -374,44 +499,76 @@ void GatedLinearAttentionGpu::gpu_gla_backward() {
 	const size_t nPack = BH * C * dh, nTok = BH * C;
 	gpuErrchk(cudaMemsetAsync(bw_G_, 0, sizeof(float) * state, st));
 	gpuErrchk(cudaMemsetAsync(bw_Gbs_, 0, sizeof(float) * state, st));
+	// optional sub-section timing (trainer -profile_steps): event after each section, host waits
+	const bool prof = cnetProfiler().on && !g_cnet_capturing;
+	cudaEvent_t pe0 = nullptr, pe1 = nullptr;
+	if (prof) { cudaEventCreate(&pe0); cudaEventCreate(&pe1); cudaEventRecord(pe0, st); }
+	auto sec = [&](const char *name) {
+		if (!prof) return;
+		cudaEventRecord(pe1, st); cudaEventSynchronize(pe1);
+		float ms = 0; cudaEventElapsedTime(&ms, pe0, pe1);
+		cnetProfiler().sub_ms[std::string("GLA bwd: ") + name] += ms;
+		cudaEventRecord(pe0, st);
+	};
 	for (int c = NC - 1; c >= 0; --c) {
 		const int c0 = c * C;
 		const float *S0 = gl_Shist_ + (size_t) c * state;
 		gla_pack__ CUDA2((unsigned) ((nPack + tb - 1) / tb), tb) (gpu_in_ptr_, gl_L_, gl_Qs_, gl_Kt_, gl_Qr_, gl_Kr_, gl_V_, c0, C, N, d, H, B);
 		gla_pack_grad__ CUDA2((unsigned) ((nPack + tb - 1) / tb), tb) (gpu_out_ptr_, bw_Gg_, bw_Gb_, c0, C, d, H, B);
+		sec("pack");
 		// Oint (forward's inter readout, for the gate term eps_k)
 		cgemm(hb, false, false, false, false, C, dh, dh, s, chunkP(gl_Qs_, C, dh), stateP(S0, dh), 0.f, chunkO(gl_Oint_, C, dh), (int) BH);
-		gla_intra_bwd__ CUDA2((unsigned) ((nTok + tb - 1) / tb), tb) (gpu_in_ptr_, gl_L_, gl_Oint_, bw_Gg_, bw_Gb_,
-			bw_A_, bw_PW_, bw_PbW_, bw_E_, bw_eps_, c0, C, N, d, H, B, s);
+		sec("Oint gemm");
+		// intra-chunk C x C products as GEMMs: <q_i,k_j> = Qr Kr^H, p = Gg V^T, pb = Gb V^H, then mask/weights/E
+		cgemm(hb, false, false, true, true,  C, C, dh, 1.f, chunkP(gl_Qr_, C, dh), chunkP(gl_Kr_, C, dh), 0.f, sqO(bw_A_, C),   (int) BH);
+		cgemm(hb, false, false, true, false, C, C, dh, 1.f, chunkP(bw_Gg_, C, dh), chunkP(gl_V_, C, dh),  0.f, sqO(bw_PW_, C),  (int) BH);
+		cgemm(hb, false, false, true, true,  C, C, dh, 1.f, chunkP(bw_Gb_, C, dh), chunkP(gl_V_, C, dh),  0.f, sqO(bw_PbW_, C), (int) BH);
+		{
+			const size_t nSq = BH * C * C;
+			gla_intra_bwd_ew__ CUDA2((unsigned) ((nSq + 255) / 256), 256) (gl_L_, bw_A_, bw_PW_, bw_PbW_, bw_E_, c0, C, N, (int) BH, s);
+			gla_eps__ CUDA2((unsigned) ((nTok + tb - 1) / tb), tb) (bw_Gg_, bw_Gb_, gl_Oint_, bw_eps_, C, dh, (int) BH);
+		}
+		sec("intra kernel");
 		// V from later chunks: dV = s conj(Kt) G ; dVb = s Kt Gb   (rows scaled by w_j through Kt)
 		cgemm(hb, false, true,  false, false, C, dh, dh, s, chunkP(gl_Kt_, C, dh), stateP(bw_G_, dh),   0.f, chunkO(bw_dV_, C, dh),  (int) BH);
 		cgemm(hb, false, false, false, false, C, dh, dh, s, chunkP(gl_Kt_, C, dh), stateP(bw_Gbs_, dh), 0.f, chunkO(bw_dVb_, C, dh), (int) BH);
+		sec("dV gemms (later)");
 		gla_eta__ CUDA2((unsigned) ((nTok + tb - 1) / tb), tb) (gl_V_, bw_dV_, bw_dVb_, bw_eta_, C, dh, (int) BH);
+		sec("eta kernel");
 		// V in-chunk: dV += A^T Gg ; dVb += conj(A)^T Gb
 		cgemm(hb, true, false, false, false, C, dh, C, 1.f, sqP(bw_A_, C), chunkP(bw_Gg_, C, dh), 1.f, chunkO(bw_dV_, C, dh),  (int) BH);
 		cgemm(hb, true, true,  false, false, C, dh, C, 1.f, sqP(bw_A_, C), chunkP(bw_Gb_, C, dh), 1.f, chunkO(bw_dVb_, C, dh), (int) BH);
+		sec("dV gemms (in-chunk)");
 		// Q: dQ = PW conj(Kr) ; dQb = PbW Kr ; inter: dQi = Gg S0^T ; dQbi = Gb conj(S0)^T  (scaled by s exp(L_i) at accumulate)
 		cgemm(hb, false, false, false, true,  C, dh, C,  1.f, sqP(bw_PW_, C),  chunkP(gl_Kr_, C, dh), 0.f, chunkO(bw_dQ_, C, dh),  (int) BH);
 		cgemm(hb, false, false, false, false, C, dh, C,  1.f, sqP(bw_PbW_, C), chunkP(gl_Kr_, C, dh), 0.f, chunkO(bw_dQb_, C, dh), (int) BH);
 		cgemm(hb, false, false, true,  false, C, dh, dh, 1.f, chunkP(bw_Gg_, C, dh), stateP(S0, dh), 0.f, chunkO(bw_dQi_, C, dh),  (int) BH);
 		cgemm(hb, false, false, true,  true,  C, dh, dh, 1.f, chunkP(bw_Gb_, C, dh), stateP(S0, dh), 0.f, chunkO(bw_dQbi_, C, dh), (int) BH);
+		sec("dQ gemms");
 		// K: dKb (dz*) = PW^T Qr ; dK (dz) = PbW^T conj(Qr) ; later: dKl = s V G^T ; dKlb = s conj(V) Gb^T (scaled by w_j at accumulate)
 		cgemm(hb, true, false, false, false, C, dh, C,  1.f, sqP(bw_PW_, C),  chunkP(gl_Qr_, C, dh), 0.f, chunkO(bw_dKb_, C, dh), (int) BH);
 		cgemm(hb, true, false, false, true,  C, dh, C,  1.f, sqP(bw_PbW_, C), chunkP(gl_Qr_, C, dh), 0.f, chunkO(bw_dK_, C, dh),  (int) BH);
 		cgemm(hb, false, false, true, false, C, dh, dh, s,   chunkP(gl_V_, C, dh), stateP(bw_G_, dh),   0.f, chunkO(bw_dKl_, C, dh),  (int) BH);
 		cgemm(hb, false, true,  true, false, C, dh, dh, s,   chunkP(gl_V_, C, dh), stateP(bw_Gbs_, dh), 0.f, chunkO(bw_dKlb_, C, dh), (int) BH);
+		sec("dK gemms");
 		// gates
-		gla_e_prefix__ CUDA2((unsigned) ((nTok + tb - 1) / tb), tb) (bw_E_, bw_Ecum_, C, (int) BH);
-		gla_dc__ CUDA2((unsigned) ((BH + tb - 1) / tb), tb) (bw_G_, bw_Gbs_, S0, gl_L_, bw_Dc_, c0, C, N, dh, (int) BH, s);
+		gla_e_prefix_warp__ CUDA2((unsigned) ((nTok + 7) / 8), 256) (bw_E_, bw_Ecum_, C, (int) BH);   // 8 rows (warps) per block
+		sec("e_prefix kernel");
+		gla_dc_block__ CUDA2((unsigned) BH, 256) (bw_G_, bw_Gbs_, S0, gl_L_, bw_Dc_, c0, C, N, dh, (int) BH, s);
+		sec("dc kernel");
 		gla_gate_grad__ CUDA2((unsigned) ((nTok + tb - 1) / tb), tb) (gpu_in_ptr_, bw_Ecum_, bw_eps_, bw_eta_, bw_Dc_, c0, C, N, d, H, B);
+		sec("gate_grad kernel");
 		gla_accum__ CUDA2((unsigned) ((nPack + tb - 1) / tb), tb) (gpu_in_ptr_, gl_L_, bw_dQ_, bw_dQb_, bw_dQi_, bw_dQbi_,
 			bw_dK_, bw_dKb_, bw_dKl_, bw_dKlb_, bw_dV_, bw_dVb_, c0, C, N, d, H, B, s);
+		sec("accum kernel");
 		// suffix state: G <- exp(LC) G + Qs^T Gg ; Gb <- exp(LC) Gb + conj(Qs)^T Gb_chunk
 		gla_scale_state__ CUDA2((unsigned) ((state + tb - 1) / tb), tb) (bw_G_, gl_L_, c0, C, N, dh, (int) BH);
 		gla_scale_state__ CUDA2((unsigned) ((state + tb - 1) / tb), tb) (bw_Gbs_, gl_L_, c0, C, N, dh, (int) BH);
 		cgemm(hb, true, false, false, false, dh, dh, C, 1.f, chunkP(gl_Qs_, C, dh), chunkP(bw_Gg_, C, dh), 1.f, stateO(bw_G_, dh),   (int) BH);
 		cgemm(hb, true, true,  false, false, dh, dh, C, 1.f, chunkP(gl_Qs_, C, dh), chunkP(bw_Gb_, C, dh), 1.f, stateO(bw_Gbs_, dh), (int) BH);
+		sec("suffix state");
 	}
+	if (prof) { cudaEventDestroy(pe0); cudaEventDestroy(pe1); }
 	cublasSetStream(hb, cudaStreamPerThread);
 	CNET_KSYNC();
 #endif

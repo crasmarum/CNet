@@ -1,3 +1,4 @@
+#include <chrono>
 // =============================================================================
 // dp_shakespeare: a standalone, multi-GPU (data-parallel) character-level
 // language model on tiny-shakespeare, built with the CNet complex-valued
@@ -110,6 +111,9 @@ FLAG_INT(gen_len, 600)      // number of characters to generate
 FLAG_BOOL(gen_gpu, false)   // generate using the GPU forward (fast Bluestein mixer) instead of CPU
 FLAG_FLOAT(temp, 0.8)       // sampling temperature (lower = greedier)
 FLAG_BOOL(print_net, false) // build the LM and print its layer graph, then exit
+FLAG_INT(profile_steps, 0)  // >0: after 20 warm-up steps, profile this many steps per layer type and per phase, print, exit
+FLAG_BOOL(tf32, false)      // TF32 tensor cores for the cuBLAS GEMMs (default strict FP32)
+FLAG_BOOL(ksync, true)      // false: no host sync after every kernel in eager mode (same results, less launch latency)
 FLAG_INT(seed, 1000)        // base seed for the per-rank data sampler (rank r uses seed+r)
 FLAG_BOOL(emb_gauss, false) // symmetry-breaking zero-mean complex embedding init (vs default)
 FLAG_BOOL(token_lm, false)  // sub-word token LM: -data is a DIR with train.bin/val.bin (uint16 ids)
@@ -493,6 +497,10 @@ static int runEvalStream() {
 
 int main(int argc, char **argv) {
 	FLAGS::Parse(argc, argv);
+#ifdef __CUDACC__
+	g_cnet_nosync = !ksync;
+	g_cnet_tf32 = tf32;
+#endif
 	if (!((std::string) eval_stream).empty()) return runEvalStream();   // GPU windowed streaming (bits/byte)
 	if (eval_loss) return runEval();              // restore a model, report exact-Born val
 	if (generate) return runGenerate();          // standalone sampling, no training / NCCL
@@ -650,10 +658,25 @@ int main(int argc, char **argv) {
 	float best_val = 1e30f;   // best held-out loss seen, for best-checkpoint saving
 	for (int t = 1; t <= steps; ++t) {
 		float gnorm = 0.f;
+		const bool prof = profile_steps > 0 && t > 20 && t <= 20 + profile_steps;
+		cnetProfiler().on = prof;
+		static double ph[6] = {0, 0, 0, 0, 0, 0};
+		auto phase = [&](int k, std::chrono::steady_clock::time_point &t0) {
+			if (!prof) return;
+			cudaDeviceSynchronize();
+			auto t1 = std::chrono::steady_clock::now();
+			ph[k] += std::chrono::duration<double, std::milli>(t1 - t0).count(); t0 = t1;
+		};
+		auto tp = std::chrono::steady_clock::now();
+		if (prof) cudaDeviceSynchronize();
 		EmbeddingBatch batch_ = buildBatch(false);
+		phase(0, tp);
 		net.gpuForward(em, seq, batch_);
+		phase(1, tp);
 		acc += net.getLoss(0)[seq->uid()]; ++accn;
+		phase(2, tp);
 		net.gpuBackward();
+		phase(3, tp);
 		for (size_t i = 0; i < gradBufs.size(); ++i)                      // gather
 			cudaMemcpyAsync(scratch + off[i], gradBufs[i].first,
 				(size_t) gradBufs[i].second * sizeof(float), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
@@ -669,7 +692,19 @@ int main(int argc, char **argv) {
 		for (size_t i = 0; i < gradBufs.size(); ++i)                      // scatter
 			cudaMemcpyAsync(gradBufs[i].first, scratch + off[i],
 				(size_t) gradBufs[i].second * sizeof(float), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+		phase(4, tp);
 		net.trueAdamUpdate(lr_at(t), b1, b2, eps, t, grad_clip);
+		phase(5, tp);
+		if (profile_steps > 0 && t == 20 + profile_steps && R == 0) {
+			const char *nm[6] = {"batch build (CPU)", "forward", "loss readback", "backward + grad from clones", "grad gather / all-reduce / clip", "Adam update"};
+			double T = 0; for (double v : ph) T += v;
+			printf("PHASE per step over %d steps (ms):\n", (int) profile_steps);
+			for (int k = 0; k < 6; ++k) printf("PHASE %-32s %9.2f %5.1f%%\n", nm[k], ph[k] / profile_steps, 100.0 * ph[k] / T);
+			printf("PHASE %-32s %9.2f\n", "TOTAL", T / profile_steps);
+			cnetProfiler().print((int) profile_steps);
+			fflush(stdout);
+			return 0;
+		}
 
 		if (R == 0 && t % 100 == 0) {
 			std::cout << "step " << t << "  train " << (acc / accn) << " nats/char  lr "

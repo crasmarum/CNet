@@ -1,3 +1,4 @@
+#include <cctype>
 #ifndef GPU_GPU_FUNC_H_
 #define GPU_GPU_FUNC_H_
 
@@ -72,6 +73,7 @@ struct CudaGraphState {
 /**
  * Assume 1 GPU for now.
  */
+
 class CNet {
 
 	std::unique_ptr<ComplexNet> net_;
@@ -910,12 +912,31 @@ public:
 	// gradient buffers as we go). Factored out so the CUDA-graph driver can
 	// record the exact same launch schedule it later replays.
 	void runForwardOnce() {
+#ifdef __CUDACC__
+		CnetLayerProfiler &P = cnetProfiler();
+		cudaEvent_t e0 = nullptr, e1 = nullptr;
+		if (P.on && !g_cnet_capturing) { cudaEventCreate(&e0); cudaEventCreate(&e1); }
+#endif
 		for (auto mp : maps_) {
+#ifdef __CUDACC__
+			if (e0) cudaEventRecord(e0, g_cnet_stream);
+#endif
 			mp->forward();
 			if (!mp->getCpuFun().front()->isInput()) {
 				mp->zeroGradients();
 			}
+#ifdef __CUDACC__
+			if (e0) {
+				cudaEventRecord(e1, g_cnet_stream); cudaEventSynchronize(e1);
+				float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
+				std::string k = CnetLayerProfiler::typeOf(mp->getCpuFun().front()->getName());
+				P.fwd_ms[k] += ms; P.fwd_n[k]++;
+			}
+#endif
 		}
+#ifdef __CUDACC__
+		if (e0) { cudaEventDestroy(e0); cudaEventDestroy(e1); }
+#endif
 	}
 
 	std::string GpuForward(bool& was_failure) {
@@ -967,9 +988,28 @@ public:
 	}
 
 	void runBackwardOnce(int label) {
+#ifdef __CUDACC__
+		CnetLayerProfiler &P = cnetProfiler();
+		cudaEvent_t e0 = nullptr, e1 = nullptr;
+		if (P.on && !g_cnet_capturing) { cudaEventCreate(&e0); cudaEventCreate(&e1); }
+#endif
 		for (auto it = maps_.rbegin(); it != maps_.rend(); ++it) {
+#ifdef __CUDACC__
+			if (e0) cudaEventRecord(e0, g_cnet_stream);
+#endif
 			(*it)->backward(label);
+#ifdef __CUDACC__
+			if (e0) {
+				cudaEventRecord(e1, g_cnet_stream); cudaEventSynchronize(e1);
+				float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
+				std::string k = CnetLayerProfiler::typeOf((*it)->getCpuFun().front()->getName());
+				P.bwd_ms[k] += ms; P.bwd_n[k]++;
+			}
+#endif
 		}
+#ifdef __CUDACC__
+		if (e0) { cudaEventDestroy(e0); cudaEventDestroy(e1); }
+#endif
 	}
 
 	std::string GpuBackward(int label, bool& was_failure) {
@@ -1526,6 +1566,18 @@ public:
 	bool gpuBackward() {
 		bool was_failure = false;
 		GpuBackward(0, was_failure);
+#ifdef __CUDACC__
+		CnetLayerProfiler &P = cnetProfiler();
+		if (P.on) {
+			cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+			cudaEventRecord(e0, g_cnet_stream);
+			updateGradientsFromClones();
+			cudaEventRecord(e1, g_cnet_stream); cudaEventSynchronize(e1);
+			float ms = 0; cudaEventElapsedTime(&ms, e0, e1); P.grad_ms += ms;
+			cudaEventDestroy(e0); cudaEventDestroy(e1);
+			return !was_failure;
+		}
+#endif
 		updateGradientsFromClones();
 		return !was_failure;
 	}
