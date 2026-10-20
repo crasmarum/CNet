@@ -313,6 +313,61 @@ auto V = cnet.add(new TokenwiseLinear(N, E, d), {pre, wV});
 auto att = cnet.add(new BornAttention(N, d), {Q, K, V});   // input [Q;K;V] -> O
 ```
 
+### Multiple heads
+
+`BornAttention(N, d, causal, eps, heads)` splits the $d$ complex dims into `heads` heads of $d_h = d/\text{heads}$ consecutive dims; head $h$ owns dims $[h d_h, (h+1) d_h)$, computes its own scores and normalisation, and writes its own output dims. `heads = 1` is the single-head operator above. `RotaryEmbed(N, d, base, heads)` restarts the frequency ladder every $d_h$ dims so every head sees the full range of rotation frequencies. Checkpoints written with `heads > 1` (or a non-zero `eps`) use an extended record; old checkpoints restore unchanged. Smaller heads matter for the linear mode below: its state and per-token cost scale with $d_h^2$, and its compute crossover against the quadratic kernel sits near $N \approx d_h^2$ ($1$k tokens for $d_h = 32$, $16$k for a single $d_h = 128$ head).
+
+### Exact linear (chunkwise) mode
+
+Because the score is a *squared* inner product it has an exact finite feature map: lifting each vector to its outer product $\rho_x = x x^\dagger$ gives $|\langle Q_k, K_m\rangle|^2 = \mathrm{tr}(\rho_{Q_k}\rho_{K_m})$, a linear function of the $d_h^2$ (packed, real) features of $\rho_{K_m}$. The causal sums therefore collapse into a running state of $d_h^2$ numbers (the normaliser) plus $d_h^2 \times 2 d_h$ numbers (the value-weighted state) per head, read by a quadratic form in $Q_k$, and attention costs $O(N d_h^2)$ instead of $O(N^2 d_h)$ with no $N \times N$ scratch. `setLinear(true, chunk)` switches the **GPU** kernels to this form: tokens are processed in chunks of `chunk` (`N % chunk == 0`), each chunk mixes with itself through the quadratic kernel and with everything before it through the carried state, and the state advances by one cuBLAS batched GEMM per chunk. The backward is exact too (query gradients read the stored per-chunk forward state; key and value gradients a suffix state swept in reverse). The CPU operator stays quadratic and is the oracle: `make test_bornattn_mh && ./test_bornattn_mh` checks the linear forward and all input gradients against it on eight configurations, together with finite differences, a head-slicing oracle, serialization and GPU/CPU parity.
+
+```c++
+auto att = cnet.add(new BornAttention(N, d, /*causal=*/true, /*eps=*/0.f, /*heads=*/4), {Qr, Kr, V});
+((BornAttention*) cnet[att])->setLinear(true, /*chunk=*/256);   // GPU: exact O(N d_h^2) form
+```
+
+The same operator, so the same model: a run switched between the two forms reaches the same loss (within the quadratic kernel's own run-to-run spread, which comes from its atomic backward). Attention layer alone, $d = 128$ as $4 \times 32$, batch 4, forward+backward per step on an A100-40GB:
+
+| N | quadratic | linear (chunk 256) | speed-up |
+|:--:|:--:|:--:|:--:|
+| 1k | 108 ms, 0.25 GB | 20 ms | 5.5x |
+| 4k | 692 ms, 1.4 GB | 78 ms | 8.9x |
+| 16k | 11.3 s, 14.9 GB | 310 ms, 6.1 GB | 37x |
+| 64k | out of memory | 1.24 s, 12.6 GB | --- |
+
+Constraints: causal attention only, `N % chunk == 0`, $d_h \le 64$; the linear form has no attention-weight dropout (there are no weights). The design, the gradient derivation and the measurements are in [gpu/born_linear_cnet.md](gpu/born_linear_cnet.md).
+
+### Fixed per-head decay (forgetting)
+
+`setDecay(true)` (trainer flag `-born_decay true`) multiplies the score by $\gamma_h^{\,k-m}$ with the RetNet schedule $\gamma_h = 1 - 2^{-(5+h)}$ (effective windows of about 32, 64, 128, 256 tokens for four heads), so distant keys fade before normalisation. It costs no parameters and no wall-clock: the quadratic kernels multiply the score, the linear kernels carry it exactly in the state (keys weighted by $\gamma^{C-1-j}$ inside a chunk, the state scaled by $\gamma^{C}$ per chunk, queries read with $\gamma^{i+1}$), and the streaming decoder scales its running state by $\gamma_h$ per token. Checkpoints with decay use the extended record (negative head count). Finite differences, GPU parity, the linear-vs-quadratic oracle and the step-vs-full check all cover the decayed operator (`make test_bornattn_mh`). In the controlled PyTorch study of the companion paper the decay was the single most effective fix for long contexts (at 128k it recovered 0.66 of the 0.70 nats between plain Born and gated linear attention).
+
+### Streaming (constant-state) decoding
+
+The running state also gives constant-memory autoregressive decoding: one token in, one token out, the state updated in place, never touching past tokens. CNet graphs are static, so the decoder is a *second* graph with one token per step, built from a restored model by [impl/stepnet.h](impl/stepnet.h): the same layers and wiring, every per-token size divided by $N$, weights copied, the learned positional table sliced one row per token, `RotaryEmbed` given an absolute position (`setPos`), and `BornAttention` in step mode (`setStepMode(true)`, `forwardStep`). Fed the tokens one at a time it reproduces the fixed-window model's next-token distribution to $10^{-5}$ at every position. Supported layers: embedding, inputs, `TokenwiseLinear`, `TokenNorm`, `RotaryEmbed`, `BornAttention`, `GatedLinearAttention`, `Residual`, `CGelu`, `SequenceCrossEntropy`; Fourier mixers and the `SoftMax` block norm have no constant-state form and are rejected. See the `generate` example below.
+
+## Gated Linear Attention (Complex-Amplitude) Layer
+
+The degree-one counterpart of Born attention, added to compare the two inside CNet with everything else held fixed. Where Born attention routes with the *probability* $|\langle Q_k, K_m\rangle|^2$, this layer routes with the complex *amplitude* $\langle Q_k, K_m\rangle$ itself, damped by a data-dependent forget gate. The input is the concatenation $[Q; K; V; G]$: $Q, K, V$ as for `BornAttention` ($N \times d$ complex, `heads` heads of $d_h = d/\text{heads}$ dims), and $G$ an $N \times \text{heads}$ block of gate logits of which the real part is used. Per head, with $\alpha_t = \sigma(\mathrm{Re}\,G_{t,h})$ and $s = 1/\sqrt{d_h}$:
+
+$$O_k = \sum_{m \leq k} \Big(\prod_{m < u \leq k} \alpha_u\Big)\, s\, \langle Q_k, K_m\rangle\, V_m, \qquad\text{equivalently}\qquad S_t = \alpha_t S_{t-1} + \overline{K_t}\, V_t^{\top},\quad O_t = s\, S_t^{\top} Q_t,$$
+
+a $d_h \times d_h$ complex state per head that is constant in $N$. The weights are amplitudes, not probabilities: value contributions interfere by phase (with `RotaryEmbed` on $Q$ and $K$ the phase rotates with the distance $k - m$, so the state acts as a bank of positional filters), and nothing sums to one, so a `TokenNorm` normally follows the layer. The current token is never gated. The inner product uses the same convention as `BornAttention`, $\langle q, k\rangle = \sum_{dd} q_{dd}\,\overline{k_{dd}}$. The Wirtinger backward covers $Q$, $K$, $V$ and the gate logits and is verified against finite differences; `setStepMode(true)` / `forwardStep()` give the one-token recurrence for the streaming decoder.
+
+```c++
+#include "impl/gla.h"
+
+int N = 4096, E = 256, d = E / 2, heads = 4;
+auto Q = cnet.add(new TokenwiseLinear(N, E, d), {pre, wQ});     // then RotaryEmbed(N, d, 10000.0, heads) on Q and K
+auto K = cnet.add(new TokenwiseLinear(N, E, d), {pre, wK});
+auto V = cnet.add(new TokenwiseLinear(N, E, d), {pre, wV});
+auto G = cnet.add(new TokenwiseLinear(N, E, heads), {pre, wG});  // per-head gate logits
+auto gla = cnet.add(new GatedLinearAttention(N, d, heads), {Q, K, V, G});
+((GatedLinearAttention*) cnet[gla])->setChunk(512);              // GPU chunk length (N % chunk == 0)
+auto att = cnet.add(new TokenNorm(N, d), {gla});                 // output norm: the mix has no normaliser
+```
+
+On the GPU the layer runs chunkwise like the linear Born mode: the inter-chunk readout and the state update are complex GEMMs (four real cuBLAS GEMMs on the re/im planes), one kernel forms the intra-chunk amplitudes, and the backward sweeps the chunks in reverse with a suffix state. Constraints: causal only, `N % chunk == 0`, $d_h \le 128$. `make test_gla && ./test_gla` runs the finite-difference, recurrence, serialisation and GPU-parity checks. On the PG-19 character model (6 blocks, $E = 256$, 4 heads, context 4096, same seed and budget on one A100) it reaches 1.418 nats/char against 1.938 for linear Born attention and 1.539 for linear Born attention with the fixed decay (`-born_decay true`); the gated kernel is a first version (942 vs 815 and 835 ms per step). A controlled repeat of the same architecture in the PyTorch mirror puts the gated mixer level with Born plus a fixed per-head decay (1.230 vs 1.210 nats/char; plain Born 1.370), so its gain is forgetting; CNet's plain Born trailing its mirror is under investigation. Born attention remains CNet's recommended mixer; the gated layer is an option. Design, derivation and measurements: [gpu/gla_cnet.md](gpu/gla_cnet.md).
+
 ## Rotary Position Embedding (RoPE) Layer
 
 `RotaryEmbed` applies a position-dependent complex phase rotation to each token's features — rotary position embeddings (RoPE) expressed as what they natively *are* in a complex network: a rotation. The input is $N$ tokens of $D$ complex features each (token $t$, dimension $d$ at index $t\,D + d$):
@@ -725,6 +780,22 @@ By default the example uses the parameter-free `TriangFourier` causal mixer. Fla
     -emb 160 -tokens 64 -blocks 8 -batch 64 -steps 8000 -grad_clip 0.5
 ```
 
+`-born_decay true` adds the fixed per-head decay described above (recommended for contexts beyond a few thousand tokens); `-pos_table false` drops the learned positional table (RoPE only), which is what lets the trained model stream past its context (see below). Two more flags select the multi-head and linear forms of the mixer: `-heads 4` splits the $E/2$-wide complex head into four, and `-born_linear true -born_chunk 256` runs the exact chunkwise linear kernels (GPU only; `-tokens` must be a multiple of `-born_chunk`). With them the same model trains at contexts the quadratic kernel cannot reach: at `-tokens 4096 -batch 8` the quadratic kernel runs out of memory on a 40 GB A100 while the linear form steps in 0.78 s, and at `-tokens 1024` the whole training step is 6.4x faster (0.21 s vs 1.35 s). Everything else — RoPE, TokenNorm, the Born read-out, checkpoints — is unchanged, and a checkpoint trained one way can be used the other way.
+
+```bash
+./examples/run_dp_shakespeare.sh 1 -born true -heads 4 -born_linear true -born_chunk 256 \
+    -rope true -token_norm true -tw_cublas true -ce_eps 0.001 \
+    -emb 256 -tokens 4096 -blocks 4 -batch 8 -steps 3000 -save_path born4k.mod
+```
+
+`-gla true` replaces the Born mixer in every attention block by the gated linear attention over complex amplitudes (`GatedLinearAttention` with a `TokenwiseLinear` gate projection and a `TokenNorm` after the mix; `-heads`, `-rope`, `-token_norm` and `-born_chunk` apply as before; GPU chunkwise kernels, so `-tokens` must be a multiple of `-born_chunk`). Checkpoints trained either way serialise, restore and stream through `generate` unchanged:
+
+```bash
+./examples/run_dp_shakespeare.sh 1 -gla true -heads 4 -born_chunk 512 \
+    -rope true -token_norm true -tw_cublas true -ce_eps 0.001 \
+    -emb 256 -tokens 4096 -blocks 6 -batch 4 -steps 6000 -save_path gla4k.mod
+```
+
 The trained model can be checkpointed (`-save_path model.mod`) and then sampled without retraining. Training also writes a `model.mod.vocab` sidecar holding the character⟷id table, so generation is **self-contained** and no longer needs the training corpus to reconstruct the (insertion-order) vocabulary; older checkpoints without a sidecar fall back to `-data`. Add `-gen_gpu true` to sample on the device through the fast Bluestein/Born forward instead of the CPU reference — seconds rather than minutes for a hybrid/FNet model:
 
 ```bash
@@ -737,6 +808,51 @@ A pretrained fully-complex Born-rule model (Born attention + RoPE + TokenNorm, ~
 curl -L -o rope20k.mod https://github.com/crasmarum/CNet/releases/download/v0.1/rope20k.mod
 ./dp_shakespeare -generate true -model rope20k.mod -prompt "ROMEO:" -gen_len 600 -temp 0.8
 ```
+
+### Constant-state generation with `generate`
+
+The standalone `generate` example (`make generate`, CPU only, no NCCL) samples from any all-Born or all-GLA checkpoint through the streaming decoder of `impl/stepnet.h`: the prompt is prefilled one token at a time and every generated character costs one state update per layer, independent of how much has been generated. Characters are flushed as they are sampled, so the text appears live. The vocabulary is rebuilt from the training text in insertion order, so `-data` must be the file the model was trained on (for the published checkpoint, the standard 1,115,394-byte tiny-shakespeare with 65 distinct characters):
+
+```bash
+make generate
+./generate -model rope20k.mod -data tiny_shakespear2.txt -prompt "ROMEO:" -gen_len 400 -temp 0.8
+./generate -model rope20k.mod -data tiny_shakespear2.txt -prompt "ROMEO:" -gen_len 400 -stream false   # recompute the window per token
+./generate -model rope20k.mod -data tiny_shakespear2.txt -check 64 \
+    -prompt "First Citizen: Before we proceed any further, hear me speak."    # streaming vs window: max |dp| ~ 5e-6
+```
+
+`-check K` feeds the first `K` prompt tokens (`K` at most the model's context) through both paths and reports the largest difference between their next-token distributions. On a 4-block, 4-head model with a 512-token context, 300 characters take 2.6 s streaming against 101 s through the full-window path. Keep `-threads` (default 8) at or below the physical cores: the per-token layers are tiny and a parallel region per layer per token over a hundred threads is pure overhead. Models with a learned positional table are limited to their training context; when it runs out the generator re-prefills from the last $N/2$ characters, a sliding window amortised over $N/2$ tokens rather than paid per token.
+
+### Large-window inference: scoring millions of bytes with a constant state
+
+Streaming is bounded only by what the model itself remembers of position. A model trained with the default learned positional table (`-pos_table true`, one row per context position) cannot be fed past its context: the twin has no row to read. With `-pos_table false` the model is RoPE-only (the embedding feeds the first block through a `TokenNorm`), RoPE takes the absolute position in the streaming twin, and the state runs for as long as the input lasts. `generate -eval` scores a text file through the twin in byte-counted windows:
+
+```bash
+./generate -model pg19.mod -eval pg19_test.txt -eval_offset 0 -eval_chars 5242880 -eval_window 5242880 -threads 8
+# EVAL ... scored=5242879 skipped=0 nats/char=... bits/char=... bpb_all=...
+```
+
+`-eval_window` is the number of bytes between state resets (`0` = the training context, the old behaviour). Bytes outside the training vocabulary are not scored and are charged 8 bits each in `bpb_all`. A long file is sharded by whole windows (`-eval_offset` and `-eval_chars` as multiples of the window); the CPU twin runs at a few hundred bytes per second per process.
+
+The same recurrence runs on the GPU, `N` tokens at a time. `dp_shakespeare -eval_stream` restores a model, allocates `-eval_batch` windows in parallel and feeds each window as consecutive `N`-token forwards with the mixer state carried between them (`GatedLinearAttentionGpu::setCarry`; `BornAttentionGpu::setCarry` on the density state and the normalizer, restored Born layers being switched to the linear form with chunk `-born_chunk`) and RoPE at the absolute byte position; per-position losses are read back, and the state is reset at window boundaries only.
+
+```bash
+./dp_shakespeare -tw_cublas true -fft_fast true -born_chunk 512 -eval_stream pg19_test.txt \
+    -model pg19.mod -eval_window 5242880 -eval_batch 8
+# WINDOW k ... nats/char ... bits/char ...   then   EVAL_STREAM ... bits/char=... bpb_all=...
+```
+
+Pass `-tw_cublas true` (without it the token-wise layers run through the slow reference kernel), and `-eval_batch` must be at least 2. On a GH200 a 41 MB test set in eight 5 MB windows takes about three minutes for a 6-block model with the gated mixer and six with linear Born. The GPU pass reproduces the CPU twin exactly for the gated mixer and to within 0.1% of the summed loss for linear Born (fp32 chunkwise accumulation order).
+
+**PG-19 byte models.** [scripts/pg19_5m/](scripts/pg19_5m/) fetches PG-19 (`fetch_pg19.sh 1200`: the test and validation partitions and the first 1,200 training books from the public bucket), trains two RoPE-only twins (`train_5m.sh 8 15000`: E=256, 6 blocks, 4 heads, context 4096, batch 8, 15,000 steps on one GH200, about two hours each; linear Born with the fixed decay, then the gated mixer) and scores them (`score_5m_gpu.sh` on the GPU, `eval5m.sh` on the CPU). Scored on the official test partition in 5,242,880-byte windows, the protocol of the MBLM hierarchy (Egli et al., 2025):
+
+| model (4.03M complex parameters, 0.49 GB of training bytes) | best val (nats/char) | test, 5M-byte windows (bits/byte) | validation, 5M windows / 4k resets |
+|---|:--:|:--:|:--:|
+| linear Born + fixed decay (`-born true -born_linear true -born_decay true -pos_table false`) | 1.121 | **1.656** | 1.690 / 1.696 |
+| gated complex mixer (`-gla true -pos_table false`) | 1.148 | 1.700 | 1.732 / 1.736 |
+| MBLM (Mamba-2 + two Transformer stages, 350M parameters, 100 GB of bytes, 5M-byte context) | — | 2.448 | — |
+
+The carried state neither drifts over five million bytes nor adds much beyond the training context (the 5M-window and 4k-reset scores are within 0.006 of each other), and without the positional table the decayed Born twin leads the gated one at every checkpoint. Samples from both twins are in the papers' results.
 
 The per-step work is the forward/backward plus a single coalesced NCCL
 all-reduce of the gradients; the validation loss is identical across GPU counts,

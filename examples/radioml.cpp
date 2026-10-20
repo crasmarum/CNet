@@ -34,8 +34,10 @@
 #include <fstream>
 #include <vector>
 #include <string>
+#include <sstream>
 #include <complex>
 #include <cmath>
+#include <algorithm>
 #include <cstdint>
 
 #include "../utils/flags.h"
@@ -78,6 +80,8 @@ FLAG_BOOL(gauss_init, true) // scaled complex-Gaussian init (per-input; essentia
 FLAG_FLOAT(init_scale, 1.0) // init variance = init_scale / length
 FLAG_INT(seed, 12345)       // RNG seed for weight init (vary across runs for mean +/- std)
 FLAG_BOOL(augment, false)   // training-time random phase-rotation + time-reversal (held-out eval is NEVER augmented)
+FLAG_BOOL(aug_reverse, true) // -augment: include random time reversal (off = phase rotation / CFO only)
+FLAG_FLOAT(aug_cfo, 0.0)     // -augment: max random carrier-frequency offset, rad/sample (linear phase ramp)
 
 // ---- Mode / IO --------------------------------------------------------------
 FLAG_STRING(model_path, "") // where to save (train) / restore (infer) the model
@@ -93,6 +97,15 @@ FLAG_INT(infer_dims, 4)     // Vars::dims_ for inference (4 is safe for every ne
 FLAG_STRING(conv_act, "u")   // arch 20 conv activation: u (per-plane TokenNorm, amplitude-removing)
                              // | crelu | cgelu (amplitude-preserving, like VT-CNN2's ReLU)
 FLAG_FLOAT(dropout, 0.0)     // arch 20: ComplexDropout prob after conv activations + dense (VT-CNN2 uses 0.5)
+FLAG_INT(gla_blocks, 2)        // arch 21: number of complex-GLA blocks over the unpooled sequence
+FLAG_INT(gla_dim, 64)          // arch 21: stream width E (complex) per time step
+FLAG_INT(gla_heads, 4)         // arch 21: GLA heads (E % heads == 0)
+FLAG_INT(gla_chunk, 64)        // arch 21: GPU chunk length (L % chunk == 0)
+FLAG_STRING(lags, "1,2,3,4")   // arch 21: conjugate-lag streams x_t conj(x_{t-tau}) kept at full resolution
+FLAG_BOOL(cyc_branch, true)    // arch 21: also feed the arch 16 cyclostationary bank (pooled) to the head
+FLAG_INT(eval_examples, 20000) // held-out examples scored after every epoch (0 = only the final full pass);
+                               // a fixed random subset of -radioml_test, dropout off, never augmented
+FLAG_BOOL(cosine, false)       // cosine decay of -l_rate over all steps, down to 5% of the initial value
 
 extern bool g_dropout_infer;   // (kernels.cpp) set true around eval so dropout is identity
 
@@ -267,8 +280,95 @@ static void buildRadioMLNet(CNet& cnet, int *inp, int *outp) {
 		return;
 	}
 
+	if (arch == 21) {
+		// Differential-phase streams + complex-amplitude gated linear attention over the
+		// UNPOOLED sequence (the Step 2 design): per time step the network sees
+		//   u_t = [ x_t,  x_t conj(x_{t-tau}) for tau in -lags,  |x_t|^2 ]
+		// (a constant carrier offset becomes a constant phasor in every lag stream, while the
+		// symbol-to-symbol phase jumps survive), embedded token-wise into E complex channels
+		// (sum of one TokenwiseLinear(L, 1, E) per stream == TokenwiseLinear(L, S, E) on the
+		// interleaved streams), then -gla_blocks pre-norm blocks of
+		//   complex GLA (scalar per-head gates, running dh x dh state) + TokenNorm + residual,
+		//   position-wise FFN E -> 2E -> E + residual,
+		// followed by a dense head over the L x E tokens, optionally concatenated with the
+		// arch 16 cyclostationary bank (R(tau), |R(tau)|^2, normalized cyclic spectrum).
+		// Operates on the 1-D complex IQ bins (L = 128), not the 2-D image layout of arch 20.
+		const int E = gla_dim, Hd = gla_heads, size = L * E, Hf = 2 * E;
+		if (E % Hd != 0 || L % gla_chunk != 0) {
+			std::cerr << "radioml arch 21: need -gla_dim % -gla_heads == 0 and -seq_len % -gla_chunk == 0\n";
+			exit(1);
+		}
+		std::vector<int> taus;
+		{ std::stringstream ss((std::string) lags); std::string tok;
+		  while (std::getline(ss, tok, ',')) if (!tok.empty()) taus.push_back(std::stoi(tok)); }
+
+		*inp = cnet.add(new CInput(OutSize(L)));
+		std::vector<int> streams = {*inp};
+		for (int tau : taus) streams.push_back(cnet.add(new ConjLagProduct(InSize(L), tau), {*inp}));
+		streams.push_back(cnet.add(new CModulus2(InSize(L)), {*inp}));
+
+		int emb = -1;                                             // token-wise embedding, summed over streams
+		for (int sid : streams) {
+			int w = cnet.add(new CInput(OutSize(E)));
+			int pj = cnet.add(new TokenwiseLinear(L, 1, E), {sid, w});
+			emb = (emb < 0) ? pj : cnet.add(new Residual(InSize(size), InSize(size)), {emb, pj});
+		}
+		int last = cnet.add(new TokenNorm(L, E), {emb});
+		for (int b = 0; b < gla_blocks; ++b) {
+			int pre = cnet.add(new CGelu(InSize(size)), {cnet.add(new TokenNorm(L, E), {last})});
+			int wQ = cnet.add(new CInput(OutSize(E * E))); int Q  = cnet.add(new TokenwiseLinear(L, E, E), {pre, wQ});
+			int wK = cnet.add(new CInput(OutSize(E * E))); int K  = cnet.add(new TokenwiseLinear(L, E, E), {pre, wK});
+			int wV = cnet.add(new CInput(OutSize(E * E))); int Vv = cnet.add(new TokenwiseLinear(L, E, E), {pre, wV});
+			int wG = cnet.add(new CInput(OutSize(E * Hd))); int G = cnet.add(new TokenwiseLinear(L, E, Hd), {pre, wG});
+			int g = cnet.add(new GatedLinearAttention(L, E, Hd), {Q, K, Vv, G});
+			((GatedLinearAttention*) cnet[g])->setChunk(gla_chunk);
+			int att = cnet.add(new TokenNorm(L, E), {g});
+			int wO = cnet.add(new CInput(OutSize(E * E)));
+			int mix = cnet.add(new TokenwiseLinear(L, E, E), {att, wO});
+			int r0 = cnet.add(new Residual(InSize(size), InSize(size)), {last, mix});
+			int n0 = cnet.add(new CGelu(InSize(size)), {r0});
+			int w1 = cnet.add(new CInput(OutSize(E * Hf)));
+			int f1 = cnet.add(new TokenwiseLinear(L, E, Hf), {cnet.add(new TokenNorm(L, E), {n0}), w1});
+			int gg = cnet.add(new CGelu(InSize(L * Hf)), {f1});
+			int w2 = cnet.add(new CInput(OutSize(Hf * E)));
+			int f2 = cnet.add(new TokenwiseLinear(L, Hf, E), {gg, w2});
+			int r1 = cnet.add(new Residual(InSize(size), InSize(size)), {n0, f2});
+			last = cnet.add(new CGelu(InSize(size)), {r1});
+			last = maybeDrop(cnet, last, size);
+		}
+		last = cnet.add(new TokenNorm(L, E), {last});
+
+		std::vector<int> acts = {last};
+		int feat = size;
+		if (cyc_branch) {                                         // arch 16 bank, pooled
+			const int bins = (pool_out > 0) ? pool_out : 8;
+			int lags16[] = {1, 2, 3, 4, 6, 8, 12, 16, 24, 32};
+			for (int li = 0; li < 10; ++li) {
+				int cl = cnet.add(new ConjLagProduct(InSize(L), lags16[li]), {*inp});
+				int R  = cnet.add(new MeanPool(InSize(L), OutSize(bins)), {cl});
+				acts.push_back(R);
+				acts.push_back(cnet.add(new CModulus2(InSize(bins)), {R}));
+				int f  = cnet.add(new FourierTrans(InSize(L)), {cl});
+				int nf = cnet.add(new SoftMax(InSize(L)), {f});
+				int sp = cnet.add(new CModulus2(InSize(L)), {nf});
+				acts.push_back(cnet.add(new MeanPool(InSize(L), OutSize(bins)), {sp}));
+				feat += 3 * bins;
+			}
+		}
+		const int H = (hidden_dim > 0) ? hidden_dim : 256;
+		int d1 = cnet.add(new CInput(OutSize(feat * H)));
+		std::vector<int> in0 = acts; in0.push_back(d1);
+		int h1 = cnet.cpuNet().add(new Linear(InSize(feat), InSize(feat * H)), in0);
+		int g1 = cnet.add(new CGelu(InSize(H)), {h1});
+		g1 = maybeDrop(cnet, g1, H);
+		int d2 = cnet.add(new CInput(OutSize(H * n_classes)));
+		int lin = cnet.add(new Linear(InSize(H), InSize(H * n_classes)), {g1, d2});
+		*outp = cnet.add(new CrossEntropy(InSize(n_classes)), {lin});
+		return;
+	}
+
 	std::cerr << "radioml: unsupported -arch " << arch
-			  << " (use 11, 15, 16, or 20)." << std::endl;
+			  << " (use 11, 15, 16, 20, or 21)." << std::endl;
 	exit(1);
 }
 
@@ -288,6 +388,12 @@ static void trainRadioML() {
 		exit(1);
 	}
 	train_reader.setAugment(augment);
+	train_reader.setAugmentOptions(aug_reverse, aug_cfo, arch == 20);   // arch 20 = 2-D [I row, Q row] layout
+
+	// Held-out reader opened up front: a fixed shuffled subset is scored after every epoch.
+	RadioMLDataReader test_reader;
+	const bool have_test = test_reader.Open(radioml_test) && test_reader.readData();
+	if (have_test) test_reader.shuffle();
 
 	CNet cnet;
 	int cinp, coutp;
@@ -305,9 +411,12 @@ static void trainRadioML() {
 
 	ModelSaver saver;
 	float avg_loss = 0; int correct = 0, seen = 0, step = 0;
+	const int steps_per_epoch = train_reader.size() / batch_size;
+	const long total_steps = (long) steps_per_epoch * no_epochs;
+	float best_acc = -1.f; int best_epoch = -1;
 	for (int epoch = 0; epoch < no_epochs; ++epoch) {
 		train_reader.shuffle();
-		for (int t = 0; t < train_reader.size() / batch_size; ++t) {
+		for (int t = 0; t < steps_per_epoch; ++t) {
 			auto batch = train_reader.nextBatch(batch_size);
 			cnet.gpuForward(inp, cen, batch);
 			avg_loss += cnet.getLoss(cen, &batch);
@@ -319,16 +428,43 @@ static void trainRadioML() {
 				avg_loss = 0; correct = 0; seen = 0;
 			}
 			cnet.gpuBackward();
+			float lr = l_rate;
+			if (cosine) lr = l_rate * (0.05f + 0.95f * 0.5f * (1.f + cosf((float) M_PI * step / (float) total_steps)));
 			if (true_adam) {
-				cnet.trueAdamUpdate(l_rate / batch.size(), beta, beta2, eps, step, grad_clip);
+				cnet.trueAdamUpdate(lr / batch.size(), beta, beta2, eps, step, grad_clip);
 			} else if (use_adam) {
-				cnet.adamUpdate(l_rate / batch.size(), beta, step);
+				cnet.adamUpdate(lr / batch.size(), beta, step);
 			} else {
-				cnet.gpuUpdateInputs(l_rate / batch.size());
+				cnet.gpuUpdateInputs(lr / batch.size());
 			}
 			step++;
 		}
+		// Per-epoch held-out accuracy on a fixed subset; keep the best weights in model_path.
+		if (have_test && eval_examples > 0) {
+			g_dropout_infer = true;
+			test_reader.rewind();
+			int ecorrect = 0, eseen = 0;
+			const int nb = std::min(test_reader.size(), eval_examples) / batch_size;
+			for (int t = 0; t < nb; ++t) {
+				auto tb = test_reader.nextBatch(batch_size);
+				cnet.gpuForward(inp, cen, tb);
+				ecorrect += cnet.getCorrect(cen);
+				eseen += tb.size();
+			}
+			g_dropout_infer = false;
+			const float acc = ecorrect / (float) eseen;
+			const bool improved = acc > best_acc;
+			if (improved) { best_acc = acc; best_epoch = epoch; }
+			std::cout << "EPOCH " << epoch << " held-out acc " << acc << " over " << eseen
+					  << " examples (best " << best_acc << " at epoch " << best_epoch << ")" << std::endl;
+			if (improved && !model_path.empty() && cnet.getInputsFromGpu()) {
+				saver.Save(cnet.cpuNet(), model_path + ".best");
+			}
+		}
 	}
+	if (best_epoch >= 0)
+		std::cout << "BEST held-out acc " << best_acc << " at epoch " << best_epoch
+				  << " (" << model_path << ".best)" << std::endl;
 
 	if (!model_path.empty() && cnet.getInputsFromGpu()) {
 		saver.Save(cnet.cpuNet(), model_path);
@@ -337,8 +473,8 @@ static void trainRadioML() {
 
 	// Held-out evaluation (never augmented; dropout off via inference mode).
 	g_dropout_infer = true;
-	RadioMLDataReader test_reader;
-	if (test_reader.Open(radioml_test) && test_reader.readData()) {
+	if (have_test) {
+		test_reader.rewind();
 		int tcorrect = 0, tseen = 0;
 		for (int t = 0; t < test_reader.size() / batch_size; ++t) {
 			auto tb = test_reader.nextBatch(batch_size);

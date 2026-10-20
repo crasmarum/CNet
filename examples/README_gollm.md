@@ -112,6 +112,28 @@ for r in 0 1 2 3; do
 done; wait
 ```
 
+### Whole-game window with multi-head linear Born attention (8 GPUs)
+
+`-heads` splits the complex head and `-born_linear` runs the exact chunkwise linear kernels, which makes a
+whole-game window affordable. Measured 2026-10-16 on 8 x A100-40GB, 30k steps, global batch 64, 435 ms/step
+(11 GB per GPU), 3.75 h:
+
+```bash
+for r in 0 1 2 3 4 5 6 7; do
+  CUDA_VISIBLE_DEVICES=$r ./gollm -world 8 -rank $r -data ~/godata \
+    -emb 256 -tokens 360 -blocks 6 -heads 4 -born true -born_linear true -born_chunk 120 \
+    -rope true -token_norm true -tw_cublas false -emb_gauss true \
+    -ce_smooth 0 -ce_eps 1e-3 -grad_clip 1.0 -lr 1e-3 -min_lr 1e-4 -warmup 100 \
+    -batch 64 -steps 30000 -val_every 500 -save_path ~/go_h4_n360.mod -nccl_id /tmp/gollm_id &
+done; wait
+```
+
+Result: best validation **3.868 nats/move** (step 29000; final pass 3.904; exact-Born held-out loss 3.905 over
+500 windows), against ~4.7 for the 128-move single-head recipe above; the curve was still improving slowly at
+the end. 4.4M complex parameters. The checkpoint plays a sensible opening (`-predict` on the empty board: 4-4
+point 48%, 3-4 point 39%, then other corners) and generates whole games with `-generate` (legal-move filter on).
+The unigram saddle was not hit with the linear kernels (`-tw_cublas false` kept as in the recipe above).
+
 ### Metadata printed at startup (rank 0)
 
 ```

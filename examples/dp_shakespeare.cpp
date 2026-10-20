@@ -60,6 +60,13 @@ FLAG_INT(rank, 0)            // this process's rank in [0, world)
 FLAG_INT(world, 1)          // number of data-parallel processes (one per GPU)
 FLAG_INT(batch, 32)         // GLOBAL batch, split across ranks (per-rank = batch/world)
 FLAG_INT(emb, 64)           // embedding width E
+FLAG_INT(heads, 1)          // Born attention heads: the E/2-wide complex head is split into
+                            // `heads` heads of E/(2*heads) dims (per-head scores, per-head RoPE)
+FLAG_BOOL(pos_table, true)  // learned absolute positional table (N x E) added to the embedding; false = RoPE only
+                            // (21% fewer parameters at N=4096/E=256, no context ceiling for the streaming decoder)
+FLAG_BOOL(born_linear, false) // GPU: exact chunkwise linear Born form (O(N) scratch; needs N % born_chunk == 0)
+FLAG_INT(born_chunk, 512)   // chunk length C of the linear form
+FLAG_BOOL(born_decay, false) // fixed per-head decay gamma_h^(k-m) on the Born score (gamma_h = 1 - 2^-(5+h)); exact in the linear state
 FLAG_INT(tokens, 64)        // context length N
 FLAG_INT(blocks, 4)         // number of FNet blocks L
 FLAG_INT(steps, 3000)       // optimizer steps
@@ -75,6 +82,8 @@ FLAG_FLOAT(grad_norm_clip, 0.0) // GLOBAL gradient-norm clip on the all-reduced 
                                 // every rank (same summed gradient), so replicas stay in sync.
 FLAG_STRING(data, "tiny_shakespear2.txt")
 FLAG_BOOL(born, false)      // use Born-rule attention mixer instead of causal Fourier
+FLAG_BOOL(gla, false)       // gated linear attention over complex amplitudes (degree-one counterpart of Born;
+                            // per-head sigmoid gates from the pre-normed stream; TokenNorm after the mixer)
 FLAG_STRING(attn_at, "")    // hybrid: comma-separated block indices that use Born attention
                             // (the rest use TriangFourier). Empty = all blocks follow -born.
 FLAG_BOOL(block_norm, false) // L2-normalize (SoftMax) each block output (deep nets)
@@ -88,6 +97,12 @@ FLAG_FLOAT(attn_eps, 0.0)   // Born-ATTENTION normalization floor A=s/(S+eps): b
 FLAG_STRING(save_path, "")  // if set, rank 0 saves the trained model here after training
 FLAG_BOOL(generate, false)  // generation mode: restore -model and sample text (no training)
 FLAG_BOOL(eval_loss, false) // eval mode: restore -model, report exact-Born held-out loss
+FLAG_STRING(eval_stream, "") // eval mode: stream this byte file through -model on the GPU in -eval_window byte
+                             // windows (state carried across consecutive N-token forwards, reset per window;
+                             // the MBLM 5M-byte protocol), -eval_batch windows in parallel; prints bits/byte
+FLAG_INT(eval_window, 5242880) // bytes per state reset (multiple of the model context N)
+FLAG_INT(eval_batch, 4)      // windows evaluated in parallel (GPU memory ~ batch x the training footprint)
+FLAG_INT(eval_bytes, 0)      // bytes of -eval_stream to use (0 = whole file)
 FLAG_STRING(model, "")      // model file to restore in -generate mode
 FLAG_STRING(init_model, "") // warm-restart: restore these weights before training (continue a checkpoint)
 FLAG_STRING(prompt, "ROMEO:")// seed text for generation
@@ -174,8 +189,15 @@ struct TokenData {
 // SequenceCrossEntropy. Returns the output (SequenceCrossEntropy) id.
 static int buildLM(ComplexNet &net, int embId, int E, int N, int L, int vocab) {
 	const int size = N * E, H = 4 * E;
-	int pos  = net.add(new CInput(OutSize(size)));
-	int last = net.add(new Residual(InSize(size), InSize(size)), {embId, pos});
+	int last = embId;
+	if (pos_table) {                                                        // learned absolute positions
+		int pos = net.add(new CInput(OutSize(size)));
+		last = net.add(new Residual(InSize(size), InSize(size)), {embId, pos});
+	} else {
+		// No positional table (RoPE only; the model then streams past N without limit). The GPU embedding
+		// mapping expects a single consumer, so the residual stream starts from the normalized embedding.
+		last = net.add(new TokenNorm(N, E), {embId});
+	}
 	const int dh = E / 2;   // Born-rule attention head dim (complex)
 	// Per-token pre-norm (complex RMSNorm). When on, each sub-block sees a
 	// normalized residual-stream input; the residual still adds to the un-normed
@@ -189,17 +211,27 @@ static int buildLM(ComplexNet &net, int embId, int E, int N, int L, int vocab) {
 	  while (std::getline(ss, tok, ',')) if (!tok.empty()) attn_set.insert(std::stoi(tok)); }
 	for (int b = 0; b < L; ++b) {
 		int mixout;
-		bool useBorn = attn_set.empty() ? (bool) born : (attn_set.count(b) > 0);
+		bool useBorn = attn_set.empty() ? ((bool) born || (bool) gla) : (attn_set.count(b) > 0);
 		if (useBorn) {                                                     // Born-rule attention
 			int pre = net.add(new CGelu(InSize(size)), {norm(last)});
 			int wQ = net.add(new CInput(OutSize(E * dh))); int Q  = net.add(new TokenwiseLinear(N, E, dh), {pre, wQ});
 			int wK = net.add(new CInput(OutSize(E * dh))); int K  = net.add(new TokenwiseLinear(N, E, dh), {pre, wK});
 			int wV = net.add(new CInput(OutSize(E * dh))); int Vv = net.add(new TokenwiseLinear(N, E, dh), {pre, wV});
 			if (rope) {                                                        // RoPE on queries/keys
-				Q = net.add(new RotaryEmbed(N, dh), {Q});
-				K = net.add(new RotaryEmbed(N, dh), {K});
+				Q = net.add(new RotaryEmbed(N, dh, 10000.0, heads), {Q});
+				K = net.add(new RotaryEmbed(N, dh, 10000.0, heads), {K});
 			}
-			int att = net.add(new BornAttention(N, dh, true, attn_eps), {Q, K, Vv});
+			int att;
+			if (gla) {                                                         // complex-amplitude gated linear attention
+				int wG = net.add(new CInput(OutSize(E * heads))); int G = net.add(new TokenwiseLinear(N, E, heads), {pre, wG});
+				int g = net.add(new GatedLinearAttention(N, dh, heads), {Q, K, Vv, G});
+				((GatedLinearAttention*) net[g])->setChunk(born_chunk);
+				att = net.add(new TokenNorm(N, dh), {g});                       // GLA's output norm (no normalizer in the mix)
+			} else {
+				att = net.add(new BornAttention(N, dh, true, attn_eps, heads), {Q, K, Vv});
+				((BornAttention*) net[att])->setLinear(born_linear, born_chunk);
+				((BornAttention*) net[att])->setDecay(born_decay);
+			}
 			int wO = net.add(new CInput(OutSize(dh * E)));
 			mixout = net.add(new TokenwiseLinear(N, dh, E), {att, wO});
 		} else {                                                           // causal Fourier
@@ -351,8 +383,117 @@ static int runEval() {
 	return 0;
 }
 
+// Windowed streaming evaluation on the GPU: the exact recurrence of the CPU twin (impl/stepnet.h),
+// N tokens at a time. Each gated-linear-attention layer carries its state across the consecutive
+// forwards of a window (GatedLinearAttentionGpu::setCarry) and RoPE uses the absolute byte position,
+// so a 5,242,880-byte window is 1,280 forwards of N=4096 with one state reset at the start. Only
+// whole N-token blocks are scored (a window's trailing remainder is dropped and reported). Bytes
+// outside the model's vocabulary are fed as id 0, their own positions are not scored, and they are
+// charged 8 bits each in bpb_all.
+static int runEvalStream() {
+	FILELog::ReportingLevel() = lWarning;
+	if (((std::string) model).empty()) { std::cerr << "-eval_stream requires -model <file>\n"; return 1; }
+	std::vector<char> i2c; std::map<char, int> c2i;
+	if (!readVocabSidecar((std::string) model, i2c, c2i)) { std::cerr << "no vocab sidecar next to " << (std::string) model << "\n"; return 1; }
+	std::ifstream f((std::string) eval_stream, std::ios::binary);
+	if (!f) { std::cerr << "cannot read " << (std::string) eval_stream << "\n"; return 1; }
+	std::string buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+	if (eval_bytes > 0 && (size_t) eval_bytes < buf.size()) buf.resize(eval_bytes);
+
+	CNet net;
+	if (!net.restore((std::string) model)) { std::cerr << "cannot restore model: " << (std::string) model << "\n"; return 1; }
+	auto *em  = (CEmbedding*) net.cpuNet().findFirstOfType(isEmbedding);
+	auto *seq = (SequenceCrossEntropy*) net.cpuNet().findFirstOfType(isSeqCrossEntropy);
+	if (!em || !seq) { std::cerr << "restored model missing embedding / sequence head\n"; return 1; }
+	seq->setEps(0); seq->setSmooth(0);                       // exact Born probabilities
+	const int N = seq->nPos();
+	const long W = eval_window;
+	if (W % N != 0) { std::cerr << "-eval_window must be a multiple of the model context N=" << N << "\n"; return 1; }
+	// The linear (chunkwise density-matrix) form is the one with a carried state; it computes the same
+	// operator as the quadratic kernel, so restored Born layers are switched to it here (chunk = -born_chunk).
+	for (CFunc *fn : net.cpuNet().funcs())
+		if (auto *b = dynamic_cast<BornAttention*>(fn)) {
+			if (N % born_chunk != 0) { std::cerr << "eval_stream: -born_chunk must divide the context N=" << N << "\n"; return 1; }
+			b->setLinear(true, born_chunk);
+		}
+	const long NWtot = (long) (buf.size() + W - 1) / W;        // windows, the last one possibly partial
+	const int Bn = std::max(2, (int) std::min<long>(eval_batch, NWtot));   // the batched GPU path needs >= 1 clone
+	if (!net.allocateOnGpu(Bn)) { std::cerr << "GPU allocation failed\n"; return 1; }
+	std::vector<GatedLinearAttentionGpu*> glas; std::vector<BornAttentionGpu*> borns; std::vector<RotaryEmbed*> ropes;
+	for (CFunc *fn : net.cpuNet().funcs()) {
+		if (dynamic_cast<GatedLinearAttention*>(fn)) { auto *g = (GatedLinearAttentionGpu*) net.getMappingFor(fn); g->setCarry(true); glas.push_back(g); }
+		if (dynamic_cast<BornAttention*>(fn)) { auto *b = (BornAttentionGpu*) net.getMappingFor(fn); b->setCarry(true); borns.push_back(b); }
+		if (auto *r = dynamic_cast<RotaryEmbed*>(fn)) ropes.push_back(r);
+	}
+	auto *sce = (SequenceCrossEntropyGpu*) net.getMappingFor(seq);
+	auto idOf = [&](long b) { auto it = c2i.find(buf[b]); return it == c2i.end() ? -1 : it->second; };
+
+	double nll_total = 0; long scored_total = 0, skipped_total = 0, dropped_total = 0;
+	std::vector<float> losses;
+	for (long g = 0; g < NWtot; g += Bn) {
+		const int nw = (int) std::min<long>(Bn, NWtot - g);
+		std::vector<long> wbytes(Bn, 0), nblk(Bn, 0);
+		long maxblk = 0;
+		for (int i = 0; i < nw; ++i) {
+			wbytes[i] = std::min<long>(W, (long) buf.size() - (g + i) * W);
+			nblk[i] = wbytes[i] / N;                              // whole blocks only
+			dropped_total += wbytes[i] - nblk[i] * N - (nblk[i] * N < wbytes[i] ? 1 : 0);
+			maxblk = std::max(maxblk, nblk[i]);
+		}
+		for (auto *gl : glas) gl->resetCarry();
+		for (auto *b : borns) b->resetCarry();
+		std::vector<double> wnll(Bn, 0); std::vector<long> wsc(Bn, 0), wsk(Bn, 0);
+		for (long j = 0; j < maxblk; ++j) {
+			for (auto *r : ropes) r->setPos((int) (j * N));
+			EmbeddingBatch b(Bn, N);
+			for (int i = 0; i < Bn; ++i) {
+				std::vector<int> win(N, 0); int lab = 0;
+				if (i < nw && j < nblk[i]) {
+					const long base = (g + i) * W + j * N;
+					for (int t = 0; t < N; ++t) { int id = idOf(base + t); win[t] = id < 0 ? 0 : id; }
+					if (j * N + N < wbytes[i]) { int id = idOf(base + N); lab = id < 0 ? 0 : id; }
+				}
+				b.add(win, lab);
+				std::vector<int> tg(N, 0);                            // per-position targets: next token, label last
+				for (int t = 0; t + 1 < N; ++t) tg[t] = win[t + 1];
+				tg[N - 1] = lab;
+				b.addTargets(tg);
+			}
+			net.gpuForward(em, seq, b);
+			sce->readLosses(losses);
+			for (int i = 0; i < nw; ++i) {
+				if (j >= nblk[i]) continue;
+				const long base = (g + i) * W + j * N;
+				for (int t = 0; t < N; ++t) {
+					const long tb = j * N + t + 1;                    // target byte, window-relative
+					if (tb >= wbytes[i]) continue;                     // no next byte in this window
+					if (tb >= nblk[i] * N + 1) continue;               // beyond the scored blocks
+					if (idOf(base + t + 1) < 0) { wsk[i]++; continue; }
+					wnll[i] += losses[(size_t) i * N + t]; wsc[i]++;
+				}
+			}
+		}
+		for (int i = 0; i < nw; ++i) {
+			const double bits = wnll[i] / std::log(2.0);
+			std::cout << "WINDOW " << (g + i) << " bytes=" << wbytes[i] << " blocks=" << nblk[i] << " scored=" << wsc[i]
+					  << " skipped=" << wsk[i] << " nats/char=" << (wsc[i] ? wnll[i] / wsc[i] : 0.0)
+					  << " bits/char=" << (wsc[i] ? bits / wsc[i] : 0.0) << " sum_nll=" << wnll[i] << std::endl;
+			nll_total += wnll[i]; scored_total += wsc[i]; skipped_total += wsk[i];
+		}
+	}
+	const double bits = nll_total / std::log(2.0);
+	const long all = scored_total + skipped_total;
+	std::cout << "EVAL_STREAM file=" << (std::string) eval_stream << " bytes=" << buf.size() << " window=" << W << " N=" << N
+			  << " windows=" << NWtot << " scored=" << scored_total << " skipped=" << skipped_total << " dropped=" << dropped_total
+			  << " nats/char=" << (scored_total ? nll_total / scored_total : 0.0)
+			  << " bits/char=" << (scored_total ? bits / scored_total : 0.0)
+			  << " bpb_all=" << (all ? (bits + 8.0 * skipped_total) / all : 0.0) << " sum_nll=" << nll_total << std::endl;
+	return 0;
+}
+
 int main(int argc, char **argv) {
 	FLAGS::Parse(argc, argv);
+	if (!((std::string) eval_stream).empty()) return runEvalStream();   // GPU windowed streaming (bits/byte)
 	if (eval_loss) return runEval();              // restore a model, report exact-Born val
 	if (generate) return runGenerate();          // standalone sampling, no training / NCCL
 	if (print_net) {                              // dump the layer graph, no training / NCCL
@@ -363,7 +504,7 @@ int main(int argc, char **argv) {
 		int embId = net.cpuNet().add(new CEmbedding(emb, tokens, vcb));
 		buildLM(net.cpuNet(), embId, emb, tokens, blocks, vcb);
 		std::cout << "config: born=" << born << " token_norm=" << token_norm
-				  << " rope=" << rope << " block_norm=" << block_norm
+				  << " rope=" << rope << " pos_table=" << pos_table << " block_norm=" << block_norm
 				  << "  E=" << emb << " N=" << tokens << " L=" << blocks
 				  << " vocab=" << vcb << "\n\n"
 				  << net.cpuNet().toString();
@@ -416,7 +557,7 @@ int main(int argc, char **argv) {
 		std::cout << (token_lm ? "token-LM: tokens=" : "tiny-shakespeare: chars=") << ids.size() << " vocab=" << vocab
 				  << "  model E=" << E << " N=" << N << " L=" << L
 				  << "  global_batch=" << batch << " world=" << W
-				  << "  born=" << born << " attn_at=[" << (std::string) attn_at << "]"
+				  << "  born=" << born << " heads=" << heads << " attn_at=[" << (std::string) attn_at << "]"
 				  << " block_norm=" << block_norm
 				  << " token_norm=" << token_norm << " rope=" << rope
 				  << "  grad_clip=" << grad_clip << " ce_eps=" << ce_eps

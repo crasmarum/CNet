@@ -53,6 +53,8 @@ public:
 	}
 
 	int nTokens()    const { return n_tokens_; }
+	int eIn()        const { return e_in_; }
+	int eOut()       const { return e_out_; }
 	int inDim()      const { return e_in_; }
 	int outDim()     const { return e_out_; }
 	int weightBase() const { return n_tokens_ * e_in_; }  // index where the weight starts

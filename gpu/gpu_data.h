@@ -62,7 +62,8 @@ public:
 		X(isBornAttention,  BornAttentionGpu)  \
 		X(isTokenNorm,      TokenNormGpu)      \
 		X(isRotary,         RotaryEmbedGpu)    \
-		X(isHadamardConv,   HadamardConvGpu)
+		X(isHadamardConv,   HadamardConvGpu)   \
+		X(isGLA,            GatedLinearAttentionGpu)
 
 	void add(float **gpu_ptr, std::vector<CFunc*>& block, int depth) {
 		assert(block.size());

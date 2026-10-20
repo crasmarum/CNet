@@ -70,7 +70,7 @@ the **held-out** test split (never augmented) and prints `RadioML TEST accuracy`
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `-arch` | `16` | `11` pooled-power baseline · `15` + cyclic-correlation `R(τ)` · `16` + normalized cyclic spectrum (best) |
+| `-arch` | `16` | `11` pooled-power baseline · `15` + cyclic-correlation `R(τ)` · `16` + normalized cyclic spectrum · `20` VT-CNN2-style complex conv stack on the 2-D IQ image (`data/rml22_to_2dbin.py` bins, `-seq_len 256`) · `21` conjugate-lag streams + complex GLA over the unpooled sequence (best; 1-D bins) |
 | `-seq_len` | `128` | IQ window length `L` (must match the `.bin` header) |
 | `-n_classes` | `11` | modulation classes (RML2016.10a / RML22 = 11, RML2016.10b = 10) |
 | `-n_channels` | `128` | learnable spectral conv-bank channels |
@@ -87,7 +87,13 @@ the **held-out** test split (never augmented) and prints `RadioML TEST accuracy`
 | `-gauss_init` | `true` | scaled complex-Gaussian **per-input** init — essential (a shared init keeps all channels symmetric and the net never learns) |
 | `-init_scale` | `1.0` | init variance = `init_scale / length` |
 | `-seed` | `12345` | RNG seed for weight init (vary across runs for mean ± std) |
-| `-augment` | `false` | training-time random phase-rotation + time-reversal (the held-out test split is **never** augmented) |
+| `-augment` | `false` | training-time random phase rotation + time reversal (the held-out test split is **never** augmented); layout-aware for the 2-D bins of arch 20 |
+| `-aug_reverse` / `-aug_cfo` | `true` / `0` | with `-augment`: include time reversal; max random carrier-frequency offset in rad/sample (a linear phase ramp) |
+| `-eval_examples` | `20000` | held-out examples scored after every epoch on a fixed subset (`EPOCH e held-out acc ...`); the best epoch's weights are saved to `<model_path>.best` (`0` = only the final full pass) |
+| `-cosine` | `false` | cosine decay of `-l_rate` over all steps to 5% of its value |
+| `-conv_act` / `-dropout` | `u` / `0` | arch 20: conv activation (`u` per-plane TokenNorm, `crelu`, `cgelu`) and complex dropout after the conv and dense layers |
+| `-gla_blocks` / `-gla_dim` / `-gla_heads` / `-gla_chunk` | `2` / `64` / `4` / `64` | arch 21: number of complex-GLA blocks, stream width, heads, GPU chunk (`seq_len % chunk == 0`) |
+| `-lags` / `-cyc_branch` | `1,2,3,4` / `true` | arch 21: conjugate-lag streams `x_t conj(x_{t-τ})` kept at full resolution; also feed the pooled arch-16 cyclostationary bank to the head |
 | `-radioml_train` / `-radioml_test` | — | train / test `.bin` paths |
 | `-model_path` | — | save (train) / restore (infer) path |
 | `-infer` | `false` | forward-only held-out inference from a restored model |
@@ -120,6 +126,30 @@ done
 > restored from the model, but `-arch` must be consistent for the data reader and
 > class count.)
 
+## arch 21: conjugate-lag streams read by a complex gated sequence mixer
+
+Pooling the lag products (arch 16) discards the symbol-transition trajectories. arch 21 keeps them: every time step is
+represented by the raw sample, its conjugate lag products at `-lags` and its power, embedded token-wise into
+`-gla_dim` complex channels (one `TokenwiseLinear(L, 1, E)` per stream, summed), then `-gla_blocks` pre-norm blocks of
+the complex-amplitude `GatedLinearAttention` (scalar per-head gates, running `dh x dh` state) with position-wise
+feed-forward layers, a dense head over the `L x E` tokens, optionally concatenated with the pooled cyclostationary bank
+(`-cyc_branch`), and the Born-rule classifier. Nothing new was written for it: it is the language-model block applied to
+IQ samples.
+
+```bash
+./radioml -radioml_train rmldata/rml10a_train.bin -radioml_test rmldata/rml10a_test.bin \
+          -arch 21 -seq_len 128 -n_classes 11 -no_epochs 10 -l_rate 3.2e-3 -cosine true \
+          -eval_examples 20000 -model_path rml21.mod       # best epoch -> rml21.mod.best
+./radioml -infer true -model_path rml21.mod.best -arch 21 -seq_len 128 -n_classes 11 \
+          -radioml_test rmldata/rml10a_test.bin -confusion true
+```
+
+The per-step learning rate is `-l_rate / -batch_size`. The model overfits after the first epoch or two (training accuracy
+0.98 against a flat test accuracy), so the per-epoch held-out subset and the `.best` checkpoint are what give the number;
+complex dropout on the token stream and time-reversal augmentation both lowered it (0.43 / 0.34 at `-dropout 0.3 / 0.5`,
+0.43 with `-augment`), the latter because reversal runs the causal recurrence backwards. A global phase rotation leaves
+every lag stream invariant.
+
 ## Expected numbers
 
 Trained with the defaults above (true Adam, `gauss_init`, `l_rate 8e-4`):
@@ -129,6 +159,17 @@ Trained with the defaults above (true Adam, `gauss_init`, `l_rate 8e-4`):
 | RML2016.10a | ~0.47 | **~0.49** | ~0.70* |
 | RML2016.10b | — | ~0.47 | ~0.69 |
 | RML22 (artifact-corrected) | — | **~0.50** | ~0.65 |
+
+arch 21 (50/50 split, all SNRs, `-l_rate 3.2e-3 -cosine true`, best epoch of 10 on RML2016.10a and of 6 on RML22, scored
+on the full test split with `-infer`):
+
+| Dataset | arch 21 | plateau | arch 20 (CGelu, 6 epochs) |
+|---|---|---|---|
+| RML2016.10a | **0.515** | ~0.80 from +4 dB | — |
+| RML22 | **0.597** | ~0.87 from +8 dB | 0.403 |
+
+Residual confusions are QAM16 (absorbed by QAM64) and WBFM/AM-DSB. For arch 20, the default `-conv_act u`
+(amplitude-removing) stays at chance for two epochs at every learning rate tried; use `-conv_act cgelu`.
 
 On the artifact-corrected **RML22** benchmark arch 16 reaches ~0.50 overall — on
 par with the reported overall accuracy of the VT-CNN2 real-valued baseline. The

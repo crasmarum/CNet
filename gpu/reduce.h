@@ -223,19 +223,80 @@ public:
 // its verified Wirtinger backward). Input [Q;K;V] of length 3*N*d per clone ->
 // output N*d. Per-clone scratch stores c (N*N complex), A (N*N real) and S (N).
 class BornAttentionGpu : public GpuMapping {
-	cmplx_ *ba_c_ = NULL;   // c[k,m]   : B*N*N
-	float  *ba_A_ = NULL;   // A[k,m]   : B*N*N
-	float  *ba_S_ = NULL;   // S[k]     : B*N
-	int ba_N_ = 0, ba_d_ = 0, ba_M_ = 0;   // M_ = number of clones (getNoMappings)
-	void ensure_scratch(int N, int d, int M);
+	cmplx_ *ba_c_ = NULL;   // c[h][k,m] : B*H*N*N
+	float  *ba_A_ = NULL;   // A[h][k,m] : B*H*N*N
+	float  *ba_S_ = NULL;   // S[h][k]   : B*H*N
+	int ba_N_ = 0, ba_d_ = 0, ba_H_ = 0, ba_M_ = 0, ba_cols_ = 0;   // M_ = number of clones (getNoMappings)
+	void ensure_scratch(int N, int d, int H, int M, int cols);   // cols: N (quadratic) or chunk C (linear)
 	void free_scratch();
+	// Linear (chunkwise density-matrix) mode -- see gpu_born_linear_forward(). Per (clone, head):
+	// lifted chunk features cQ/cK [C, d2] (d2 = dh*dh packed Hermitian features), packed value
+	// chunk U [2][C][dh], inter-chunk readout num [2][C][dh] / den [C], running state
+	// M [2][d2][dh] and Z [d2], and the per-chunk-start snapshots Mhist/Zhist for the backward.
+	float *lin_cQ_ = NULL, *lin_cK_ = NULL, *lin_U_ = NULL, *lin_num_ = NULL, *lin_den_ = NULL;
+	float *lin_M_ = NULL, *lin_Z_ = NULL, *lin_Mhist_ = NULL, *lin_Zhist_ = NULL, *lin_ones_ = NULL;
+	float *lin_cKw_ = NULL, *lin_cQd_ = NULL;   // decay: keys lifted then weighted by gamma^(C-1-j), queries by gamma^(i+1)
+	int *lin_idx_ = NULL;   // feature a -> (m, n) pair table, 2*d2 ints
+	// backward scratch (see gpu_born_linear_backward): packed output grads / values per chunk,
+	// the C x C intra matrices, per-chunk lifted-space gradients and the suffix state.
+	float *bw_Gm_ = NULL, *bw_Gt_ = NULL, *bw_Ut_ = NULL, *bw_Ug_ = NULL, *bw_G4_ = NULL;
+	float *bw_Am_ = NULL, *bw_Bm_ = NULL, *bw_W_ = NULL, *bw_Gq_ = NULL, *bw_Gk_ = NULL, *bw_cQs_ = NULL;
+	float *bw_dV_ = NULL, *bw_abar_ = NULL, *bw_abarD_ = NULL, *bw_Ms_ = NULL, *bw_Zs_ = NULL;
+	void gpu_born_linear_backward();
+	int lin_C_ = 0, lin_NC_ = 0, lin_d2_ = 0, lin_B_ = 0, lin_H_ = 0, lin_dh_ = 0;
+	void ensure_linear_scratch(int N, int d, int H, int C, int B);
+	// Carried state for windowed streaming (linear mode): with carry_ on, a forward starts from
+	// carry_M_/carry_Z_ (the state after the previous forward of the same clone) and leaves its final
+	// state there; the decay bookkeeping is unchanged because the state is kept at "after the last token".
+	float *carry_M_ = NULL, *carry_Z_ = NULL; bool carry_ = false;
+	void free_linear_scratch();
+	void gpu_born_linear_forward();
 public:
 	BornAttentionGpu(int depth) : GpuMapping(depth) {}
-	virtual ~BornAttentionGpu() { free_scratch(); }
+	virtual ~BornAttentionGpu() { free_scratch(); free_linear_scratch(); }
+	void setCarry(bool on) { carry_ = on; }
+	void resetCarry();
 	void gpu_born_forward();
 	void gpu_born_backward();
 	virtual void forward() override { gpu_born_forward(); }
 	virtual void backward(int label) override { gpu_born_backward(); }
+};
+
+// Gated linear attention over complex amplitudes on GPU (see impl/gla.h for the layer and its
+// Wirtinger backward). Chunkwise: per (clone, head) a dh x dh complex state S (two planes) carried
+// across chunks of C tokens; inside a chunk the C x C amplitudes are formed directly. Complex
+// GEMMs are four real strided-batched cuBLAS GEMMs on the [re | im] planes. Backward sweeps the
+// chunks in reverse with a suffix state (G, Gb) built from the queries and output gradients.
+class GatedLinearAttentionGpu : public GpuMapping {
+	// per (clone, head) gate arrays over all tokens: lambda_t = log sigmoid(Re g_t), L_t = chunk-local
+	// inclusive cumulative sum; plus the per-chunk totals LC[c]
+	float *gl_lam_ = NULL, *gl_L_ = NULL;
+	// chunk planes [2][C][dh]: Qs (exp(L) q), Kt (exp(LC-L) k), Qraw, Kraw, V, Oint; state S [2][dh][dh]
+	// and its per-chunk snapshots Shist [NC][BH][2][dh][dh]
+	float *gl_Qs_ = NULL, *gl_Kt_ = NULL, *gl_Qr_ = NULL, *gl_Kr_ = NULL, *gl_V_ = NULL, *gl_Oint_ = NULL;
+	float *gl_S_ = NULL, *gl_Shist_ = NULL;
+	// backward: gradient planes, C x C amplitude / weighted-p planes, gate partials, suffix state
+	float *bw_Gg_ = NULL, *bw_Gb_ = NULL, *bw_A_ = NULL, *bw_PW_ = NULL, *bw_PbW_ = NULL, *bw_E_ = NULL, *bw_Ecum_ = NULL;
+	float *bw_eps_ = NULL, *bw_eta_ = NULL, *bw_Dc_ = NULL;
+	float *bw_dQ_ = NULL, *bw_dQb_ = NULL, *bw_dQi_ = NULL, *bw_dQbi_ = NULL;
+	float *bw_dK_ = NULL, *bw_dKb_ = NULL, *bw_dKl_ = NULL, *bw_dKlb_ = NULL, *bw_dV_ = NULL, *bw_dVb_ = NULL;
+	float *bw_G_ = NULL, *bw_Gbs_ = NULL;
+	int gl_N_ = 0, gl_C_ = 0, gl_B_ = 0, gl_H_ = 0, gl_dh_ = 0;
+	// Carried state for windowed streaming: when carry_ is on, each forward starts from carry_S_
+	// (per clone and head, zero after resetCarry) instead of zero and leaves its final state there,
+	// so consecutive N-token forwards of one clone form an unbroken recurrence.
+	float *carry_S_ = NULL; bool carry_ = false;
+	void ensure_scratch(int N, int d, int H, int C, int B);
+	void free_scratch();
+public:
+	GatedLinearAttentionGpu(int depth) : GpuMapping(depth) {}
+	virtual ~GatedLinearAttentionGpu() { free_scratch(); }
+	void setCarry(bool on) { carry_ = on; }
+	void resetCarry();
+	void gpu_gla_forward();
+	void gpu_gla_backward();
+	virtual void forward() override { gpu_gla_forward(); }
+	virtual void backward(int label) override { gpu_gla_backward(); }
 };
 
 // Per-token complex RMS normalization on the GPU (see impl/tokennorm.h). One
@@ -343,6 +404,8 @@ class SequenceCrossEntropyGpu : public GpuMapping {
 public:
 	SequenceCrossEntropyGpu(int depth) : GpuMapping(depth) {
 	}
+	void readLosses(std::vector<float> &out);   // all B*n_pos per-position losses, clone-major
+	int nPos() const { return n_pos_; }
 	virtual ~SequenceCrossEntropyGpu();
 
 	// Called once at allocation in the batched path: the device targets arena

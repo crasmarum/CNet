@@ -84,6 +84,9 @@ FLAG_FLOAT(grad_noise, 0.0) // if >0: add decaying Gaussian noise N(0, (grad_noi
 FLAG_STRING(data, "godata") // directory with train.bin / val.bin (uint16 move ids)
 FLAG_INT(vocab_size, GO_VOCAB)  // vocabulary size (keep at 723 for 19x19 Go)
 FLAG_BOOL(born, true)       // Born-rule attention mixer (false = causal Fourier)
+FLAG_INT(heads, 1)          // Born attention heads (the E/2-wide complex head split into `heads` of E/(2*heads) dims)
+FLAG_BOOL(born_linear, false) // GPU: exact chunkwise linear Born form (O(N) scratch; needs -tokens % -born_chunk == 0)
+FLAG_INT(born_chunk, 120)   // chunk length of the linear form
 FLAG_BOOL(block_norm, false)// L2-normalize (SoftMax) each block output
 FLAG_BOOL(token_norm, true) // per-token complex RMS pre-norm (pre-LN transformer)
 FLAG_BOOL(rope, true)       // rotary position embedding on Born-attention Q,K
@@ -198,10 +201,11 @@ static int buildLM(ComplexNet &net, int embId, int E, int N, int L, int vocab) {
 			int wK = net.add(new CInput(OutSize(E * dh))); int K  = net.add(new TokenwiseLinear(N, E, dh), {pre, wK});
 			int wV = net.add(new CInput(OutSize(E * dh))); int Vv = net.add(new TokenwiseLinear(N, E, dh), {pre, wV});
 			if (rope) {
-				Q = net.add(new RotaryEmbed(N, dh), {Q});
-				K = net.add(new RotaryEmbed(N, dh), {K});
+				Q = net.add(new RotaryEmbed(N, dh, 10000.0, heads), {Q});
+				K = net.add(new RotaryEmbed(N, dh, 10000.0, heads), {K});
 			}
-			int att = net.add(new BornAttention(N, dh, true, attn_eps), {Q, K, Vv});
+			int att = net.add(new BornAttention(N, dh, true, attn_eps, heads), {Q, K, Vv});
+			((BornAttention*) net[att])->setLinear(born_linear, born_chunk);
 			int wO = net.add(new CInput(OutSize(dh * E)));
 			mixout = net.add(new TokenwiseLinear(N, dh, E), {att, wO});
 		} else {                                                           // causal Fourier

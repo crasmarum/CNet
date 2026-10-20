@@ -47,16 +47,36 @@ public:
 	// reversal s[n] -> s[N-1-n]. Both preserve the modulation class. (RadioLLM,
 	// arXiv:2501.17888.) Off by default; enable only on the TRAINING reader.
 	void setAugment(bool a) { augment_ = a; }
+	// Augmentation options: time reversal on/off, max random carrier-frequency offset (rad/sample,
+	// a linear phase ramp e^{j w k}, w ~ U(-cfo, cfo)), and the 2-D image layout of the VT-CNN2
+	// bins ([I_0..I_{W-1}, Q_0..Q_{W-1}] as REAL entries), where the rotation must act on the
+	// (I_k, Q_k) pairs and the reversal within each row.
+	void setAugmentOptions(bool reverse, float cfo, bool layout2d) { aug_reverse_ = reverse; aug_cfo_ = cfo; aug_2d_ = layout2d; }
+	bool aug_reverse_ = true; float aug_cfo_ = 0.f; bool aug_2d_ = false;
 
 	std::vector<std::complex<float> > augment(const std::vector<std::complex<float> > &in) {
 		std::uniform_real_distribution<float> U(0.0f, 6.2831853f);
 		float th = U(aug_rng_);
-		std::complex<float> rot(cosf(th), sinf(th));
-		bool rev = (aug_rng_() & 1u);
+		float w = 0.f;
+		if (aug_cfo_ > 0.f) { std::uniform_real_distribution<float> Uw(-aug_cfo_, aug_cfo_); w = Uw(aug_rng_); }
+		bool rev = aug_reverse_ && (aug_rng_() & 1u);
 		int n = (int) in.size();
 		std::vector<std::complex<float> > out(n);
+		if (aug_2d_) {
+			const int W = n / 2;
+			for (int k = 0; k < W; ++k) {
+				int src = rev ? (W - 1 - k) : k;
+				std::complex<float> z(in[src].real(), in[W + src].real());   // (I_k, Q_k) as one complex sample
+				float ph = th + w * k;
+				z *= std::complex<float>(cosf(ph), sinf(ph));
+				out[k] = std::complex<float>(z.real(), 0.f);
+				out[W + k] = std::complex<float>(z.imag(), 0.f);
+			}
+			return out;
+		}
 		for (int k = 0; k < n; ++k) {
-			out[k] = in[rev ? (n - 1 - k) : k] * rot;
+			float ph = th + w * k;
+			out[k] = in[rev ? (n - 1 - k) : k] * std::complex<float>(cosf(ph), sinf(ph));
 		}
 		return out;
 	}
@@ -64,6 +84,7 @@ public:
 	virtual ~BatchedDataReader() {
 	}
 
+	void rewind() { current_ = 0; }       // restart iteration (per-epoch held-out subsets)
 	int size() {
 		return samples_.size();
 	}

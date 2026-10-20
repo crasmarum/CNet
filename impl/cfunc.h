@@ -257,6 +257,9 @@ public:
 		return next_func_.size();
 	}
 
+	int no_next_func() const { return (int) next_func_.size(); }
+	CFunc* next(int index) { assert(index >= 0 && index < (int) next_func_.size()); return next_func_[index]; }
+
 	int no_previous_func() const {
 		return prev_func_.size();
 	}

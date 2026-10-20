@@ -982,13 +982,22 @@ private:
 	}
 
 	// BornAttention carries no learnable parameters of its own (Q/K/V come from
-	// feeding TokenwiseLinear layers), so only its constructor args (N tokens,
-	// complex head dim) are persisted.
+	// feeding TokenwiseLinear layers), so only its constructor args are persisted.
+	// Legacy record: N, dim (single head, eps 0). Extended record (heads > 1 or
+	// eps != 0): N, -dim, heads, eps -- the sign of dim is the version flag, so old
+	// files restore unchanged and old readers reject new files loudly.
 	bool Write(BornAttention *ba, BinaryWriter &writer) {
 		writer.write_int32(isBornAttention);
 		writeFuncInfo(writer, ba);
 		writer.write_int32(ba->nTokens());
-		writer.write_int32(ba->dim());
+		if (ba->heads() == 1 && ba->eps() == 0.f && !ba->decay()) {
+			writer.write_int32(ba->dim());
+		} else {
+			writer.write_int32(-ba->dim());
+			writer.write_int32(ba->decay() ? -ba->heads() : ba->heads());   // negative heads: fixed per-head decay on
+			float eps = ba->eps();
+			writer.write(&eps, 1);
+		}
 		return true;
 	}
 
@@ -997,10 +1006,46 @@ private:
 		std::vector<int> prev;
 		readFuncInfo(reader, prev);
 
-		int n_tokens = 0, dim = 0;
+		int n_tokens = 0, dim = 0, heads = 1;
+		float eps = 0.f;
 		assert(reader.read_int32(&n_tokens));
 		assert(reader.read_int32(&dim));
-		net.add(new BornAttention(Uid(uid), n_tokens, dim), prev);
+		bool decay = false;
+		if (dim < 0) {
+			dim = -dim;
+			assert(reader.read_int32(&heads));
+			if (heads < 0) { heads = -heads; decay = true; }
+			assert(reader.read_float(&eps, 1));
+		}
+		auto *ba = new BornAttention(Uid(uid), n_tokens, dim, true, eps, heads);
+		ba->setDecay(decay);
+		net.add(ba, prev);
+		return true;
+	}
+
+	// GatedLinearAttention (complex-amplitude gated linear attention): parameter-free, persist
+	// N, dim, heads and the amplitude scale.
+	bool Write(GatedLinearAttention *g, BinaryWriter &writer) {
+		writer.write_int32(isGLA);
+		writeFuncInfo(writer, g);
+		writer.write_int32(g->nTokens());
+		writer.write_int32(g->dim());
+		writer.write_int32(g->heads());
+		float scale = g->scale();
+		writer.write(&scale, 1);
+		return true;
+	}
+
+	bool RestoreGLA(ComplexNet &net, BinaryReader &reader) {
+		L_(lDebug) << "RestoreGLA";
+		std::vector<int> prev;
+		readFuncInfo(reader, prev);
+		int n_tokens = 0, dim = 0, heads = 1; float scale = 0.f;
+		assert(reader.read_int32(&n_tokens));
+		assert(reader.read_int32(&dim));
+		assert(reader.read_int32(&heads));
+		assert(reader.read_float(&scale, 1));
+		net.add(new GatedLinearAttention(Uid(uid), n_tokens, dim, heads, scale), prev);
 		return true;
 	}
 
@@ -1030,13 +1075,15 @@ private:
 	}
 
 	// RotaryEmbed is parameter-free; persist N, per-token dim, and the RoPE base.
+	// Extended record (heads > 1): N, -dim, base, heads (sign of dim = version flag).
 	bool Write(RotaryEmbed *ro, BinaryWriter &writer) {
 		writer.write_int32(isRotary);
 		writeFuncInfo(writer, ro);
 		writer.write_int32(ro->nTokens());
-		writer.write_int32(ro->dim());
+		writer.write_int32(ro->heads() == 1 ? ro->dim() : -ro->dim());
 		float base = (float) ro->base();
 		writer.write(&base, 1);
+		if (ro->heads() != 1) writer.write_int32(ro->heads());
 		return true;
 	}
 
@@ -1045,12 +1092,13 @@ private:
 		std::vector<int> prev;
 		readFuncInfo(reader, prev);
 
-		int n_tokens = 0, dim = 0;
+		int n_tokens = 0, dim = 0, heads = 1;
 		float base = 10000.f;
 		assert(reader.read_int32(&n_tokens));
 		assert(reader.read_int32(&dim));
 		assert(reader.read_float(&base, 1));
-		net.add(new RotaryEmbed(Uid(uid), n_tokens, dim, (double) base), prev);
+		if (dim < 0) { dim = -dim; assert(reader.read_int32(&heads)); }
+		net.add(new RotaryEmbed(Uid(uid), n_tokens, dim, (double) base, heads), prev);
 		return true;
 	}
 

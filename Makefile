@@ -45,6 +45,7 @@ ifeq ($(NVCC_TEST),nvcc)
            gpu/kernels.cpp \
            gpu/reduce.cpp \
            gpu/reducegrad.cpp \
+           gpu/gla_gpu.cpp \
            cnet.cpp
 
 else
@@ -59,6 +60,7 @@ else
            gpu/gpu_func.cpp \
            gpu/reduce.cpp \
            gpu/reducegrad.cpp \
+           gpu/gla_gpu.cpp \
            gpu/kernels.cpp \
            cnet.cpp
 endif
@@ -82,14 +84,14 @@ DEPS = $(OBJS:.o=.d)
 
 
 # Framework objects (everything except the selected main), reused by example mains.
-FW_SRCS = utils/flags.cpp gpu/gpu_func.cpp impl/vars.cpp gpu/kernels.cpp gpu/reduce.cpp gpu/reducegrad.cpp
+FW_SRCS = utils/flags.cpp gpu/gpu_func.cpp impl/vars.cpp gpu/kernels.cpp gpu/reduce.cpp gpu/reducegrad.cpp gpu/gla_gpu.cpp
 FW_OBJS = $(addprefix $(OBJ_DIR)/, $(notdir $(FW_SRCS:.cpp=.o)))
 
 
 # --- Build Rules ---
 
 # Phony targets are not actual files. 'all' is the default goal.
-.PHONY: all clean run info dp_shakespeare generate gollm radioml mnist_hadamard bench_mixer bench_clone bench_bornattn test_conjlag_fd test_hadamardconv_fd test_hadamardconv_gpu
+.PHONY: all clean run info dp_shakespeare generate gollm radioml mnist_hadamard bench_mixer bench_clone bench_bornattn test_conjlag_fd test_hadamardconv_fd test_hadamardconv_gpu test_bornattn_mh test_gla
 .DEFAULT_GOAL := all
 
 # Standalone multi-GPU data-parallel tiny-shakespeare example (its own main).
@@ -173,6 +175,20 @@ test_hadamardconv_gpu: $(FW_OBJS)
 	$(CXX) $(CXXFLAGS) -c examples/test_hadamardconv_gpu.cpp -o $(OBJ_DIR)/test_hadamardconv_gpu.o
 	$(CXX) $(FW_OBJS) $(OBJ_DIR)/test_hadamardconv_gpu.o $(LDFLAGS) -o $(TARGET_DIR)/test_hadamardconv_gpu
 	@echo "==> Built $(TARGET_DIR)/test_hadamardconv_gpu"
+
+# Multi-head BornAttention / per-head RoPE checks (FD, head-slicing oracle, GPU parity,
+# serialization). No NCCL; -gpu 0 skips the GPU parity part.
+test_bornattn_mh: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/test_bornattn_mh.cpp -o $(OBJ_DIR)/test_bornattn_mh.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/test_bornattn_mh.o $(LDFLAGS) -o $(TARGET_DIR)/test_bornattn_mh
+	@echo "==> Built $(TARGET_DIR)/test_bornattn_mh"
+
+test_gla: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/test_gla.cpp -o $(OBJ_DIR)/test_gla.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/test_gla.o $(LDFLAGS) -o $(TARGET_DIR)/test_gla
+	@echo "==> Built $(TARGET_DIR)/test_gla"
 
 # Default target: build the final executable.
 all: $(TARGET)

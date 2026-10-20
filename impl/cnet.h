@@ -31,6 +31,7 @@
 #include "tokenwise.h"
 #include "seqcrossent.h"
 #include "bornattn.h"
+#include "gla.h"
 #include "dropout.h"
 #include "conjlag.h"
 #include "segfourier.h"
@@ -65,6 +66,7 @@ const int isDropout = 23;
 const int isConjLag = 24;
 const int isSegFourier = 25;
 const int isHadamardConv = 26;
+const int isGLA = 27;
 
 const int isUnknown = INT_MAX;
 
@@ -101,7 +103,8 @@ const int isUnknown = INT_MAX;
 	X(ComplexDropout,      isDropout,        RestoreDropout)              \
 	X(ConjLagProduct,      isConjLag,        RestoreConjLag)              \
 	X(SegmentedFourier,    isSegFourier,     RestoreSegFourier)          \
-	X(HadamardConv,        isHadamardConv,   RestoreHadamardConv)
+	X(HadamardConv,        isHadamardConv,   RestoreHadamardConv)  \
+	X(GatedLinearAttention, isGLA,           RestoreGLA)
 
 
 /*
@@ -160,6 +163,10 @@ public:
 		if (func_at_depth_) {
 			delete [] func_at_depth_;
 		}
+	}
+
+	const std::vector<CFunc*>& funcs() const {   // all layers, in insertion (topological) order
+		return func_list_;
 	}
 
 	const std::vector<CFunc*>& inputs() const {
