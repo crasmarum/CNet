@@ -34,6 +34,10 @@
 #include <cmath>
 #include <cstdio>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <cstdint>
 #include <nccl.h>
 #include <cublas_v2.h>
 
@@ -116,23 +120,52 @@ FLAG_BOOL(tf32, false)      // TF32 tensor cores for the cuBLAS GEMMs (default s
 FLAG_BOOL(ksync, true)      // false: no host sync after every kernel in eager mode (same results, less launch latency)
 FLAG_INT(seed, 1000)        // base seed for the per-rank data sampler (rank r uses seed+r)
 FLAG_BOOL(emb_gauss, false) // symmetry-breaking zero-mean complex embedding init (vs default)
+FLAG_STRING(val_data, "")  // optional held-out text file; when set, all of -data is training data (char mode)
 FLAG_BOOL(token_lm, false)  // sub-word token LM: -data is a DIR with train.bin/val.bin (uint16 ids)
 FLAG_INT(vocab_size, 8192)  // vocab in -token_lm mode (must match the BPE used to make the bins)
 FLAG_STRING(nccl_id, "/tmp/cnet_shk_id")  // base path for the NCCL rendezvous id file (per DP group)
 
-// ---------------- minimal character dataset (90/10 train/val) ----------------
-struct CharData {
-	std::vector<int> data;
-	std::map<char, int> c2i;
-	int vocab = 0, ntrain = 0;
-	void load(const std::string &path) {
-		std::ifstream f(path);
-		std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-		if (s.empty()) { std::cerr << "cannot read " << path << "\n"; exit(1); }
-		for (char c : s) if (!c2i.count(c)) c2i[c] = vocab++;
-		for (char c : s) data.push_back(c2i[c]);
-		ntrain = (int) ((data.size() / 10) * 9);
+// ---------------- character dataset: memory-mapped bytes, one byte per character ----------------
+// The text is mapped read-only (MAP_SHARED), so it costs no heap and the page cache holds ONE copy
+// for all ranks on a node; ids are produced on the fly through a 256-entry byte -> id table. Ids keep
+// the first-seen order of the old loader (the training file first, then -val_data), so existing
+// models and .vocab sidecars stay compatible. Positions are 64-bit: the full PG-19 training set is
+// 11.6 billion characters. Without -val_data the last 10% of the file is held out, as before.
+struct ByteFile {
+	const unsigned char *p = nullptr; size_t n = 0;
+	bool open(const std::string &path) {
+		int fd = ::open(path.c_str(), O_RDONLY);
+		if (fd < 0) return false;
+		struct stat st; if (fstat(fd, &st) != 0 || st.st_size <= 0) { ::close(fd); return false; }
+		n = (size_t) st.st_size;
+		void *m = mmap(nullptr, n, PROT_READ, MAP_SHARED, fd, 0);
+		::close(fd);
+		if (m == MAP_FAILED) { n = 0; return false; }
+		p = (const unsigned char*) m;
+		return true;
 	}
+};
+struct CharData {
+	ByteFile tr, va;
+	std::map<char, int> c2i;
+	int vocab = 0, lut[256];
+	size_t ntrain = 0, total = 0;
+	void load(const std::string &path, const std::string &valpath = "") {
+		if (!tr.open(path)) { std::cerr << "cannot read " << path << "\n"; exit(1); }
+		if (!valpath.empty() && !va.open(valpath)) { std::cerr << "cannot read " << valpath << "\n"; exit(1); }
+		for (int b = 0; b < 256; ++b) lut[b] = -1;
+		auto scan = [&](const ByteFile &f) {
+			for (size_t i = 0; i < f.n && vocab < 256; ++i) {
+				const unsigned char b = f.p[i];
+				if (lut[b] < 0) { lut[b] = vocab++; c2i[(char) b] = lut[b]; }
+			}
+		};
+		scan(tr); scan(va);
+		if (va.n) { ntrain = tr.n; total = tr.n + va.n; }
+		else      { ntrain = (tr.n / 10) * 9; total = tr.n; }
+	}
+	int at(size_t i) const { return i < tr.n ? lut[tr.p[i]] : lut[va.p[i - tr.n]]; }
+	size_t size() const { return total; }
 };
 
 // ---- sidecar vocab: <model>.vocab stores the char<->id table so -generate/-eval
@@ -166,7 +199,9 @@ static bool readVocabSidecar(const std::string &model, std::vector<char> &i2c,
 // existing held-out sampler (which draws from [ntrain, size)) reads validation.
 struct TokenData {
 	std::vector<int> data;
-	int vocab = 0, ntrain = 0;
+	int vocab = 0; size_t ntrain = 0;
+	int at(size_t i) const { return data[i]; }
+	size_t size() const { return data.size(); }
 	static void readBin(const std::string &p, std::vector<int> &out) {
 		std::ifstream f(p, std::ios::binary);
 		if (!f) { std::cerr << "cannot read " << p << "\n"; exit(1); }
@@ -181,11 +216,26 @@ struct TokenData {
 		std::vector<int> tr, va;
 		readBin(dir + "/train.bin", tr);
 		readBin(dir + "/val.bin", va);
-		ntrain = (int) tr.size();
+		ntrain = tr.size();
 		data = std::move(tr);
 		data.insert(data.end(), va.begin(), va.end());
 	}
 };
+
+// Uniform read-only view over CharData or TokenData (the trainer and the evaluator use only this).
+struct Corpus {
+	CharData ch; TokenData tk; bool tok = false;
+	void load(bool token_mode, const std::string &path, const std::string &valpath, int vocab_) {
+		tok = token_mode;
+		if (tok) tk.load(path, vocab_); else ch.load(path, valpath);
+	}
+	int at(size_t i) const { return tok ? tk.at(i) : ch.at(i); }
+	size_t size() const { return tok ? tk.size() : ch.size(); }
+	size_t ntrain() const { return tok ? tk.ntrain : ch.ntrain; }
+	int vocab() const { return tok ? tk.vocab : ch.vocab; }
+	void window(size_t p, int n, std::vector<int> &out) const { out.resize(n); for (int i = 0; i < n; ++i) out[i] = at(p + i); }
+};
+
 
 // ------- fully complex FNet-AR language model (causal Fourier mixing) ---------
 // embedding + learnable positional + L x [TriangFourier mix -> residual+CGelu ->
@@ -358,9 +408,7 @@ static int runGenerate() {
 static int runEval() {
 	FILELog::ReportingLevel() = lWarning;
 	if (((std::string) model).empty()) { std::cerr << "-eval_loss requires -model <file>\n"; return 1; }
-	std::vector<int> ids; int ntrainTok;
-	if (token_lm) { TokenData d; d.load(data, vocab_size); ids = std::move(d.data); ntrainTok = d.ntrain; }
-	else          { CharData  d; d.load(data);             ids = std::move(d.data); ntrainTok = d.ntrain; }
+	Corpus corpus; corpus.load(token_lm, data, val_data, vocab_size);
 	CNet net;
 	if (!net.restore((std::string) model)) { std::cerr << "cannot restore model: " << (std::string) model << "\n"; return 1; }
 	auto *em  = (CEmbedding*) net.cpuNet().findFirstOfType(isEmbedding);
@@ -368,16 +416,15 @@ static int runEval() {
 	if (!em || !seq) { std::cerr << "restored model missing embedding / sequence head\n"; return 1; }
 	seq->setEps(0); seq->setSmooth(0);                    // exact Born for evaluation
 	const int Nw = seq->nPos();
-	int lo = ntrainTok, hi = (int) ids.size() - Nw - 2;
+	const long long lo = (long long) corpus.ntrain(), hi = (long long) corpus.size() - Nw - 2;
 	if (hi <= lo) { std::cerr << "not enough validation tokens\n"; return 1; }
-	std::mt19937 rng(777);
-	std::uniform_int_distribution<int> U(lo, hi);
+	std::mt19937_64 rng(777);
+	std::uniform_int_distribution<long long> U(lo, hi);
 	int K = gen_len > 0 ? gen_len : 500;                  // reuse -gen_len as eval window count
 	double tot = 0;
 	for (int k = 0; k < K; ++k) {
-		int p = U(rng);
-		std::vector<int> win(ids.begin() + p, ids.begin() + p + Nw), tgt(Nw);
-		for (int i = 0; i < Nw; ++i) tgt[i] = ids[p + 1 + i];
+		const long long p = U(rng);
+		std::vector<int> win, tgt; corpus.window((size_t) p, Nw, win); corpus.window((size_t) p + 1, Nw, tgt);
 		em->setInput(win); seq->setTargets(tgt);
 		net.cpuNet().forward();
 		tot += seq->loss(0);
@@ -507,7 +554,7 @@ int main(int argc, char **argv) {
 	if (print_net) {                              // dump the layer graph, no training / NCCL
 		int vcb;
 		if (token_lm) vcb = vocab_size;
-		else { CharData ds; ds.load(data); vcb = ds.vocab; }
+		else { CharData ds; ds.load(data, val_data); vcb = ds.vocab; }
 		CNet net;
 		int embId = net.cpuNet().add(new CEmbedding(emb, tokens, vcb));
 		buildLM(net.cpuNet(), embId, emb, tokens, blocks, vcb);
@@ -546,11 +593,10 @@ int main(int argc, char **argv) {
 	ncclComm_t comm;
 	if (ncclCommInitRank(&comm, W, id, R) != ncclSuccess) { std::cerr << "rank " << R << ": nccl init failed\n"; return 1; }
 
-	std::vector<int> ids; int vocab, ntrainTok;
+	Corpus corpus; corpus.load(token_lm, data, val_data, vocab_size);
+	const int vocab = corpus.vocab();
 	std::vector<char> charVocab;   // id->char for char mode, persisted as the model's .vocab sidecar
-	if (token_lm) { TokenData d; d.load(data, vocab_size); ids = std::move(d.data); vocab = d.vocab; ntrainTok = d.ntrain; }
-	else          { CharData  d; d.load(data);             ids = std::move(d.data); vocab = d.vocab; ntrainTok = d.ntrain;
-	                charVocab.assign(vocab, 0); for (auto &kv : d.c2i) charVocab[kv.second] = kv.first; }
+	if (!token_lm) { charVocab.assign(vocab, 0); for (auto &kv : corpus.ch.c2i) charVocab[kv.second] = kv.first; }
 	// Persist the char<->id table beside the model so -generate/-eval are self-contained
 	// (char mode only; token_lm uses an external BPE vocab). Written once by rank 0.
 	if (R == 0 && !token_lm && !((std::string) save_path).empty()) {
@@ -562,7 +608,7 @@ int main(int argc, char **argv) {
 					  << vocabPath((std::string) save_path) << "\n";
 	}
 	if (R == 0)
-		std::cout << (token_lm ? "token-LM: tokens=" : "tiny-shakespeare: chars=") << ids.size() << " vocab=" << vocab
+		std::cout << (token_lm ? "token-LM: tokens=" : "char LM: chars=") << corpus.size() << " (train " << corpus.ntrain() << ") vocab=" << vocab
 				  << "  model E=" << E << " N=" << N << " L=" << L
 				  << "  global_batch=" << batch << " world=" << W
 				  << "  born=" << born << " heads=" << heads << " attn_at=[" << (std::string) attn_at << "]"
@@ -626,7 +672,7 @@ int main(int argc, char **argv) {
 	cublasHandle_t gbh = 0;
 	if (grad_norm_clip > 0.f) { cublasCreate(&gbh); cublasSetStream(gbh, cudaStreamPerThread); cublasSetPointerMode(gbh, CUBLAS_POINTER_MODE_HOST); }
 
-	std::mt19937 rng(seed + R);                    // each rank draws a different data shard (seed flag)
+	std::mt19937_64 rng(seed + R);                 // each rank draws a different data shard (seed flag); 64-bit positions
 	auto targetsOf = [&](const std::vector<int> &win, int lab) {
 		std::vector<int> t(N, 0);
 		for (int i = 0; i + 1 < (int) win.size(); ++i) t[i] = win[i + 1];
@@ -635,13 +681,13 @@ int main(int argc, char **argv) {
 	};
 	auto buildBatch = [&](bool heldout) {
 		EmbeddingBatch b(per, N);
-		int lo = heldout ? ntrainTok : 0;
-		int hi = (heldout ? (int) ids.size() : ntrainTok) - N - 2;
-		std::uniform_int_distribution<int> d(lo, hi);
+		const long long lo = heldout ? (long long) corpus.ntrain() : 0;
+		const long long hi = (heldout ? (long long) corpus.size() : (long long) corpus.ntrain()) - N - 2;
+		std::uniform_int_distribution<long long> d(lo, hi);
 		for (int i = 0; i < per; ++i) {
-			int p = d(rng);
-			std::vector<int> win(ids.begin() + p, ids.begin() + p + N);
-			int lab = ids[p + N];
+			const long long p = d(rng);
+			std::vector<int> win; corpus.window((size_t) p, N, win);
+			int lab = corpus.at((size_t) p + N);
 			b.add(win, lab);
 			b.addTargets(targetsOf(win, lab));
 		}
