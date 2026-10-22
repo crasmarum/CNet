@@ -338,6 +338,24 @@ public:
 		}
 	}
 
+	// Every weight input (embedding included): real and imaginary parts i.i.d. N(0, std^2), independent of layer size.
+	// Matches the PyTorch mirror's init (cnet_torch.py, std 0.02), unlike init_inputs / gaussInit, which divide by the
+	// number of weights in the layer.
+	void normalInit(float std, uint64_t seed) {
+		assert(this->func_list_.size());
+		std::mt19937_64 g(seed);
+		std::normal_distribution<float> N(0.f, std);
+		for (auto in_func : inputs_) {
+			if (in_func->isGpuOnly()) {
+				continue;
+			}
+			for (int i = 0; i < in_func->input().length_; ++i) {
+				in_func->mutable_input()->real_[i] = N(g);
+				in_func->mutable_input()->imag_[i] = N(g);
+			}
+		}
+	}
+
 	void gaussInit(float scale, uint64_t seed) {
 		assert(this->func_list_.size());
 		int indx = 1;

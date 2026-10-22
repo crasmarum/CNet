@@ -96,7 +96,7 @@ FW_OBJS = $(addprefix $(OBJ_DIR)/, $(notdir $(FW_SRCS:.cpp=.o)))
 # --- Build Rules ---
 
 # Phony targets are not actual files. 'all' is the default goal.
-.PHONY: all clean run info dp_shakespeare generate gollm radioml mnist_hadamard bench_mixer bench_clone bench_bornattn test_conjlag_fd test_hadamardconv_fd test_hadamardconv_gpu test_bornattn_mh test_gla
+.PHONY: all clean run info app dp_shakespeare generate gollm radioml mnist_hadamard bench_mixer bench_clone bench_bornattn test_conjlag_fd test_hadamardconv_fd test_hadamardconv_gpu test_bornattn_mh test_gla
 .DEFAULT_GOAL := all
 
 # Standalone multi-GPU data-parallel tiny-shakespeare example (its own main).
@@ -116,6 +116,17 @@ gollm: $(FW_OBJS)
 	$(CXX) $(CXXFLAGS) $(GOLLM_DEF) -c examples/gollm.cpp -o $(OBJ_DIR)/gollm.o
 	$(CXX) $(FW_OBJS) $(OBJ_DIR)/gollm.o $(LDFLAGS) -lcurand $(GOLLM_LIB) -o $(TARGET_DIR)/gollm
 	@echo "==> Built $(TARGET_DIR)/gollm (NCCL=$(if $(filter 0,$(NCCL)),off,on))"
+
+# Any program written on impl/cnet_app.h (app::Trainer / app::Infer):
+#   make app SRC=examples/char_lm.cpp            # multi-GPU build (needs NCCL); binary named after the source
+#   make app SRC=my/model.cpp NCCL=0             # single-GPU build, no NCCL
+APP_NAME = $(basename $(notdir $(SRC)))
+app: $(FW_OBJS)
+	@test -n "$(SRC)" || (echo "usage: make app SRC=path/to/program.cpp [NCCL=0]" && false)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) $(GOLLM_DEF) -c $(SRC) -o $(OBJ_DIR)/app_$(APP_NAME).o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/app_$(APP_NAME).o $(LDFLAGS) $(GOLLM_LIB) -o $(TARGET_DIR)/$(APP_NAME)
+	@echo "==> Built $(TARGET_DIR)/$(APP_NAME) (NCCL=$(if $(filter 0,$(NCCL)),off,on))"
 
 # Radio modulation classifier (examples/radioml.cpp). Single-GPU, no NCCL;
 # links the framework objects + cuFFT/cuBLAS (via LDFLAGS). Run: ./radioml ...

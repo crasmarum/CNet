@@ -120,6 +120,9 @@ FLAG_BOOL(tf32, false)      // TF32 tensor cores for the cuBLAS GEMMs (default s
 FLAG_BOOL(ksync, true)      // false: no host sync after every kernel in eager mode (same results, less launch latency)
 FLAG_INT(seed, 1000)        // base seed for the per-rank data sampler (rank r uses seed+r)
 FLAG_BOOL(emb_gauss, false) // symmetry-breaking zero-mean complex embedding init (vs default)
+FLAG_FLOAT(init_std, 0.02) // every weight (embedding included) re, im ~ N(0, init_std^2), as the PyTorch mirror. Default since
+                            // 2026-10-22: CNet's old init_inputs start (pass -init_std 0 to get it) is near rank one and
+                            // vanishes through the CGelu residual stream; it trailed this start by 0.22 nats/byte at 2k steps.
 FLAG_STRING(val_data, "")  // optional held-out text file; when set, all of -data is training data (char mode)
 FLAG_BOOL(token_lm, false)  // sub-word token LM: -data is a DIR with train.bin/val.bin (uint16 ids)
 FLAG_INT(vocab_size, 8192)  // vocab in -token_lm mode (must match the BPE used to make the bins)
@@ -646,6 +649,7 @@ int main(int argc, char **argv) {
 		// Optional symmetry-breaking embedding init: zero-mean complex (real AND imag
 		// random), giving DISTINCT per-token embeddings so the model does not start pinned at
 		// the unigram saddle. Deterministic across ranks (fixed seed).
+		if (init_std > 0.f) net.cpuNet().normalInit(init_std, 1234);   // identical on every rank
 		if (emb_gauss) {
 			CEmbedding *e0 = (CEmbedding*) net.cpuNet()[embId];
 			std::mt19937 er(98765);
@@ -670,7 +674,7 @@ int main(int argc, char **argv) {
 	// cuBLAS handle for the global gradient-norm clip (operates on the coalesced
 	// all-reduced gradient in `scratch`).
 	cublasHandle_t gbh = 0;
-	if (grad_norm_clip > 0.f) { cublasCreate(&gbh); cublasSetStream(gbh, cudaStreamPerThread); cublasSetPointerMode(gbh, CUBLAS_POINTER_MODE_HOST); }
+	{ cublasCreate(&gbh); cublasSetStream(gbh, cudaStreamPerThread); cublasSetPointerMode(gbh, CUBLAS_POINTER_MODE_HOST); }
 
 	std::mt19937_64 rng(seed + R);                 // each rank draws a different data shard (seed flag); 64-bit positions
 	auto targetsOf = [&](const std::vector<int> &win, int lab) {
@@ -728,8 +732,10 @@ int main(int argc, char **argv) {
 				(size_t) gradBufs[i].second * sizeof(float), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
 		ncclAllReduce(scratch, scratch, total, ncclFloat, ncclSum, comm, cudaStreamPerThread);
 		// Global gradient-NORM clip on the summed gradient (same on every rank).
+		// ||g|| of the summed gradient before any clipping: needed for the norm clip, and printed every
+		// 100 steps (previously computed only with -grad_norm_clip, so the log showed |g|=0).
+		if (grad_norm_clip > 0.f || (R == 0 && t % 100 == 0)) cublasSnrm2(gbh, total, scratch, 1, &gnorm);
 		if (grad_norm_clip > 0.f) {
-			cublasSnrm2(gbh, total, scratch, 1, &gnorm);
 			if (gnorm > grad_norm_clip) {
 				float s = grad_norm_clip / gnorm;
 				cublasSscal(gbh, total, &s, scratch, 1);

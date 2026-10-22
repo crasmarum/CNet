@@ -28,6 +28,50 @@ In short: **use PyTorch or JAX to ship; use CNet to _study_ complex-valued learn
 
 # Examples
 
+## Your own model in one file: `app::Trainer` and `app::Infer`
+
+For sequence models (text, bytes, Go moves or any other token stream) you write only the model graph and the data;
+[impl/cnet_app.h](impl/cnet_app.h) supplies training on one GPU or many (NCCL), Adam with warm-up and cosine decay,
+gradient clipping, validation with best-checkpoint saving, and inference.
+
+```cpp
+#include "../impl/cnet_app.h"
+
+struct MyData : app::DataSource {            // vocab(), context(), sample(heldout, rng, in, tgt)
+    ...
+};
+struct MyModel : app::ModelDef {             // build(net, vocab, context) -> app::Heads(embedding, loss)
+    ...
+};
+int main(int argc, char **argv) {
+    FLAGS::Parse(argc, argv);
+    MyData data(...); MyModel model(...);
+    app::Trainer trainer(model, data);       // options from standard flags: -steps -lr -batch -save_path ...
+    return trainer.run();
+}
+```
+
+Inference on a saved model:
+
+```cpp
+app::Infer inf;
+inf.loadModel("model.mod");
+std::vector<int> out = inf.generate(prompt_ids, 300, 0.8, /*seed*/ 1);   // or nextProbs(), sample(), score()
+```
+
+Build and run:
+
+```bash
+make app SRC=examples/char_lm.cpp                # multi-GPU build (NCCL=0 for a single-GPU box)
+./char_lm -data book.txt -steps 5000 -batch 8 -save_path lm.mod -tw_cublas true -tw_real_loss true
+./char_lm -data book.txt -generate true -model lm.mod -prompt "ROMEO:" -gen_len 300
+for r in 0 1 2 3; do ./char_lm -data book.txt -batch 24 -world 4 -rank $r -save_path lm.mod & done; wait   # 4 GPUs
+```
+
+[examples/char_lm.cpp](examples/char_lm.cpp) is a complete byte-level language model in about 100 lines, and
+[examples/README_app.md](examples/README_app.md) lists every flag and API call. Fresh weights use a normal
+initialization (`-init_std 0.02`), which trains much better than CNet's older `init_inputs()` start.
+
 ## A Simple Complex Neural Net for MNIST
 
 The following code shows how to build a minimal neural net for the MNIST/Fashion MNIST datasets, using the Fourier Transform and Hadamard layers with a Gelu activation function:
@@ -216,7 +260,7 @@ from a batch using this method:
 ```c++
 setInput(InputBatch& batch, int b_indx)
 ```
-As the input parameter for other layers, its values are either randomly set at the beginning of training a network, e.g., `net.init_inputs()`, 
+As the input parameter for other layers, its values are either randomly set at the beginning of training a network, e.g., `net.init_inputs()` (for deep residual models prefer `net.normalInit(0.02, seed)`, see the `-init_std` flag below), 
 or are restored from a model via `net.restore(std::string file)`.
 
 See  the file [cnet.cpp](https://github.com/crasmarum/CNet/blob/main/cnet.cpp)  for more details.
@@ -832,6 +876,8 @@ Three trainer flags matter for speed:
 | flag | effect |
 |---|---|
 | `-tw_cublas true` | token-wise layers through batched cuBLAS GEMMs instead of the reference kernel; always use it |
+| `-tw_real_loss true` | with `-tw_cublas`: the token-wise backward computes only the dz* GEMMs and writes dz as their conjugate (8 instead of 16 GEMMs, about 38% less backward time in those layers); exact for a real loss, so use it for language models but not for Jacobian or parity tests |
+| `-init_std 0.02` (default) | every weight, embedding included, gets independent N(0, std²) real and imaginary parts. The old `init_inputs()` start (`-init_std 0`) sets all weights near i/n with n the layer's weight count: layers start near rank one and the CGelu residual stream shrinks fourfold per block. On the 12M PG-19 model it trailed this start by 0.22 nats/byte after 2,000 steps |
 | `-tf32 true` | TF32 tensor cores for the cuBLAS GEMMs (default strict FP32). About 1.6x faster per step, but on the PG-19 byte model it trails FP32 by 0.04 validation nats at equal steps over 1,500 steps (it is ahead at equal wall-clock time); opt in deliberately |
 | `-profile_steps N` | after 20 warm-up steps, time N steps per layer type (forward, backward, share) and per phase (batch, forward, loss, backward, gradient reduce, Adam), print the table and exit |
 

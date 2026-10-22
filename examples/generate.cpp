@@ -38,6 +38,7 @@ FLAG_STRING(data, "tiny_shakespear2.txt")    // training text (for the char<->id
 FLAG_STRING(prompt, "ROMEO:")                // seed text
 FLAG_INT(gen_len, 600)                        // characters to generate
 FLAG_FLOAT(temp, 0.8)                         // sampling temperature (lower = greedier)
+FLAG_INT(seed, 0)                             // sampling RNG seed (0 = random); fixed seeds make checkpoints comparable
 FLAG_BOOL(stream, true)                       // constant-state decoding through the N=1 twin graph (impl/stepnet.h);
                                               // false = recompute the full N-token window per token (the old path)
 FLAG_INT(threads, 8)                          // OpenMP threads for streaming decode: the per-token layers are
@@ -120,7 +121,7 @@ int main(int argc, char **argv) {
 		std::cerr << "warning: model vocab " << vocab << " != data vocab " << ds.vocab
 				  << " (wrong -data file?)\n";
 
-	std::mt19937 rng(std::random_device{}());
+	std::mt19937 rng(seed != 0 ? (unsigned) seed : std::random_device{}());
 	std::vector<int> ctx;
 	for (char c : (std::string) prompt) if (ds.c2i.count(c)) ctx.push_back(ds.c2i[c]);
 

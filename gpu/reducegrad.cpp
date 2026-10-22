@@ -1,4 +1,5 @@
 
+#include <map>
 #include "reduce.h"
 #include "allocator.h"
 
@@ -14,6 +15,7 @@ extern bool fast_linear;    // defined in reduce.cpp
 extern bool fft_fast;       // defined in reduce.cpp
 extern bool fast_softmax;   // defined in reduce.cpp
 extern bool tw_cublas;      // defined in reduce.cpp
+extern bool tw_real_loss;   // defined in reduce.cpp
 
 #ifdef __CUDACC__
 // This TU's cuBLAS handle (bound to the per-thread stream); the forward TU keeps
@@ -602,6 +604,77 @@ __global__ void gpu_tokenwise_vec_grad__(GpuInVar *in, GpuOutVar *out,
 }
 
 #ifdef __CUDACC__
+// ---- -tw_real_loss: dz* contributions once (8 GEMMs into a shared scratch), then added to the dz* planes and,
+// conjugated, to the dz planes. With dOut_dz = conj(dOut_dz*) (real loss), each dz-path GEMM line of the full
+// backward equals the conjugate of the matching dz*-path line:
+//   data:   gD  += W dGO = conj( conj(W) dGS ),   weight: gW += D dGO^T = conj( conj(D) dGS^T )   (per Wirtinger part)
+static float *g_twr_scr = nullptr;      // shared scratch [B x (2 Ld + 2 Lw)] floats, grown on demand
+static size_t g_twr_cap = 0;
+static unsigned g_twr_gen = 0;          // bumped on every reallocation; per-layer pointer tables rebuild on change
+struct TwrTable { float **dev = nullptr; unsigned gen = ~0u; int B = 0; };
+static std::map<float**, TwrTable> g_twr_tables;
+
+__global__ void tw_conj_add__(float **pool, int B, int Ld, int Lw, const float *scr) {
+	size_t tid = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+	const size_t per = (size_t) 2 * Ld + 2 * Lw;
+	if (tid >= (size_t) B * (Ld + Lw)) return;
+	const int b = (int) (tid / (size_t) (Ld + Lw));
+	const int j = (int) (tid % (size_t) (Ld + Lw));
+	const float *s = scr + (size_t) b * per;
+	if (j < Ld) {
+		const float r = s[j], i = s[Ld + j];
+		pool[10 * B + b][j] += r;  pool[11 * B + b][j] += i;      // gData dz*
+		pool[8 * B + b][j]  += r;  pool[9 * B + b][j]  -= i;      // gData dz  = conj
+	} else {
+		const int k = j - Ld;
+		const float r = s[2 * Ld + k], i = s[2 * Ld + Lw + k];
+		pool[14 * B + b][k] += r;  pool[15 * B + b][k] += i;      // gWeight dz*
+		pool[12 * B + b][k] += r;  pool[13 * B + b][k] -= i;      // gWeight dz  = conj
+	}
+}
+
+static void tw_gemm_backward_real_loss(int N, int e_in, int e_out, int B, float **pool, cublasHandle_t h) {
+	const int Ld = N * e_in, Lw = e_in * e_out;
+	const size_t per = (size_t) 2 * Ld + 2 * Lw, need = (size_t) B * per;
+	if (need > g_twr_cap) {
+		gpuErrchk(cudaDeviceSynchronize());
+		if (g_twr_scr) gpuErrchk(cudaFree(g_twr_scr));
+		gpuErrchk(cudaMalloc((void**) &g_twr_scr, need * sizeof(float)));
+		g_twr_cap = need; ++g_twr_gen;
+	}
+	TwrTable &tb = g_twr_tables[pool];
+	if (tb.gen != g_twr_gen || tb.B != B) {                      // 4 x B scratch pointers: SDr, SDi, SWr, SWi
+		if (tb.dev) gpuErrchk(cudaFree(tb.dev));
+		std::vector<float*> hp((size_t) 4 * B);
+		for (int b = 0; b < B; ++b) {
+			float *base = g_twr_scr + (size_t) b * per;
+			hp[0 * B + b] = base;            hp[1 * B + b] = base + Ld;
+			hp[2 * B + b] = base + 2 * Ld;   hp[3 * B + b] = base + 2 * Ld + Lw;
+		}
+		gpuErrchk(cudaMalloc((void**) &tb.dev, (size_t) 4 * B * sizeof(float*)));
+		gpuErrchk(cudaMemcpy(tb.dev, hp.data(), (size_t) 4 * B * sizeof(float*), cudaMemcpyHostToDevice));
+		tb.gen = g_twr_gen; tb.B = B;
+	}
+	float **Dr = pool, **Di = pool + B, **Wr = pool + 2 * B, **Wi = pool + 3 * B, **GSr = pool + 6 * B, **GSi = pool + 7 * B;
+	float **SDr = tb.dev, **SDi = tb.dev + B, **SWr = tb.dev + 2 * B, **SWi = tb.dev + 3 * B;
+	auto GD = [&](float a, float **A, float **Bm, float **C, float beta) {
+		cublasSgemmBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, e_in, N, e_out,
+				&a, (const float* const*) A, e_in, (const float* const*) Bm, e_out, &beta, C, e_in, B);
+	};
+	auto GW = [&](float a, float **A, float **Bm, float **C, float beta) {
+		cublasSgemmBatched(h, CUBLAS_OP_N, CUBLAS_OP_T, e_in, e_out, N,
+				&a, (const float* const*) A, e_in, (const float* const*) Bm, e_out, &beta, C, e_in, B);
+	};
+	GD(1.f, Wr, GSr, SDr, 0.f); GD( 1.f, Wi, GSi, SDr, 1.f);     // Re conj(W) dGS
+	GD(1.f, Wr, GSi, SDi, 0.f); GD(-1.f, Wi, GSr, SDi, 1.f);     // Im
+	GW(1.f, Dr, GSr, SWr, 0.f); GW( 1.f, Di, GSi, SWr, 1.f);     // Re conj(D) dGS^T
+	GW(1.f, Dr, GSi, SWi, 0.f); GW(-1.f, Di, GSr, SWi, 1.f);     // Im
+	const size_t tot = (size_t) B * (Ld + Lw);
+	tw_conj_add__ CUDA2((unsigned) ((tot + 255) / 256), 256)(pool, B, Ld, Lw, g_twr_scr);
+}
+#endif
+
+#ifdef __CUDACC__
 // Backward for the position-wise linear (the dense Linear calls with N = 1). Both
 // grads are complex GEMMs accumulated (beta=1) onto the pre-zeroed gradient planes:
 //   data grad:   gD[E_in,N]    += (conj)W[E_in,E_out] * dOut[E_out,N]
@@ -636,6 +709,11 @@ void tw_gemm_backward(int N, int e_in, int e_out,
 	float **Dr=P(0),**Di=P(1),**Wr=P(2),**Wi=P(3),**GOr=P(4),**GOi=P(5),**GSr=P(6),**GSi=P(7),
 		  **gDr=P(8),**gDi=P(9),**gSDr=P(10),**gSDi=P(11),**gWr=P(12),**gWi=P(13),**gWSr=P(14),**gWSi=P(15);
 	cublasHandle_t h = twg_blas_handle();
+	if (tw_real_loss) {
+		tw_gemm_backward_real_loss(N, e_in, e_out, B, pool, h);
+		CNET_KSYNC();
+		return;
+	}
 	const float one = 1.f;
 	// data grad: C[E_in,N] = A[E_in,E_out] * Bm[E_out,N], accumulate
 	auto GD = [&](float a, float **A, float **Bm, float **C) {

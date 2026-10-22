@@ -112,6 +112,8 @@ FLAG_BOOL(print_net, false) // build the LM and print its layer graph, then exit
 FLAG_INT(seed, 1000)        // base seed for the per-rank data sampler (rank r uses seed+r)
 FLAG_BOOL(emb_gauss, false) // symmetry-breaking zero-mean complex embedding init
 FLAG_FLOAT(gauss_init, 0.0) // if >0: circularly-symmetric complex Gaussian init (this scale)
+FLAG_FLOAT(init_std, 0.02) // every weight (embedding included) re, im ~ N(0, init_std^2); 0 = CNet's old init_inputs start
+                            // (near rank one, vanishing through the CGelu residual stream; see dp_shakespeare -init_std)
                             // for ALL weights, replacing the default +imag-biased init. Removes
                             // the Born-loss unigram-saddle knife-edge so cuBLAS (not just the
                             // element-wise kernel) escapes it. 0 = default init.
@@ -422,6 +424,7 @@ int main(int argc, char **argv) {
 	// Symmetric-Gaussian init for ALL weights (breaks the +imag saddle bias at the
 	// source, so cuBLAS's summation order also escapes the unigram saddle).
 	if (gauss_init > 0.f) net.cpuNet().gaussInit(gauss_init, 4242);
+	if (init_std > 0.f) net.cpuNet().normalInit(init_std, 1234);   // identical on every rank
 	if (emb_gauss) {
 		CEmbedding *e0 = (CEmbedding*) net.cpuNet()[embId];
 		std::mt19937 er(98765);

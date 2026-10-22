@@ -31,6 +31,12 @@ FLAG_INT(reduce_block_size, 512);
 // still issues a per-step cudaMemcpy (not CUDA-graph capturable); enable it for faster non-graph
 // training.
 FLAG_BOOL(tw_cublas, false)
+// Real-loss shortcut for the TokenwiseLinear backward (with -tw_cublas): when the network ends in a REAL loss,
+// dL/dz = conj(dL/dz*) for every variable, so the 8 GEMMs of the dz path equal the conjugate of the 8 of the dz*
+// path. Computes the dz* contributions once into a shared scratch and adds them to the dz* planes and, conjugated,
+// to the dz planes. Halves the backward GEMMs. NOT valid when output gradients are seeded independently (complex
+// outputs, Jacobian / parity tests), hence off by default.
+FLAG_BOOL(tw_real_loss, false)
 
 // When set, the Linear layer uses the direct shared-memory GEMV kernels
 // (forward and backward) instead of the generic reduce-then-sum path.
