@@ -94,8 +94,9 @@ Please see the file [cnet.cpp](https://github.com/crasmarum/CNet/blob/main/cnet.
 
 ## Adding Custom Complex Valued Functions / NN Layers
 
-In order to add a new complex valued function, say $Sigmoid : \mathbb C^n \to \mathbb C^n$ given by $Sigmoid(z)_i \mapsto 1 / (1 + e^{-z_i}),$
-you extend the `CFunc` class and provide implementations for the `forward()` and the `backward()` methods. A layer also
+In order to add a new complex valued function, say $Sigmoid : \mathbb C^n \to \mathbb C^n$ given by $Sigmoid(z)_i = 1 / (1 + e^{-z_i})$,
+you extend the `CFunc` class and implement `forward()` plus either `backward()` or, more simply, the two Wirtinger
+derivatives `dz()` and `dz_star()`, from which CNet builds the backward pass. A layer also
 needs a constructor that takes a `Uid`, a `clone()` method and a `getName()`: CNet clones every layer once per batch
 entry on the GPU and uses the name when saving and restoring models.
 
@@ -130,11 +131,11 @@ For example for the Sigmoid function
 $Sigmoid\big(\textbf{z} = (z_0,\dots, z_i, \dots)\big)=\big(S_0(\textbf{z}),\dots,S_j(\textbf{z}),\dots\big)$
 we have that the conjugate derivatives are all null because the sigmoid function is defined only in terms of $\textbf{z}=x+iy$ and not of the conjugate $z^\star=x-iy$:
 
-$$\frac{d}{d z_i^\star} S_j = 0 \quad \text{for all } 0 \leq i,j < n$$
+$$\frac{\partial S_j}{\partial z_i^\star} = 0 \quad \text{for all } 0 \leq i,j < n$$
 
 while the $z$ derivatives are easily computed as 
 
-$$\frac{d}{d z_i} S_j = g(z_i)\,(1 - g(z_i)) \quad \text{for all } 0 \leq i = j < n, \quad g(z) = \frac{1}{1 + e^{-z}}$$
+$$\frac{\partial S_j}{\partial z_i} = g(z_i)\,(1 - g(z_i)) \text{ if } i = j, \quad 0 \text{ otherwise}, \qquad g(z) = \frac{1}{1 + e^{-z}}$$
 
 From the above observations we can easily implement the `dz()` and the `dz_star()` methods:
 
@@ -152,8 +153,15 @@ virtual complex<float> dz_star(int out_indx, int in_indx) {
 }
 ```
 
-We can test that the implementation is correct by minimizing the `Sigmoid` using a small neural net and Wirtinger gradient descent as you can see in the 
-following snippet of code:
+A function that depends on $z^\star$ as well, i.e. one that is not holomorphic, has a non-zero `dz_star()`. This is
+the usual case in practice: the complex sigmoid above has poles at $z = i\pi(2k+1)$, so CNet's own activation `CGelu`
+instead applies a real function $g$ to the real and imaginary parts separately, $f(z) = g(x) + i\,g(y)$. Its
+Wirtinger derivatives are
+
+$$\frac{\partial f}{\partial z} = \tfrac12\big(g'(x) + g'(y)\big), \qquad \frac{\partial f}{\partial z^\star} = \tfrac12\big(g'(x) - g'(y)\big).$$
+
+A quick smoke test is to minimize the squared norm of the `Sigmoid` outputs with a small net: `L2Out` computes
+$\sum_j |S_j|^2$, and Wirtinger gradient descent on the inputs drives it towards zero, as in the following snippet:
 
 ```c++
 CNet net;
@@ -195,7 +203,9 @@ Depth 2: L2Out_3 4128,
 999	Loss: 0.079
 ```
 
-Please see the file [examples/sigmoid.h](examples/sigmoid.h) for additional details.
+Please see the file [examples/sigmoid.h](examples/sigmoid.h) for additional details. A falling loss only shows that
+the gradient points downhill; to check `dz()` and `dz_star()` themselves, compare the backward pass with central
+finite differences of the forward pass, as the finite-difference checks in [examples/test_bornattn_mh.cpp](examples/test_bornattn_mh.cpp) do.
 
 Two practical notes:
 
