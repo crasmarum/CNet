@@ -95,23 +95,30 @@ Please see the file [cnet.cpp](https://github.com/crasmarum/CNet/blob/main/cnet.
 ## Adding Custom Complex Valued Functions / NN Layers
 
 In order to add a new complex valued function, say $Sigmoid : \mathbb C^n \to \mathbb C^n$ given by $Sigmoid(z)_i \mapsto 1 / (1 + e^{-z_i}),$
-all you need to do in principle is to extend the `CFunc` class and provide implementations for the `forward()` and the `backward()` methods.
+you extend the `CFunc` class and provide implementations for the `forward()` and the `backward()` methods. A layer also
+needs a constructor that takes a `Uid`, a `clone()` method and a `getName()`: CNet clones every layer once per batch
+entry on the GPU and uses the name when saving and restoring models.
 
 ```c++
 class CSigmoid: public CFunc {
 
 public:
-  CSigmoid(InSize in_size) : CFunc(in_size, OutSize(in_size.value())) {
-  }
+  CSigmoid(Uid uid, InSize in_size) : CFunc(uid, in_size, OutSize(in_size.value())) {}
+  CSigmoid(InSize in_size) : CFunc(in_size, OutSize(in_size.value())) {}
+
+  virtual CFunc* clone(Uid uid) { return new CSigmoid(uid, InSize(input().length_)); }
+  virtual std::string getName() { return "CSigmoid_" + std::to_string(uid_); }
 };
 ```
 While writing an implementation for the `forward()` method is usually straightforward:
 ```c++
 virtual void forward() {
-    for (int in_indx = 0; in_indx < input().length_; ++in_indx) {
-        complex<float> g = 1.0f / (1.0f + exp(-input().z(in_indx)));
-        mutable_output()->real_[in_indx] = g.real();
-        mutable_output()->imag_[in_indx] = g.imag();
+    for (int i = 0; i < no_outputs(); ++i) {           // one copy of the output per consuming layer
+        for (int in_indx = 0; in_indx < input().length_; ++in_indx) {
+            complex<float> g = 1.0f / (1.0f + exp(-input().z(in_indx)));
+            mutable_output(i)->real_[offset(i) + in_indx] = g.real();
+            mutable_output(i)->imag_[offset(i) + in_indx] = g.imag();
+        }
     }
 }
 ```
@@ -160,7 +167,7 @@ for (int var = 0; var < 1000; ++var) {
     net.forward();
     cout << var << "\tLoss: " << ((L2Out*)net[l2])->loss() << endl;
     net.backward(0);
-    net.updateInputs(0.1);
+    net.updateInputs(0.9);
 }
 ```
 
@@ -173,22 +180,31 @@ Running the above code from the command line:
 one can observe that the loss is decreasing:
 
 ```
-Depth 0: Input_1 3072, 
-Depth 1: CSigmoid_2 3072, 
-Depth 2: L2Out_3 3096, 
-0	Loss: 32.008
-1	Loss: 28.512
-2	Loss: 25.425
-3	Loss: 22.725
-4	Loss: 20.377
-5	Loss: 18.341
+Depth 0: Input_1 4096, 
+Depth 1: CSigmoid_2 4096, 
+Depth 2: L2Out_3 4128, 
+0	Loss: 32.004
+1	Loss: 28.508
+2	Loss: 25.422
+3	Loss: 22.722
+4	Loss: 20.374
+5	Loss: 18.338
 ...
-798	Loss: 0.100
-799	Loss: 0.099
+791	Loss: 0.100
 ...
+999	Loss: 0.079
 ```
 
-Please see the file [examples/sigmoid.h](https://github.com/crasmarum/CNet/blob/main/examples/sigmoid.h) for additional details.
+Please see the file [examples/sigmoid.h](examples/sigmoid.h) for additional details.
+
+Two practical notes:
+
+- **Cost of the generic backward.** When you implement only `dz()` and `dz_star()`, the inherited `backward()` evaluates
+  them for every (output, input) pair, which is $O(n_{in} \cdot n_{out})$ calls. That is fine for the 128-element
+  example above but far too slow for large activations. For element-wise or otherwise sparse layers, override
+  `backward()` and accumulate the gradient directly, as `CGelu` and `TokenNorm` do.
+- **GPU.** A new `CFunc` runs on the CPU. To run it inside a GPU graph it also needs a GPU mapping with its own
+  kernels; see [Computation Graph on CUDA](#computation-graph-on-cuda) and the existing layers under `gpu/`.
 
 # Computation Graph on CUDA
 

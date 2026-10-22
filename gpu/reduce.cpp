@@ -840,6 +840,7 @@ __global__ void gpu_born_fwd_ew__(const float *Cr, cmplx_ *Cs, float *A, int c0,
 	if (decay) sc *= powf(born_gamma__((int) (bh % H), decay), (float) (kc - m));
 	A[cb] = sc;
 }
+#ifdef __CUDACC__   // warp shuffles: GPU build only (its single caller is inside a __CUDACC__ block)
 // one warp per (bh, k): S_k = sum_m A + den; normalize the row of A and the inter-chunk numerator
 __global__ void gpu_born_fwd_rownorm__(float *A, float *S, float *num, const float *den, int c0, int C, int N, int dh, int BH, float eps) {
 	const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -856,6 +857,7 @@ __global__ void gpu_born_fwd_rownorm__(float *A, float *S, float *num, const flo
 	float *nr = num + ((bh * 2 + 0) * C + kc) * dh, *ni = num + ((bh * 2 + 1) * C + kc) * dh;
 	for (int j = lane; j < dh; j += 32) { nr[j] *= invS; ni[j] *= invS; }
 }
+#endif
 // write the chunk output planes O[bh][2][C][dh] into the layer output
 __global__ void gpu_born_out_scatter__(GpuOutVar *out, const float *O, int c0, int C, int d, int H, int B) {
 	size_t tid = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -870,12 +872,14 @@ __global__ void gpu_born_out_scatter__(GpuOutVar *out, const float *O, int c0, i
 	ov.out_ptr_[p] = O[((bh * 2 + 0) * C + t) * dh + j];
 	ov.out_ptr_[ov.out_length_ + p] = O[((bh * 2 + 1) * C + t) * dh + j];
 }
+#ifdef __CUDACC__   // cuBLAS: GPU build only
 // row-major Z[n x m] = alpha op(X)[n x k] op(Y)[k x m] + beta Z, batched (cuBLAS column-major via transposes)
 static void born_rm_gemm(cublasHandle_t hb, bool tX, bool tY, int n, int m, int k, float alpha,
 		const float *X, int ldX, long long sX, const float *Y, int ldY, long long sY, float beta, float *Z, int ldZ, long long sZ, int batch) {
 	cublasSgemmStridedBatched(hb, tY ? CUBLAS_OP_T : CUBLAS_OP_N, tX ? CUBLAS_OP_T : CUBLAS_OP_N, m, n, k, &alpha,
 		Y, ldY, sY, X, ldX, sX, &beta, Z, ldZ, sZ, batch);
 }
+#endif
 
 void BornAttentionGpu::ensure_linear_scratch(int N, int d, int H, int C, int B) {
 #ifdef __CUDACC__
