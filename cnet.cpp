@@ -24,7 +24,7 @@ FLAG_BOOL(mnist_gpu_train, false)
 FLAG_BOOL(mnist_model_accuracy, false)
 FLAG_BOOL(test_sigmoid, false)
 
-FLAG_STRING(model_path, "~/cnet_mnist.mod")
+FLAG_STRING(model_path, "cnet_mnist.mod")   // "~" is not expanded inside the program
 
 FLAG_INT(batch_size, 16)
 FLAG_FLOAT(l_rate, 0.0001)
@@ -136,7 +136,7 @@ void trainMnistGPU() {
 
 			if (time % 1000 == 999) {
 				if (!cnet.getInputsFromGpu()) {
-					std::cerr << "Warning: could get data from GPU." << std::endl;
+					std::cerr << "Warning: could not get data from GPU." << std::endl;
 				} else {
 					cnet.save(model_path);
 					std::cout << "Model saved at: " << model_path << std::endl;

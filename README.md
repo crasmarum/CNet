@@ -767,7 +767,7 @@ You can change the default learning rate and the GPU batch size via the `l_rate`
 ~/cnet -mnist_images ~/train-images.idx3-ubyte -mnist_labels ~/train-labels.idx1-ubyte \
        -model_path ~/test.mod  -mnist_gpu_train true -l_rate 0.001 -batch_size 40
 ```
-You can find the example training code in the [cnet.cpp](https://github.com/crasmarum/CNet/blob/main/cnet.cpp) file:
+You can find the example training code in the [cnet.cpp](cnet.cpp) file:
 ```c++
 MnistDataReader reader;
 assert(reader.Open(mnist_images, mnist_labels, 60000));
@@ -803,7 +803,7 @@ for (int epoch = 0; epoch < no_epochs; ++epoch) {
 
 		if (time % 1000 == 999) {
 			if (!cnet.getInputsFromGpu()) {
-				std::cerr << "Warning: could get data from GPU." << std::endl;
+				std::cerr << "Warning: could not get data from GPU." << std::endl;
 			} else {
 				cnet.save(model_path);
 				std::cout << "Model saved at: " << model_path << std::endl;
@@ -816,6 +816,13 @@ for (int epoch = 0; epoch < no_epochs; ++epoch) {
 }
 ```
 
+This loop is deliberately minimal: plain gradient descent (`gpuUpdateInputs`) and CNet's original `init_inputs()`
+start, which is enough for this shallow network. For deeper models use Adam (`trueAdamUpdate`, as `dp_shakespeare`
+does) and the normal initialization (`cnet.cpuNet().normalInit(0.02, seed)` after `init_inputs()`; the `-init_std`
+flag in `dp_shakespeare`, `gollm` and `app::Trainer`), which trains much better. For
+token-sequence models, [`app::Trainer`](#your-own-model-in-one-file-apptrainer-and-appinfer) packages the whole loop:
+batching, Adam with warm-up and cosine decay, clipping, validation, checkpoints and multi-GPU.
+
 # Multi-GPU Training (Data Parallel)
 
 CNet trains across multiple GPUs with **data parallelism**, using the same
@@ -823,12 +830,14 @@ clone mechanism it uses to batch within one GPU — only one level up. Each GPU
 holds a full copy of the network; the global batch is split across GPUs; after
 each backward the per-GPU gradients are summed with an **NCCL all-reduce**; and
 every replica applies the identical optimizer step, so the replicas stay in sync
-and the result is numerically **identical to single-GPU training** with the full
-batch.
+and each step is the **same update as single-GPU training** with the full batch,
+up to the order of floating-point summation.
 
-Three small pieces make this work (see `gpu/gpu_func.h`): `ancestorGradBuffers()`
-exposes each parameter's gradient buffer for an in-place all-reduce, and
-`collectAncestorParams()` / `loadAncestorParams()` broadcast the initial weights.
+Two pieces make this work (see `gpu/gpu_func.h`): `ancestorGradBuffers()` exposes
+each parameter's gradient buffer for an in-place all-reduce, and the replicas must
+start from the same weights. `dp_shakespeare` and `app::Trainer` initialize every rank
+with the same seed; `collectAncestorParams()` / `loadAncestorParams()` can broadcast
+weights instead.
 
 The standard DDP architecture — **one process per GPU** — avoids serializing
 CNet's many kernel launches through a single CUDA context, and scales
