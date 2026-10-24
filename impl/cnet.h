@@ -38,6 +38,7 @@
 #include "hadamardconv.h"
 #include "tokennorm.h"
 #include "rotary.h"
+#include "chirp.h"
 #include "l2out.h"
 
 const int isHadamard = 1;
@@ -67,6 +68,8 @@ const int isConjLag = 24;
 const int isSegFourier = 25;
 const int isHadamardConv = 26;
 const int isGLA = 27;
+const int isChirpFilter = 28;
+const int isBoxcarMax = 29;
 
 const int isUnknown = INT_MAX;
 
@@ -104,7 +107,9 @@ const int isUnknown = INT_MAX;
 	X(ConjLagProduct,      isConjLag,        RestoreConjLag)              \
 	X(SegmentedFourier,    isSegFourier,     RestoreSegFourier)          \
 	X(HadamardConv,        isHadamardConv,   RestoreHadamardConv)  \
-	X(GatedLinearAttention, isGLA,           RestoreGLA)
+	X(GatedLinearAttention, isGLA,           RestoreGLA)       \
+	X(ChirpFilter,         isChirpFilter,    RestoreChirpFilter) \
+	X(BoxcarMax,           isBoxcarMax,      RestoreBoxcarMax)
 
 
 /*

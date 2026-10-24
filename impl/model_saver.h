@@ -650,6 +650,25 @@ private:
 		return true;
 	}
 
+	bool Write(ChirpFilter *cf, BinaryWriter &writer) {
+		writer.write_int32(isChirpFilter);
+		writeFuncInfo(writer, cf);
+		writer.write_int32(cf->L());
+		writer.write_int32(cf->K());
+		writer.write_float(cf->dmScale());
+		return true;
+	}
+
+	bool Write(BoxcarMax *bm, BinaryWriter &writer) {
+		writer.write_int32(isBoxcarMax);
+		writeFuncInfo(writer, bm);
+		writer.write_int32(bm->K());
+		writer.write_int32(bm->L());
+		writer.write_int32((int) bm->widths().size());
+		for (int w : bm->widths()) writer.write_int32(w);
+		return true;
+	}
+
 	bool Write(SegmentedFourier *sf, BinaryWriter &writer) {
 		writer.write_int32(isSegFourier);
 		writeFuncInfo(writer, sf);
@@ -692,6 +711,28 @@ private:
 		readFuncInfo(reader, prev);
 		int tau = 0; assert(reader.read_int32(&tau));
 		net.add(new ConjLagProduct(Uid(uid), InSize(in_size), tau), prev);
+		return true;
+	}
+
+	bool RestoreChirpFilter(ComplexNet &net, BinaryReader &reader) {
+		L_(lDebug) << "RestoreChirpFilter";
+		std::vector<int> prev;
+		readFuncInfo(reader, prev);
+		int L = 0, K = 0; float sc = 0;
+		assert(reader.read_int32(&L)); assert(reader.read_int32(&K)); assert(reader.read_float(&sc));
+		net.add(new ChirpFilter(Uid(uid), L, K, sc), prev);
+		return true;
+	}
+
+	bool RestoreBoxcarMax(ComplexNet &net, BinaryReader &reader) {
+		L_(lDebug) << "RestoreBoxcarMax";
+		std::vector<int> prev;
+		readFuncInfo(reader, prev);
+		int K = 0, L = 0, n = 0;
+		assert(reader.read_int32(&K)); assert(reader.read_int32(&L)); assert(reader.read_int32(&n));
+		std::vector<int> widths(n);
+		for (int i = 0; i < n; ++i) assert(reader.read_int32(&widths[i]));
+		net.add(new BoxcarMax(Uid(uid), K, L, widths), prev);
 		return true;
 	}
 
@@ -1185,6 +1226,37 @@ public:
 //	bool Restore(CNet &c_net, std::string file) {
 //		return Restore(c_net.cpuNet(), file);
 //	}
+
+	// Copy the learned weights of `src` into `dst`, two nets built by the same code (same layer types in the same
+	// order) but possibly with different shapes that hold no weights, e.g. a different context length N. Only
+	// CInput (parameter tensors) and CEmbedding (token table) carry learned weights; each pair must have equal
+	// length. Everything else (norm eps, scales, attention settings) comes from the flags that built `dst`.
+	// On a mismatch nothing is half-copied: the check runs first, `err` says where, and false is returned.
+	static bool CopyWeights(const ComplexNet &src, ComplexNet &dst, std::string *err = nullptr) {
+		const std::vector<CFunc*> &a = src.funcs(), &b = dst.funcs();
+		auto fail = [&](const std::string &m) { if (err) *err = m; return false; };
+		if (a.size() != b.size())
+			return fail("layer count differs: checkpoint " + std::to_string(a.size()) + ", net " + std::to_string(b.size()));
+		for (size_t i = 0; i < a.size(); ++i) {
+			const int ta = ComplexNet::getType(a[i]), tb = ComplexNet::getType(b[i]);
+			if (ta != tb)
+				return fail("layer " + std::to_string(i) + " type differs: checkpoint " + std::to_string(ta) +
+						", net " + std::to_string(tb));
+			if ((ta == isInput || ta == isEmbedding) && a[i]->input().length_ != b[i]->input().length_)
+				return fail("layer " + std::to_string(i) + " (" + b[i]->getName() + ") weight length differs: checkpoint " +
+						std::to_string(a[i]->input().length_) + ", net " + std::to_string(b[i]->input().length_) +
+						" (architecture flags such as -emb, -heads, the vocab, or a learned -pos_table with a different -tokens"
+						" must match the checkpoint)");
+		}
+		for (size_t i = 0; i < a.size(); ++i) {
+			const int t = ComplexNet::getType(a[i]);
+			if (t != isInput && t != isEmbedding) continue;
+			const int n = a[i]->input().length_;
+			std::copy(a[i]->input().real_, a[i]->input().real_ + n, b[i]->mutable_input()->real_);
+			std::copy(a[i]->input().imag_, a[i]->input().imag_ + n, b[i]->mutable_input()->imag_);
+		}
+		return true;
+	}
 
 	bool Restore(ComplexNet &net, std::string file) {
 		FileBinaryReader_ reader;

@@ -555,7 +555,12 @@ void BornAttentionGpu::free_scratch() {
 
 // One thread per (clone, head, query k). Head h owns dims [h*dh, (h+1)*dh) of
 // the d-wide token; scratch row (clone*H + h)*N + k holds its scores.
-__device__ inline float born_gamma__(int h, int decay) { return decay ? 1.f - exp2f(-(5.f + (float) h)) : 1.f; }
+#ifdef __CUDACC__
+__constant__ float c_born_decay__[2] = {5.f, 1.f};   // base, step of gamma_h = 1 - 2^-(base + step*h); see BornAttention
+#else
+static float c_born_decay__[2] = {5.f, 1.f};
+#endif
+__device__ inline float born_gamma__(int h, int decay) { return decay ? 1.f - exp2f(-(c_born_decay__[0] + c_born_decay__[1] * (float) h)) : 1.f; }
 
 __global__ void gpu_born_forward__(GpuInVar *in, GpuOutVar *out,
 		cmplx_ *C, float *A, float *S, int N, int d, int H, int B, int causal, float eps, int decay) {
@@ -2325,3 +2330,15 @@ void gpu_argmax_predict(GpuInVar *in, int *out_pred, int N, int no_mappings) {
 	CNET_KSYNC();
 }
 
+
+// Born decay schedule (CPU statics and the GPU constant used by born_gamma__).
+void BornAttention::setDecaySchedule(float base, float step) {
+	decayBase() = base;
+	decayStep() = step;
+#ifdef __CUDACC__
+	float v[2] = {base, step};
+	gpuErrchk(cudaMemcpyToSymbol(c_born_decay__, v, sizeof(v)));
+#else
+	c_born_decay__[0] = base; c_born_decay__[1] = step;
+#endif
+}

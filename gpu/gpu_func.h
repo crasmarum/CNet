@@ -1321,6 +1321,32 @@ public:
 		return hits;
 	}
 
+	// Born-rule probability of class cls per mapping/batch element, p = |z_cls|^2 / sum_k |z_k|^2, read from the
+	// CrossEntropy input already on the GPU. Call right after GpuForward / gpuInfer. Used for score thresholds
+	// (e.g. detection at a fixed false-alarm rate), where argmax accuracy is not enough.
+	std::vector<float> getClassProb(OutputFunc *outp, int cls) {
+		auto c_fun = dynamic_cast<CFunc*>(outp);
+		assert(c_fun);
+		CrossEntropyGpu *ce = dynamic_cast<CrossEntropyGpu*>(getMappingFor(c_fun));
+		assert(ce);
+		int N = ce->length();
+		std::vector<float> prob(ce->getNoMappings());
+		std::vector<float> buf(2 * N);
+#ifdef __CUDACC__
+		for (int m = 0; m < ce->getNoMappings(); ++m) {
+			gpuErrchk(cudaMemcpy(&buf[0], ce->in_[m].input_ptr_, sizeof(float) * 2 * N, cudaMemcpyDeviceToHost));
+			double tot = 0, c = 0;
+			for (int k = 0; k < N; ++k) {
+				double p = (double) buf[k] * buf[k] + (double) buf[N + k] * buf[N + k];
+				tot += p;
+				if (k == cls) c = p;
+			}
+			prob[m] = tot > 0 ? (float) (c / tot) : 0.f;
+		}
+#endif
+		return prob;
+	}
+
 	// Predicted class (Born argmax) per mapping/batch element — for confusion.
 	std::vector<int> getPredictions(OutputFunc *outp) {
 		auto c_fun = dynamic_cast<CFunc*>(outp);

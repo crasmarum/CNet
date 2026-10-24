@@ -72,6 +72,8 @@ FLAG_BOOL(pos_table, true)  // learned absolute positional table (N x E) added t
 FLAG_BOOL(born_linear, false) // GPU: exact chunkwise linear Born form (O(N) scratch; needs N % born_chunk == 0)
 FLAG_INT(born_chunk, 512)   // chunk length C of the linear form
 FLAG_BOOL(born_decay, false) // fixed per-head decay gamma_h^(k-m) on the Born score (gamma_h = 1 - 2^-(5+h)); exact in the linear state
+FLAG_FLOAT(born_decay_base, 5.f) // decay schedule gamma_h = 1 - 2^-(base + step*h): half-life ~0.69*2^(base+step*h) tokens;
+FLAG_FLOAT(born_decay_step, 1.f) //   the defaults (5, 1) are the RetNet schedule. Not saved in the model: pass the same values at eval.
 FLAG_INT(tokens, 64)        // context length N
 FLAG_INT(blocks, 4)         // number of FNet blocks L
 FLAG_INT(steps, 3000)       // optimizer steps
@@ -107,9 +109,10 @@ FLAG_STRING(eval_stream, "") // eval mode: stream this byte file through -model 
                              // the MBLM 5M-byte protocol), -eval_batch windows in parallel; prints bits/byte
 FLAG_INT(eval_window, 5242880) // bytes per state reset (multiple of the model context N)
 FLAG_INT(eval_batch, 4)      // windows evaluated in parallel (GPU memory ~ batch x the training footprint)
+FLAG_STRING(eval_dump, "")  // -eval_stream: also write one line per scored byte, "file_offset<TAB>nats"
 FLAG_INT(eval_bytes, 0)      // bytes of -eval_stream to use (0 = whole file)
 FLAG_STRING(model, "")      // model file to restore in -generate mode
-FLAG_STRING(init_model, "") // warm-restart: restore these weights before training (continue a checkpoint)
+FLAG_STRING(init_model, "") // warm start: copy these weights into the net built from the flags (-tokens may differ)
 FLAG_STRING(prompt, "ROMEO:")// seed text for generation
 FLAG_INT(gen_len, 600)      // number of characters to generate
 FLAG_BOOL(gen_gpu, false)   // generate using the GPU forward (fast Bluestein mixer) instead of CPU
@@ -484,6 +487,8 @@ static int runEvalStream() {
 
 	double nll_total = 0; long scored_total = 0, skipped_total = 0, dropped_total = 0;
 	std::vector<float> losses;
+	std::ofstream dump;
+	if (!((std::string) eval_dump).empty()) dump.open((std::string) eval_dump);
 	for (long g = 0; g < NWtot; g += Bn) {
 		const int nw = (int) std::min<long>(Bn, NWtot - g);
 		std::vector<long> wbytes(Bn, 0), nblk(Bn, 0);
@@ -524,6 +529,7 @@ static int runEvalStream() {
 					if (tb >= nblk[i] * N + 1) continue;               // beyond the scored blocks
 					if (idOf(base + t + 1) < 0) { wsk[i]++; continue; }
 					wnll[i] += losses[(size_t) i * N + t]; wsc[i]++;
+					if (dump.is_open()) dump << (base + t + 1) << '\t' << losses[(size_t) i * N + t] << '\n';
 				}
 			}
 		}
@@ -547,6 +553,7 @@ static int runEvalStream() {
 
 int main(int argc, char **argv) {
 	FLAGS::Parse(argc, argv);
+	BornAttention::setDecaySchedule(born_decay_base, born_decay_step);
 #ifdef __CUDACC__
 	g_cnet_nosync = !ksync;
 	g_cnet_tf32 = tf32;
@@ -622,23 +629,7 @@ int main(int argc, char **argv) {
 
 	CNet net;
 	CEmbedding *em; SequenceCrossEntropy *seq;
-	if (!((std::string) init_model).empty()) {
-		// Warm-restart: restore() REBUILDS the net (layers + weights) from the checkpoint, so we
-		// skip buildLM/init_inputs here. Only weights are restored (not Adam moments / LR), so
-		// expect a brief re-warm bump. Architecture flags must match the checkpoint.
-		if (!net.restore((std::string) init_model)) {
-			std::cerr << "rank " << R << ": cannot restore -init_model " << (std::string) init_model << "\n";
-			return 1;
-		}
-		em  = (CEmbedding*) net.cpuNet().findFirstOfType(isEmbedding);
-		seq = (SequenceCrossEntropy*) net.cpuNet().findFirstOfType(isSeqCrossEntropy);
-		if (!em || !seq) { std::cerr << "rank " << R << ": -init_model missing embedding/seq head\n"; return 1; }
-		em->setIsMainInput(true);
-		seq->setIsMainOutput(true);
-		seq->setEps(ce_eps);
-		seq->setSmooth(ce_smooth);
-		if (R == 0) std::cout << "[resume] restored weights from " << (std::string) init_model << "\n";
-	} else {
+	{
 		int embId = net.cpuNet().add(new CEmbedding(E, N, vocab));
 		int ceId  = buildLM(net.cpuNet(), embId, E, N, L, vocab);
 		((CEmbedding*) net.cpuNet()[embId])->setIsMainInput(true);
@@ -662,6 +653,22 @@ int main(int argc, char **argv) {
 		}
 		em  = (CEmbedding*) net.cpuNet()[embId];
 		seq = (SequenceCrossEntropy*) net.cpuNet()[ceId];
+	}
+	if (!((std::string) init_model).empty()) {
+		// Warm start: the net above is built from the flags at the CURRENT -tokens N; the checkpoint's learned
+		// weights (embedding table and all parameter tensors) are copied in. With -pos_table false (RoPE) no weight
+		// depends on N, so a model trained at one context length continues at another. Architecture flags (-emb,
+		// -blocks, -heads, mixer, vocab) must match the checkpoint. Adam moments / LR are not restored, so expect
+		// a brief re-warm bump.
+		ComplexNet ckpt;
+		ModelSaver saver;
+		std::string err;
+		if (!saver.Restore(ckpt, (std::string) init_model) || !ModelSaver::CopyWeights(ckpt, net.cpuNet(), &err)) {
+			std::cerr << "rank " << R << ": cannot load -init_model " << (std::string) init_model
+					  << (err.empty() ? "" : ": " + err) << "\n";
+			return 1;
+		}
+		if (R == 0) std::cout << "[resume] restored weights from " << (std::string) init_model << " at N=" << N << "\n";
 	}
 	net.allocateOnGpu(per);
 

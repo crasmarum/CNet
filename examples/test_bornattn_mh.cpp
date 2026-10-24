@@ -336,6 +336,18 @@ int main(int argc, char** argv) {
 		ok &= gpuBornLinear(256, 24, 3, 64, 1.0f, 0.5f, true);
 		ok &= gpuBornLinear(512, 32, 4, 128, 1e-2f, 0.3f, true);
 	}
+	// Slow decay schedule (base 7, step 2: half-lives ~90 .. 5,700 tokens): CPU finite differences and step mode,
+	// GPU parity and the GPU linear form must all hold for a non-default schedule too.
+	std::cout << "slow decay schedule (base 7, step 2)\n";
+	BornAttention::setDecaySchedule(7.f, 2.f);
+	ok &= fdBorn(6, 6, 3, true, true);
+	ok &= stepVsFull(16, 12, 3, true);
+	if (gpu) {
+		ok &= gpuBorn(16, 12, 4, 1e-3f, true);
+		ok &= gpuBornLinear(256, 24, 3, 64, 1.0f, 0.5f, true);
+		ok &= gpuBornLinear(512, 32, 4, 128, 1e-2f, 0.3f, true);
+	}
+	BornAttention::setDecaySchedule(5.f, 1.f);
 	std::cout << (ok ? "PASS" : "FAIL") << std::endl;
 	return ok ? 0 : 1;
 }

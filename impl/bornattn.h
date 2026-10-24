@@ -73,7 +73,13 @@ public:
 	void setLinear(bool on, int chunk = 512) { linear_ = on; chunk_ = chunk; }
 	void setDecay(bool on) { decay_ = on; }
 	bool decay() const { return decay_; }
-	static float gammaOf(int h) { return 1.f - std::exp2(-(5.f + (float) h)); }   // 31/32, 63/64, ...
+	// Decay schedule gamma_h = 1 - 2^-(base + step*h); default base 5, step 1 (RetNet: 31/32, 63/64, ...). Set once at
+	// startup with setDecaySchedule (also copies it to the GPU); not stored in model files, so pass the same flags
+	// when evaluating a model trained with a non-default schedule. Half-life of head h ~ 0.69 * 2^(base + step*h) tokens.
+	static float& decayBase() { static float b = 5.f; return b; }
+	static float& decayStep() { static float st = 1.f; return st; }
+	static void setDecaySchedule(float base, float step);
+	static float gammaOf(int h) { return 1.f - std::exp2(-(decayBase() + decayStep() * (float) h)); }
 	float gamma(int h) const { return decay_ ? gammaOf(h) : 1.f; }
 	void setStepMode(bool on) { assert(!on || N_ == 1); step_ = on; resetState(); }
 	bool stepMode() const { return step_; }

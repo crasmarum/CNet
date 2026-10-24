@@ -51,6 +51,7 @@ ifeq ($(NVCC_TEST),nvcc)
            gpu/reduce.cpp \
            gpu/reducegrad.cpp \
            gpu/gla_gpu.cpp \
+           gpu/chirp_gpu.cpp \
            cnet.cpp
 
 else
@@ -66,6 +67,7 @@ else
            gpu/reduce.cpp \
            gpu/reducegrad.cpp \
            gpu/gla_gpu.cpp \
+           gpu/chirp_gpu.cpp \
            gpu/kernels.cpp \
            cnet.cpp
 endif
@@ -89,14 +91,14 @@ DEPS = $(OBJS:.o=.d)
 
 
 # Framework objects (everything except the selected main), reused by example mains.
-FW_SRCS = utils/flags.cpp gpu/gpu_func.cpp impl/vars.cpp gpu/kernels.cpp gpu/reduce.cpp gpu/reducegrad.cpp gpu/gla_gpu.cpp
+FW_SRCS = utils/flags.cpp gpu/gpu_func.cpp impl/vars.cpp gpu/kernels.cpp gpu/reduce.cpp gpu/reducegrad.cpp gpu/gla_gpu.cpp gpu/chirp_gpu.cpp
 FW_OBJS = $(addprefix $(OBJ_DIR)/, $(notdir $(FW_SRCS:.cpp=.o)))
 
 
 # --- Build Rules ---
 
 # Phony targets are not actual files. 'all' is the default goal.
-.PHONY: all clean run info app dp_shakespeare generate gollm radioml mnist_hadamard bench_mixer bench_clone bench_bornattn test_conjlag_fd test_hadamardconv_fd test_hadamardconv_gpu test_bornattn_mh test_gla
+.PHONY: all clean run info app dp_shakespeare generate gollm radioml mnist_hadamard bench_mixer bench_clone bench_bornattn test_conjlag_fd test_hadamardconv_fd test_hadamardconv_gpu test_bornattn_mh test_gla test_chirp_fd test_chirp_gpu chime_detect
 .DEFAULT_GOAL := all
 
 # Standalone multi-GPU data-parallel tiny-shakespeare example (its own main).
@@ -135,6 +137,13 @@ radioml: $(FW_OBJS)
 	$(CXX) $(CXXFLAGS) -c examples/radioml.cpp -o $(OBJ_DIR)/radioml.o
 	$(CXX) $(FW_OBJS) $(OBJ_DIR)/radioml.o $(LDFLAGS) -o $(TARGET_DIR)/radioml
 	@echo "==> Built $(TARGET_DIR)/radioml"
+
+# Dispersed-burst detection in raw CHIME voltages with ChirpFilter + BoxcarMax (examples/chime_detect.cpp). No NCCL.
+chime_detect: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/chime_detect.cpp -o $(OBJ_DIR)/chime_detect.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/chime_detect.o $(LDFLAGS) -o $(TARGET_DIR)/chime_detect
+	@echo "==> Built $(TARGET_DIR)/chime_detect"
 
 # Graph-cloning systems benchmark (examples/bench_clone.cpp). Single-GPU, no NCCL.
 bench_clone: $(FW_OBJS)
@@ -177,6 +186,20 @@ test_conjlag_fd: $(FW_OBJS)
 	$(CXX) $(CXXFLAGS) -c examples/test_conjlag_fd.cpp -o $(OBJ_DIR)/test_conjlag_fd.o
 	$(CXX) $(FW_OBJS) $(OBJ_DIR)/test_conjlag_fd.o $(LDFLAGS) -o $(TARGET_DIR)/test_conjlag_fd
 	@echo "==> Built $(TARGET_DIR)/test_conjlag_fd"
+
+# Standalone CPU checks for ChirpFilter and BoxcarMax (forward, finite differences, save/restore; no NCCL).
+test_chirp_fd: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/test_chirp_fd.cpp -o $(OBJ_DIR)/test_chirp_fd.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/test_chirp_fd.o $(LDFLAGS) -o $(TARGET_DIR)/test_chirp_fd
+	@echo "==> Built $(TARGET_DIR)/test_chirp_fd"
+
+# GPU-vs-CPU parity for ChirpFilter and BoxcarMax (needs a GPU; no NCCL).
+test_chirp_gpu: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/test_chirp_gpu.cpp -o $(OBJ_DIR)/test_chirp_gpu.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/test_chirp_gpu.o $(LDFLAGS) -o $(TARGET_DIR)/test_chirp_gpu
+	@echo "==> Built $(TARGET_DIR)/test_chirp_gpu"
 
 # Standalone CPU finite-difference gradient check for HadamardConv (no NCCL).
 test_hadamardconv_fd: $(FW_OBJS)

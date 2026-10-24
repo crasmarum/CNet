@@ -9,6 +9,7 @@
 #include "gpumapping.h"
 #include "kernels.h"
 #include "reduce.h"
+#include "chirp_gpu.h"
 #include "../impl/cfunc.h"
 #include "../impl/cnet.h"
 #include "compl.h"
@@ -63,7 +64,9 @@ public:
 		X(isTokenNorm,      TokenNormGpu)      \
 		X(isRotary,         RotaryEmbedGpu)    \
 		X(isHadamardConv,   HadamardConvGpu)   \
-		X(isGLA,            GatedLinearAttentionGpu)
+		X(isGLA,            GatedLinearAttentionGpu) \
+		X(isChirpFilter,    ChirpFilterGpu)   \
+		X(isBoxcarMax,      BoxcarMaxGpu)
 
 	void add(float **gpu_ptr, std::vector<CFunc*>& block, int depth) {
 		assert(block.size());

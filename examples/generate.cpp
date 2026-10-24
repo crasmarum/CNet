@@ -47,6 +47,7 @@ FLAG_INT(threads, 8)                          // OpenMP threads for streaming de
 FLAG_STRING(eval, "")                         // score this text file through the streaming decoder: nats/char and
                                               // bits/byte over consecutive N-char windows (state reset per window,
                                               // first char of each window unscored); chars outside the vocab are skipped
+FLAG_STRING(eval_dump, "")                    // -eval: also write one line per scored byte, "file_offset<TAB>nats"
 FLAG_INT(eval_offset, 0)                      // byte offset into -eval
 FLAG_INT(eval_chars, 1000000)                 // bytes to score from the offset (shard the file across processes)
 FLAG_INT(eval_window, 0)                      // bytes between state resets (0 = the training context N). A long
@@ -149,6 +150,8 @@ int main(int argc, char **argv) {
 		// bytes outside the vocabulary are not scored but are charged 8 bits each in the "bpb_all" figure.
 		const size_t W = eval_window > 0 ? (size_t) eval_window : (size_t) N;
 		double nll = 0; size_t scored = 0;
+		std::ofstream dump;
+		if (!((std::string) eval_dump).empty()) dump.open((std::string) eval_dump);
 		size_t pos = 0;                                   // byte position in buf
 		while (pos < buf.size()) {
 			size_t wend = std::min(buf.size(), pos + W);
@@ -161,7 +164,9 @@ int main(int argc, char **argv) {
 				if (prev >= 0) {                          // score byte `id` given the state after `prev`
 					stepToken(sn, prev, t++);
 					double pr = sn.seq->getProbability(0, id);
-					nll += -std::log(std::max(pr, 1e-12)); ++scored;
+					const double l = -std::log(std::max(pr, 1e-12));
+					nll += l; ++scored;
+					if (dump.is_open()) dump << (eval_offset + b) << '\t' << l << '\n';
 				}
 				prev = id;
 			}

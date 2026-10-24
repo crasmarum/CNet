@@ -877,6 +877,14 @@ By default the example uses the parameter-free `TriangFourier` causal mixer. Fla
     -emb 256 -tokens 4096 -blocks 6 -batch 4 -steps 6000 -save_path gla4k.mod
 ```
 
+**Continuing from a checkpoint, also at a different context length.** `-init_model model.mod` starts training from a saved model's weights. The network is built from the current flags, including `-tokens`, and the checkpoint's learned tensors (the embedding table and every parameter tensor) are copied in, layer by layer. With `-pos_table false` (RoPE only) no weight depends on the context length, so a model trained at `-tokens 1024` continues at `-tokens 4096` or longer: a cheap way to grow the context in stages. The architecture flags (`-emb`, `-blocks`, `-heads`, the mixer) and the vocabulary must match the checkpoint; on a mismatch the run stops before training and names the layer and both sizes. Adam's moments and the learning-rate schedule are not restored, so expect a short re-warm bump.
+
+```bash
+./dp_shakespeare -data train.txt -val_data val.txt -born true -born_linear true -born_chunk 512 \
+    -rope true -pos_table false -emb 64 -blocks 2 -heads 4 -tokens 4096 \
+    -init_model model1k.mod -steps 2000 -lr 5e-4 -save_path model4k.mod
+```
+
 The trained model can be checkpointed (`-save_path model.mod`) and then sampled without retraining. Training also writes a `model.mod.vocab` sidecar holding the character⟷id table, so generation is **self-contained** and no longer needs the training corpus to reconstruct the (insertion-order) vocabulary; older checkpoints without a sidecar fall back to `-data`. Add `-gen_gpu true` to sample on the device through the fast Bluestein/Born forward instead of the CPU reference — seconds rather than minutes for a hybrid/FNet model:
 
 ```bash
