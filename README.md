@@ -409,7 +409,7 @@ Constraints: causal attention only, `N % chunk == 0`, $d_h \le 64$; the linear f
 
 ### Fixed per-head decay (forgetting)
 
-`setDecay(true)` (trainer flag `-born_decay true`) multiplies the score by $\gamma_h^{\,k-m}$ with the RetNet schedule $\gamma_h = 1 - 2^{-(5+h)}$ (effective windows of about 32, 64, 128, 256 tokens for four heads), so distant keys fade before normalisation. It costs no parameters and no wall-clock: the quadratic kernels multiply the score, the linear kernels carry it exactly in the state (keys weighted by $\gamma^{C-1-j}$ inside a chunk, the state scaled by $\gamma^{C}$ per chunk, queries read with $\gamma^{i+1}$), and the streaming decoder scales its running state by $\gamma_h$ per token. Checkpoints with decay use the extended record (negative head count). Finite differences, GPU parity, the linear-vs-quadratic oracle and the step-vs-full check all cover the decayed operator (`make test_bornattn_mh`). In the controlled PyTorch study of the companion paper the decay was the single most effective fix for long contexts (at 128k it recovered 0.66 of the 0.70 nats between plain Born and gated linear attention).
+`setDecay(true)` (trainer flag `-born_decay true`) multiplies the score by $\gamma_h^{\,k-m}$ with the RetNet schedule $\gamma_h = 1 - 2^{-(5+h)}$ (effective windows of about 32, 64, 128, 256 tokens for four heads), so distant keys fade before normalisation. It costs no parameters and no wall-clock: the quadratic kernels multiply the score, the linear kernels carry it exactly in the state (keys weighted by $\gamma^{C-1-j}$ inside a chunk, the state scaled by $\gamma^{C}$ per chunk, queries read with $\gamma^{i+1}$), and the streaming decoder scales its running state by $\gamma_h$ per token. Checkpoints with decay use the extended record (negative head count). Finite differences, GPU parity, the linear-vs-quadratic oracle and the step-vs-full check all cover the decayed operator (`make test_bornattn_mh`). The schedule is configurable: `BornAttention::setDecaySchedule(base, step)` (trainer flags `-born_decay_base`, `-born_decay_step`) sets $\gamma_h = 1 - 2^{-(\text{base} + \text{step}\cdot h)}$, a half-life of about $0.69 \cdot 2^{\text{base}+\text{step}\cdot h}$ tokens; the defaults $(5, 1)$ are the RetNet schedule. It is not stored in model files, so pass the same values when evaluating a checkpoint. Slower schedules matter for memory over long spans: on a synthetic pulse train with a 1,222-token period, heads with half-lives of about 180 to 1,400 tokens (`-born_decay_base 8 -born_decay_step 1`) learned the period clearly, where a faster schedule (base 6, step 1.5) learned it only partly. In the controlled PyTorch study of the companion paper the decay was the single most effective fix for long contexts (at 128k it recovered 0.66 of the 0.70 nats between plain Born and gated linear attention).
 
 ### Streaming (constant-state) decoding
 
@@ -653,6 +653,34 @@ auto mag  = cnet.add(new CModulus2(InSize(N)), {stft});               // |.|^2 s
 ```
 
 Empirically, on RML a segmented-Fourier branch (windows `{16, 32}`) gave **no gain over the cyclic spectrum** above — the two features are redundant — which we record as an honest negative. It is provided as a general-purpose spectral/time–frequency primitive.
+
+## Chirp Filter (Coherent Dedispersion) Layer
+
+`ChirpFilter` applies `K` learnable coherent-dedispersion filters to one channel of complex baseband, the physics front end for detecting dispersed radio bursts. Each filter is an all-pass phase in the Fourier domain (the FFT–Hadamard pattern with the frequency response constrained to a quadratic phase), and its dispersion measure is the only parameter:
+
+$$y_k = \mathcal{F}^{-1}\big(D_k \cdot \mathcal{F}x\big),\qquad D_k(f) = e^{\,i\,\phi(f)\,\mathrm{DM}_k},\qquad \phi(f) = \frac{2\pi k_{\mathrm{DM}} f^2}{f_c^2 (f_c + f)},$$
+
+with $f$ the offset from the channel centre $f_c$ and $k_{\mathrm{DM}} = 4.148808\times10^{15}$ s Hz². The main input is `[x (L) | f_c (1)]`: the voltages and the channel centre in MHz, a per-example input that is never trained (it is appended to the main input because parameters are shared across clones). The second input holds the `K` parameters, with $\mathrm{DM}_k = s \cdot \mathrm{Re}\,d_k$ for the constructor's `dm_scale` $s$ (default 100, which keeps Adam's step meaningful in DM units). The output is the `K` dedispersed signals, `K·L` values. The sign is the CHIME baseband convention: CHIME channels have the reverse frequency orientation to the textbook formula, verified against the archive's own dedispersed power (median correlation 0.988 for this sign, 0.06 for the other). The sample time is `ChirpFilter::DT` = 2.56 µs (390.625 kHz channels).
+
+The map is linear in $x$, so the Wirtinger backward is the transpose and the adjoint of $\mathcal{F}^{-1} D_k \mathcal{F}$; the DM is a real parameter, so only $\mathrm{Re}\,d_k$ receives a gradient. The CPU reference uses an exact radix-2 FFT; the GPU mapping batches all examples and filters through cuFFT. `make test_chirp_fd` checks the gradients by central finite differences (about 1e-4 relative error for the signal, 1e-3 for the DM), and `make test_chirp_gpu` checks every output and gradient on the GPU against the CPU at window lengths up to 16,384.
+
+## BoxcarMax Layer
+
+`BoxcarMax` is the matching boxcar search: for each of `K` rows of length `L` (real power with unit-mean noise, for example `CModulus2` of the `ChirpFilter` output) and each width `w`, it returns the maximum over start positions (stride `max(w/4, 1)`) of the normalised window sum $(\sum_{w} p - w)/\sqrt{w}$, `K·len(widths)` values. The gradient goes to the samples of the winning window (as `MeanPool` over that window), so a finite-difference check is only piecewise valid: a step that changes the winning window breaks it.
+
+```c++
+#include "impl/chirp.h"
+
+int L = 16384, K = 16;
+std::vector<int> widths = {32, 128, 512};
+int inp = net.add(new CInput(Uid(1), OutSize(L + 1)));                      // [x | f_c (MHz)]
+int dms = net.add(new CInput(Uid(2), OutSize(K)));                          // DM_k / 100
+int chf = net.add(new ChirpFilter(Uid(3), L, K), {inp, dms});               // K dedispersed signals
+int pw  = net.add(new CModulus2(Uid(4), InSize(K * L)), {chf});             // power
+int box = net.add(new BoxcarMax(Uid(5), K, L, widths), {pw});               // K * 3 search statistics
+```
+
+[examples/chime_detect.cpp](examples/chime_detect.cpp) trains this front end with a linear Born-rule head (208 real parameters) to detect injected dispersed bursts in real CHIME/FRB noise, and evaluates detection at a fixed false-alarm rate with a threshold set on separate noise windows (`-cal_bin`). It reads windows in a simple binary format: `int32 N, int32 L`, then `N` records of `float32 f_c` (MHz) followed by `L` interleaved `float32` real and imaginary parts. With the DM parametrised as above, the filters' DMs move during training. Results, including a hybrid that reads the dedispersed power with a small non-linear head, are in the preprint [Physics Front Ends with Small Learned Heads for Detecting Dispersed Bursts in CHIME/FRB Baseband Voltages](https://phasefield.ai/papers/chime_baseband_detectors.pdf).
 
 ## L2Out Loss function
 
