@@ -21,6 +21,7 @@
 #include <map>
 #include <random>
 #include <cmath>
+#include <memory>
 
 #include "../utils/flags.h"
 #include "../impl/log.h"
@@ -54,6 +55,12 @@ FLAG_INT(eval_window, 0)                      // bytes between state resets (0 =
                                               // window (e.g. 5242880, the MBLM 5M-byte protocol) streams the
                                               // constant-state twin unbroken; shard offsets/lengths should be
                                               // multiples of it so every process sees whole windows
+FLAG_FLOAT(born_decay_base, 5.f)             // Born decay schedule gamma_h = 1 - 2^-(base + step*h); not stored in the
+FLAG_FLOAT(born_decay_step, 1.f)             //   model file: pass the values the model was trained with (default RetNet)
+FLAG_BOOL(score_stdin, false)                 // live scoring: read raw bytes from stdin one at a time through the
+                                              // streaming decoder (state never reset) and print, per byte, its surprise
+                                              // -log p(byte | all earlier bytes) in nats, one line each, flushed; the
+                                              // first byte prints "nan"; bytes outside the vocab print "skip"
 FLAG_INT(check, 0)                            // >0: compare the twin's next-token distribution with the full
                                               // window at the first `check` prompt positions, report, exit
 
@@ -86,6 +93,7 @@ static int sampleNext(SequenceCrossEntropy *seq, int p, int vocab, double temp, 
 
 int main(int argc, char **argv) {
 	FLAGS::Parse(argc, argv);
+	BornAttention::setDecaySchedule(born_decay_base, born_decay_step);
 	FILELog::ReportingLevel() = lWarning;        // quiet the per-layer restore logs
 	if (((std::string) model).empty()) {
 		std::cerr << "usage: generate -model <file> [-data <txt> -prompt <s> -gen_len <n> -temp <t>]\n";
@@ -109,7 +117,8 @@ int main(int argc, char **argv) {
 	std::vector<char> i2c(ds.vocab);
 	for (auto &kv : ds.c2i) i2c[kv.second] = kv.first;
 
-	CNet net;
+	std::unique_ptr<CNet> netp(new CNet);   // heap-held so -score_stdin can free it once the step twin exists
+	CNet &net = *netp;
 	if (!net.restore((std::string) model)) {
 		std::cerr << "cannot restore model: " << (std::string) model << "\n";
 		return 1;
@@ -133,6 +142,33 @@ int main(int argc, char **argv) {
 		std::cerr << "streaming decode unavailable (" << sn.error << "); using the full-window path\n";
 		use_stream = false;
 		if (check > 0) return 1;
+	}
+
+	if (score_stdin) {
+		if (!use_stream) { std::cerr << "-score_stdin needs the streaming decoder\n"; return 1; }
+		// The step twin holds copies of the weights; the full N-position network (GBs of activation
+		// buffers) is only needed again for a learned positional table, which it still owns.
+		if (!sn.pos_src) netp.reset();
+#ifdef _OPENMP
+		omp_set_num_threads(std::max(1, std::min<int>(threads, omp_get_max_threads())));
+#endif
+		stepReset(sn);
+		int prev = -1, t = 0;
+		char c;
+		while (std::cin.get(c)) {
+			auto it = ds.c2i.find(c);
+			if (it == ds.c2i.end()) { std::cout << "skip\n" << std::flush; continue; }
+			const int id = it->second;
+			if (prev >= 0) {                              // surprise of `id` given the state after `prev`
+				stepToken(sn, prev, t++);
+				const double pr = sn.seq->getProbability(0, id);
+				std::cout << -std::log(std::max(pr, 1e-12)) << '\n' << std::flush;
+			} else {
+				std::cout << "nan\n" << std::flush;
+			}
+			prev = id;
+		}
+		return 0;
 	}
 
 	if (!((std::string) eval).empty()) {
