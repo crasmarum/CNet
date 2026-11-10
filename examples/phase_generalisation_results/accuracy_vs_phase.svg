@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="400" font-family="sans-serif" font-size="12">
+<rect width="720" height="400" fill="white"/>
+<rect x="60.0" y="30" width="127.5" height="320" fill="#eef4ea"/>
+<text x="123.75" y="44" text-anchor="middle" fill="#557a46">training phases</text>
+<line x1="60" x2="570" y1="350" y2="350" stroke="#e5e5e5"/><text x="52" y="354" text-anchor="end">0.00</text>
+<line x1="60" x2="570" y1="270.0" y2="270.0" stroke="#e5e5e5"/><text x="52" y="274.0" text-anchor="end">0.25</text>
+<line x1="60" x2="570" y1="190.0" y2="190.0" stroke="#e5e5e5"/><text x="52" y="194.0" text-anchor="end">0.50</text>
+<line x1="60" x2="570" y1="110.0" y2="110.0" stroke="#e5e5e5"/><text x="52" y="114.0" text-anchor="end">0.75</text>
+<line x1="60" x2="570" y1="30.0" y2="30.0" stroke="#e5e5e5"/><text x="52" y="34.0" text-anchor="end">1.00</text>
+<text x="60.0" y="368" text-anchor="middle">0</text>
+<text x="187.5" y="368" text-anchor="middle">90</text>
+<text x="315.0" y="368" text-anchor="middle">180</text>
+<text x="442.5" y="368" text-anchor="middle">270</text>
+<text x="570.0" y="368" text-anchor="middle">360</text>
+<line x1="60" x2="570" y1="310.0" y2="310.0" stroke="#999" stroke-dasharray="4 4"/><text x="566" y="306.0" text-anchor="end" fill="#777">chance</text>
+<text x="315.0" y="390" text-anchor="middle">test carrier phase (degrees)</text><text x="16" y="190.0" text-anchor="middle" transform="rotate(-90 16 190.0)">accuracy</text>
+<polyline points="70.6,75.7 91.9,78.0 113.1,72.5 134.4,76.1 155.6,81.6 176.9,75.4 198.1,77.1 219.4,79.9 240.6,75.2 261.9,78.9 283.1,74.4 304.4,73.5 325.6,73.9 346.9,75.9 368.1,79.9 389.4,73.3 410.6,74.2 431.9,75.0 453.1,73.7 474.4,75.4 495.6,74.2 516.9,75.7 538.1,73.7 559.4,80.3" fill="none" stroke="#1f6fb4" stroke-width="2"/>
+<line x1="584" x2="604" y1="40" y2="40" stroke="#1f6fb4" stroke-width="2"/><text x="610" y="44">complex</text>
+<polyline points="70.6,74.2 91.9,73.7 113.1,72.7 134.4,75.2 155.6,80.1 176.9,74.4 198.1,77.8 219.4,76.9 240.6,72.7 261.9,79.9 283.1,71.8 304.4,73.3 325.6,73.5 346.9,77.8 368.1,77.4 389.4,72.2 410.6,70.7 431.9,72.2 453.1,72.9 474.4,74.2 495.6,73.7 516.9,75.4 538.1,73.3 559.4,78.4" fill="none" stroke="#5aa9e6" stroke-width="2" stroke-dasharray="6 3"/>
+<line x1="584" x2="604" y1="58" y2="58" stroke="#5aa9e6" stroke-width="2" stroke-dasharray="6 3"/><text x="610" y="62">tied_real</text>
+<polyline points="70.6,72.0 91.9,62.2 113.1,55.8 134.4,55.8 155.6,60.9 176.9,71.0 198.1,88.7 219.4,131.5 240.6,179.5 261.9,265.1 283.1,319.1 304.4,341.0 325.6,349.4 346.9,349.4 368.1,349.6 389.4,350.0 410.6,349.8 431.9,348.7 453.1,345.1 474.4,325.5 495.6,272.3 516.9,186.6 538.1,127.9 559.4,88.0" fill="none" stroke="#d1495b" stroke-width="2"/>
+<line x1="584" x2="604" y1="76" y2="76" stroke="#d1495b" stroke-width="2"/><text x="610" y="80">real_mlp</text>
+<polyline points="70.6,87.8 91.9,79.1 113.1,82.7 134.4,78.9 155.6,92.1 176.9,83.8 198.1,84.8 219.4,89.1 240.6,81.2 261.9,86.7 283.1,83.5 304.4,82.3 325.6,83.3 346.9,81.0 368.1,87.8 389.4,77.4 410.6,83.5 431.9,78.9 453.1,77.1 474.4,83.8 495.6,79.9 516.9,82.9 538.1,81.6 559.4,86.7" fill="none" stroke="#edae49" stroke-width="2"/>
+<line x1="584" x2="604" y1="94" y2="94" stroke="#edae49" stroke-width="2"/><text x="610" y="98">real_aug</text>
+<polyline points="70.6,304.8 91.9,306.7 113.1,308.2 134.4,313.9 155.6,305.8 176.9,312.7 198.1,308.8 219.4,311.4 240.6,313.5 261.9,309.9 283.1,309.0 304.4,304.8 325.6,312.7 346.9,313.5 368.1,307.1 389.4,304.8 410.6,311.4 431.9,306.7 453.1,310.5 474.4,311.4 495.6,311.6 516.9,308.0 538.1,312.2 559.4,311.0" fill="none" stroke="#8c8c8c" stroke-width="2"/>
+<line x1="584" x2="604" y1="112" y2="112" stroke="#8c8c8c" stroke-width="2"/><text x="610" y="116">real_modulus</text>
+<polyline points="70.6,68.8 91.9,68.8 113.1,68.4 134.4,70.1 155.6,72.7 176.9,65.6 198.1,69.3 219.4,73.5 240.6,66.5 261.9,71.0 283.1,65.6 304.4,68.6 325.6,69.5 346.9,69.9 368.1,70.3 389.4,68.6 410.6,64.6 431.9,67.1 453.1,66.5 474.4,69.9 495.6,67.5 516.9,69.7 538.1,67.3 559.4,72.0" fill="none" stroke="#222222" stroke-width="2" stroke-dasharray="6 3"/>
+<line x1="584" x2="604" y1="130" y2="130" stroke="#222222" stroke-width="2" stroke-dasharray="6 3"/><text x="610" y="134">matched</text>
+<text x="60" y="20">training set 16,384, mean over 3 seeds</text></svg>
