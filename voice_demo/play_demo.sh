@@ -8,7 +8,12 @@ cd "$(dirname "$0")" || exit 1
 [ -x bin/se_stream ] || { echo "run ./build.sh first"; exit 1; }
 IN=clips/clip2_noisy.wav
 OUT=clips/clip2_enhanced.wav
-bin/se_stream -model models/s8_e49.mod -wav $IN -out $OUT -gain running | tail -1
+rm -f "$OUT"                                      # never play a stale result
+if ! bin/se_stream -model models/s8_e49.mod -wav "$IN" -out "$OUT" -gain running > clips/se_stream.log 2>&1 \
+   || [ ! -s "$OUT" ]; then
+	echo "denoising failed:"; tail -5 clips/se_stream.log; exit 1
+fi
+tail -1 clips/se_stream.log
 [ "$1" = "--no-play" ] && { echo "written $OUT"; exit 0; }
 
 play() {
@@ -20,6 +25,6 @@ w = wave.open(sys.argv[1]); x = np.frombuffer(w.readframes(w.getnframes()), dtyp
 	else echo "no audio player found (afplay, paplay, aplay or the .venv)"; exit 1
 	fi
 }
-echo "noisy ..."; play $IN
+echo "noisy ..."; play "$IN"
 sleep 1
-echo "cleaned ..."; play $OUT
+echo "cleaned ..."; play "$OUT"

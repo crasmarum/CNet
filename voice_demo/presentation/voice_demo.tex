@@ -23,16 +23,16 @@
 \small
 \begin{columns}[T]
 \begin{column}{0.54\textwidth}
-\textbf{The problem.} Small robots, wearables and appliances must hear you continuously, with no cloud link, no graphics chip and a small battery. Today's speech models are built for short clips: they re-read the last second at every step, or they stream with approximations.
+\textbf{The problem.} Small robots, wearables and appliances must hear you continuously, with no cloud link, no graphics chip and a small battery. Today's speech models are built for short clips: they re-read the last second at every step, or they stream over a fixed window that forgets abruptly.
 
 \medskip
-\textbf{What we built.} \emph{Born attention} weighs earlier sound by a probability, as a measurement does in quantum physics. The consequence: the model runs \num{one 10-millisecond frame at a time}, with a memory that \num{never grows}, and gives \num{exactly} the result it would give from the whole recording.
+\textbf{What we built.} \emph{Born attention} weighs earlier sound by a probability, as a measurement does in quantum physics. Its kernel has an exact recurrence (softmax attention has none), so the model runs \num{one 10-millisecond frame at a time}, with a memory that \num{never grows}, and the stream gives \num{exactly} the result the same model gives from the whole recording.
 
 \medskip
 \textbf{Two models, one stack.} A command spotter and a noise remover, trained from the raw waveform in our own framework (CNet: C++/CUDA, complex numbers built in) and run as streams on a plain CPU.
 \end{column}
 \begin{column}{0.44\textwidth}
-\begin{block}{What the stream costs, one laptop core}
+\begin{block}{What the stream costs, one Apple M3 Max core}
 \scriptsize\setlength{\tabcolsep}{3pt}
 \begin{tabular}{@{}lrr@{}}
 \toprule
@@ -50,7 +50,7 @@ model file & 1.4 MB & 6.8 MB \\
 \scriptsize
 \begin{itemize}
 \item \emph{Standard transformers}: memory grows with time, or a fixed window forgets abruptly.
-\item \emph{``Linear'' attention}: constant memory but approximate; Born was ahead at every matched checkpoint on spotting, 48 of 50 on denoising.
+\item \emph{Other linear-attention kernels}: also constant memory; the Born kernel was ahead of a gated-linear one at every matched checkpoint on spotting, 48 of 50 on denoising.
 \item \emph{No attention}: 15 points of accuracy lost.
 \end{itemize}
 \end{block}
@@ -63,29 +63,29 @@ model file & 1.4 MB & 6.8 MB \\
 \small
 \begin{columns}[T]
 \begin{column}{0.52\textwidth}
-\begin{block}{Command spotter: Google's 35-word benchmark, trained from scratch on one rented GPU}
+\begin{block}{Command spotter (Google's 35-word benchmark, one rented GPU)}
 \scriptsize
 \begin{itemize}
-\item \num{95.1\%} of test clips correct with \num{123k} parameters.
-\item Within \num{one point} of the standard model of the same size; 2.5 points from the best published, which train four to five times longer or start from large pretrained models.
-\item Listening continuously to 15 minutes of noisy audio, seven commands: \num{80\%} caught, \num{6} false alarms.
+\item r28: \num{95.1\%} of test clips correct with \num{123k} parameters.
+\item Within \num{one point} of the standard model of the same size; 2.5 from the best published, which train 4--5$\times$ longer or start pretrained.
+\item A separate rejection-trained model (r21, 17 classes) listening to 15 minutes of noisy audio: \num{80\%} of 143 commands caught, \num{6} false alarms.
 \end{itemize}
 \end{block}
-\begin{block}{Noise remover: VoiceBank-DEMAND, the standard noisy-speech test}
+\begin{block}{Noise remover (VoiceBank-DEMAND)}
 \scriptsize
 \begin{itemize}
-\item Speech quality score (PESQ, 1 to 4.5) from \num{1.97} to \num{2.60}; noise power cut \num{8$\times$} (9 dB).
+\item Speech quality score (PESQ, 1 to 4.5) from \num{1.97} to \num{2.60}; signal-to-distortion ratio up \num{9.3 dB}.
 \item The stream is within 0.02 of the offline score.
-\item 0.3 to 0.6 short of the best published models; the lever that moves it is known (the training objective).
+\item 0.3--0.6 short of the best published; the lever is known (the training objective).
 \end{itemize}
 \end{block}
 \end{column}
 \begin{column}{0.46\textwidth}
 \textbf{Why it matters.}
 \begin{itemize}
-\item Runs on a Raspberry-Pi-class processor: no cloud, nothing leaves the device, a constant cost per second however long it listens.
+\item Built for a Raspberry-Pi-class processor, measured so far on one Apple M3 Max core: no cloud, nothing leaves the device, constant cost per second.
 \item One stack from training to deployment: a 0.4 MB program plus the model file, no runtime dependencies.
-\item Reproducible: 36 documented training runs, matched-pair comparisons, a 23-page technical report with the failures as well as the results.
+\item Reproducible: 36 documented runs, matched-pair comparisons, a 23-page technical report including the failures.
 \end{itemize}
 \medskip
 \textbf{Next.} Measure on the robot's processor; train the spotter on continuous audio; the extra loss term for the noise remover; repeat the key comparisons over several random seeds.
@@ -111,22 +111,22 @@ cd CNet/voice_demo
 \textbf{Run:}
 \begin{semiverbatim}\scriptsize
 ./play_demo.sh   # bundled clip, before and after
-./listen.sh      # say stop, go, left, right ...
+./listen.sh      # r28; --robot for r21
 ./denoise.sh     # record 5 s with noise, hear it cleaned
 \end{semiverbatim}
 \end{column}
 \begin{column}{0.48\textwidth}
 \textbf{What you will see.}
 \begin{itemize}
-\item \texttt{play\_demo.sh}: seven seconds of a noisy test recording, then the cleaned version from the stream.
-\item \texttt{listen.sh}: a time and a word at each detection, in CAPITALS when the model is sure, plus its current best guess twice a second. Ctrl-C stops it.
-\item \texttt{denoise.sh}: records you with some background noise, then plays the recording and the cleaned version.
+\item \texttt{play\_demo.sh}: a noisy test recording, then the cleaned version from the stream.
+\item \texttt{listen.sh}: a time and a word at each detection, in CAPITALS when the model is sure. Ctrl-C stops it.
+\item \texttt{denoise.sh}: records you with background noise, then plays the recording and the cleaned version.
 \end{itemize}
 \medskip
-\textbf{Variants.} \texttt{listen.sh --all} (35 words), \texttt{listen.sh --ptt} (push to talk), \texttt{denoise.sh --file your.wav}, \texttt{denoise.sh --offline}.
+\textbf{Variants.} \texttt{listen.sh --robot} (r21, the model behind the continuous-audio numbers), \texttt{--all}, \texttt{--ptt}; \texttt{denoise.sh --file your.wav}, \texttt{--offline} (the setting of the published scores).
 
 \medskip
-\textbf{In the folder.} \texttt{models/} (1.4 MB spotter, 6.8 MB noise remover), \texttt{py/} (microphone scripts), \texttt{clips/} (the demo recording), this deck in \texttt{presentation/}; the technical report is in the repository.
+\textbf{In the folder.} \texttt{models/} (two spotters, one noise remover), \texttt{py/}, \texttt{clips/}, this deck; the technical report is in the repository.
 \end{column}
 \end{columns}
 \end{frame}
