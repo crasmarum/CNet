@@ -11,3 +11,4 @@ presentation/*.toc
 presentation/*.fdb_latexmk
 presentation/*.fls
 presentation/*.synctex.gz
+presentation/*.vrb
