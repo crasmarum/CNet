@@ -6,6 +6,8 @@ three-page deck in `presentation/voice_demo.pdf` says the same as this page for 
 
 ## 1. The technology in one page
 
+![How the spotter listens: one 10 ms slice at a time, a fixed memory, a fresh answer every 10 ms](presentation/streaming_overview.svg)
+
 A small robot, a wearable or an appliance has to hear you continuously, with no cloud link, no graphics chip and
 a small battery. Today's best speech models are built for short clips: either they re-read the whole last second
 at every step, or they stream over a fixed window that forgets abruptly.
@@ -87,6 +89,7 @@ The scripts work from the public CNet repository (this folder next to the Makefi
 | `py/kws_listen_stream.py`, `py/kws_mic.py`, `py/se_mic.py` | microphone scripts (copies of `src/data/`) |
 | `clips/clip2_noisy.wav` | a seven-second VoiceBank-DEMAND test recording (CC BY 4.0), see `clips/README.md` |
 | `presentation/voice_demo.tex`, `voice_demo.pdf` | the three-page deck |
+| `presentation/streaming_overview.svg`, `.png`, `.pdf` | the one-picture explanation of the stream (above) |
 
 The programs are `examples/kws_stream.cpp`, `examples/se_stream.cpp` (the streaming twins), `examples/kws_infer.cpp`
 and `examples/se_infer.cpp` (offline), built by the CNet Makefile without CUDA. The technical report is

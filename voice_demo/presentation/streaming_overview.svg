@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0,0 L12,6 L0,12 z" fill="#555"/>
+    </marker>
+  </defs>
+  <rect width="1600" height="900" fill="#ffffff"/>
+
+  <!-- title -->
+  <text x="800" y="66" text-anchor="middle" font-size="40" font-weight="bold" fill="#222">How the spotter listens: one 10-millisecond slice at a time</text>
+  <text x="800" y="106" text-anchor="middle" font-size="24" fill="#666">Each slice updates a small, fixed memory and gives a fresh answer. No recording is kept, nothing is sent away.</text>
+
+  <!-- microphone -->
+  <circle cx="130" cy="318" r="38" fill="#444"/>
+  <rect x="118" y="356" width="24" height="36" fill="#444"/>
+  <rect x="96" y="392" width="68" height="10" rx="4" fill="#444"/>
+  <text x="130" y="440" text-anchor="middle" font-size="24" fill="#333">microphone</text>
+  <line x1="185" y1="330" x2="236" y2="330" stroke="#555" stroke-width="4" marker-end="url(#arrow)"/>
+
+  <!-- slices -->
+  <text x="410" y="262" text-anchor="middle" font-size="24" fill="#333">sound, cut into 10 ms slices</text>
+  <g>
+    <rect x="250" y="285" width="34" height="90" rx="4" fill="#d9d9d9"/>
+    <rect x="290" y="285" width="34" height="90" rx="4" fill="#d9d9d9"/>
+    <rect x="330" y="285" width="34" height="90" rx="4" fill="#d9d9d9"/>
+    <rect x="370" y="285" width="34" height="90" rx="4" fill="#d9d9d9"/>
+    <rect x="410" y="285" width="34" height="90" rx="4" fill="#d9d9d9"/>
+    <rect x="450" y="285" width="34" height="90" rx="4" fill="#d9d9d9"/>
+    <rect x="490" y="285" width="34" height="90" rx="4" fill="#d9d9d9"/>
+    <rect x="530" y="285" width="34" height="90" rx="4" fill="#005a8c"/>
+  </g>
+  <text x="410" y="412" text-anchor="middle" font-size="21" fill="#666">older slices fade from memory</text>
+  <text x="547" y="440" text-anchor="middle" font-size="21" fill="#005a8c" font-weight="bold">newest</text>
+  <line x1="572" y1="330" x2="614" y2="330" stroke="#555" stroke-width="4" marker-end="url(#arrow)"/>
+
+  <!-- the listener -->
+  <rect x="620" y="206" width="400" height="258" rx="18" fill="#eef3f8" stroke="#005a8c" stroke-width="3"/>
+  <text x="820" y="246" text-anchor="middle" font-size="28" font-weight="bold" fill="#222">the listener</text>
+  <text x="820" y="276" text-anchor="middle" font-size="21" fill="#555">Born attention, 123 000 parameters</text>
+  <rect x="656" y="296" width="328" height="118" rx="12" fill="#fff3e0" stroke="#e07a00" stroke-width="3"/>
+  <text x="820" y="332" text-anchor="middle" font-size="26" font-weight="bold" fill="#b35a00">fixed memory: 334 KiB</text>
+  <text x="820" y="364" text-anchor="middle" font-size="20" fill="#7a4a10">the same size after one second</text>
+  <text x="820" y="392" text-anchor="middle" font-size="20" fill="#7a4a10">or one hour of listening</text>
+  <text x="820" y="446" text-anchor="middle" font-size="21" fill="#333">0.65 ms of work per 10 ms slice</text>
+  <text x="820" y="498" text-anchor="middle" font-size="20" fill="#666">15x faster than real time on one laptop core</text>
+  <line x1="1022" y1="330" x2="1070" y2="330" stroke="#555" stroke-width="4" marker-end="url(#arrow)"/>
+
+  <!-- every 10 ms: word probabilities -->
+  <rect x="1076" y="226" width="236" height="208" rx="14" fill="#ffffff" stroke="#999" stroke-width="2"/>
+  <text x="1194" y="258" text-anchor="middle" font-size="21" font-weight="bold" fill="#333">every 10 ms:</text>
+  <text x="1096" y="300" font-size="20" fill="#333">stop</text>
+  <rect x="1150" y="284" width="140" height="20" rx="4" fill="#005a8c"/>
+  <text x="1282" y="300" text-anchor="end" font-size="16" fill="#ffffff" font-weight="bold">0.99</text>
+  <text x="1096" y="342" font-size="20" fill="#333">go</text>
+  <rect x="1150" y="326" width="6" height="20" rx="3" fill="#9fb8c8"/>
+  <text x="1170" y="342" font-size="16" fill="#777">0.01</text>
+  <text x="1096" y="384" font-size="20" fill="#333">left</text>
+  <rect x="1150" y="368" width="3" height="20" rx="2" fill="#9fb8c8"/>
+  <text x="1170" y="384" font-size="16" fill="#777">0.00</text>
+  <text x="1194" y="420" text-anchor="middle" font-size="17" fill="#777">how sure it is of each word</text>
+  <line x1="1314" y1="330" x2="1362" y2="330" stroke="#555" stroke-width="4" marker-end="url(#arrow)"/>
+
+  <!-- detection -->
+  <rect x="1368" y="280" width="194" height="100" rx="14" fill="#005a8c"/>
+  <text x="1465" y="346" text-anchor="middle" font-size="46" font-weight="bold" fill="#ffffff">STOP</text>
+  <text x="1465" y="412" text-anchor="middle" font-size="21" fill="#333">fires when it is sure,</text>
+  <text x="1465" y="440" text-anchor="middle" font-size="21" fill="#333">then the robot acts</text>
+
+  <!-- bottom panel -->
+  <rect x="60" y="560" width="1480" height="300" rx="18" fill="#f6f6f6"/>
+  <text x="90" y="602" font-size="26" font-weight="bold" fill="#222">Why this matters</text>
+
+  <!-- memory chart -->
+  <text x="130" y="640" font-size="19" fill="#555">memory used</text>
+  <line x1="130" y1="650" x2="130" y2="820" stroke="#888" stroke-width="2"/>
+  <line x1="130" y1="820" x2="560" y2="820" stroke="#888" stroke-width="2"/>
+  <text x="560" y="846" text-anchor="end" font-size="19" fill="#555">time spent listening</text>
+  <line x1="130" y1="812" x2="545" y2="668" stroke="#9a9a9a" stroke-width="4"/>
+  <text x="548" y="656" text-anchor="end" font-size="19" fill="#777">standard attention: grows with time</text>
+  <line x1="130" y1="796" x2="545" y2="796" stroke="#e07a00" stroke-width="6"/>
+  <text x="420" y="782" text-anchor="middle" font-size="19" font-weight="bold" fill="#b35a00">Born stream: constant</text>
+
+  <!-- badges -->
+  <rect x="600" y="632" width="420" height="62" rx="10" fill="#ffffff" stroke="#cccccc" stroke-width="2"/>
+  <text x="810" y="657" text-anchor="middle" font-size="18" fill="#333">Exact: the same answer as from the whole</text>
+  <text x="810" y="681" text-anchor="middle" font-size="18" fill="#333">recording at once (to one part in a million)</text>
+  <rect x="600" y="706" width="420" height="62" rx="10" fill="#ffffff" stroke="#cccccc" stroke-width="2"/>
+  <text x="810" y="731" text-anchor="middle" font-size="18" fill="#333">Private: nothing leaves the device,</text>
+  <text x="810" y="755" text-anchor="middle" font-size="18" fill="#333">no cloud, no internet connection</text>
+  <rect x="600" y="780" width="420" height="62" rx="10" fill="#ffffff" stroke="#cccccc" stroke-width="2"/>
+  <text x="810" y="805" text-anchor="middle" font-size="18" fill="#333">Any length: hours of audio cost no more</text>
+  <text x="810" y="829" text-anchor="middle" font-size="18" fill="#333">memory than one second</text>
+
+  <!-- the noise remover -->
+  <text x="1050" y="660" font-size="22" font-weight="bold" fill="#222">The noise remover streams the same way</text>
+  <text x="1050" y="696" font-size="19" fill="#333">one 16 ms slice of sound in, cleaned sound out</text>
+  <text x="1050" y="726" font-size="19" fill="#b35a00" font-weight="bold">fixed memory: 4.1 MiB</text>
+  <text x="1050" y="756" font-size="19" fill="#333">5.2 ms of work per slice (3x faster than real time)</text>
+  <text x="1050" y="808" font-size="17" fill="#777">Measured on one Apple M3 Max core;</text>
+  <text x="1050" y="832" font-size="17" fill="#777">a Raspberry-Pi-class processor is the target.</text>
+</svg>
