@@ -1,6 +1,7 @@
 #ifndef GPU_CHIRP_GPU_H_
 #define GPU_CHIRP_GPU_H_
 
+#include <vector>
 // GPU forms of ChirpFilter and BoxcarMax (CPU references and derivations: impl/chirp.h).
 
 #include "gpumapping.h"

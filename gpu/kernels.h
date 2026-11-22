@@ -3,6 +3,9 @@
 
 #ifndef CNET_LAYER_PROFILER_DEFINED
 #define CNET_LAYER_PROFILER_DEFINED
+#include <cstdint>
+#include <cstdlib>
+#include <utility>
 #include <map>
 #include <string>
 #include <vector>
@@ -77,6 +80,7 @@ extern bool         g_cnet_nosync;
 extern bool         g_cnet_tf32;
 #define CUDA(x, y, z) <<< x, y, z, g_cnet_stream >>>
 #define CUDA2(x, y) <<< x, y, 0, g_cnet_stream >>>
+#define cnet_finite(x) isfinite(x)          // device built-in; the CPU build maps it to std::isfinite
 
 #define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
@@ -101,8 +105,10 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 #else
 
 #include <stdio.h>
+#include <cmath>
 
 //Mocking CUDA for compiling it locally with g++ only.
+template <class T> inline bool cnet_finite(T x) { return std::isfinite(x); }
 #define CUDA(x, y, z)
 #define CUDA2(x, y)
 #define CNET_KSYNC()
@@ -134,6 +140,7 @@ inline void gpuErrchk(int);
 inline int cudaPeekAtLastError() { return 0; }
 inline int cudaDeviceSynchronize() { return 0; }
 inline void atomicAdd(float*, float) {};
+inline void atomicAdd(int*, int) {};
 inline void __syncthreads() {}
 inline void __syncwarp() {}
 
@@ -150,6 +157,8 @@ void gpu_update_adam_input(CFunc *func, float l_rate, float beta, int t);
 
 void gpu_update_true_adam_input(CFunc *func, float l_rate, float beta1,
 		float beta2, float eps, int t, float grad_clip = 0.0f);
+
+int gpu_nonfinite_gradients_reset();   // non-finite gradient components dropped by the Adam update since the last call
 
 void gpu_copy_to_clones(GpuCloneVar *in, int no_ancestors, int max_input_len);
 
@@ -439,6 +448,58 @@ public:
 	}
 };
 
+// GPU slice out[i] = in[start + i] (see Slice in impl/slice.h). Several Slice layers at the same depth
+// share one mapping (e.g. the two halves of one parent), so the start is kept PER MAP, read from each
+// mapped CPU layer the first time a kernel runs, in a small device array.
+class SliceGpu : public GpuMapping {
+	int start_;                 // start of the first layer of the block (kept for printing)
+	int *gpu_starts_ = NULL;    // one start per map (clone), uploaded lazily
+	int n_starts_ = 0;
+	void ensureStarts();
+
+public:
+	SliceGpu(int depth, int start) : GpuMapping(depth), start_(start) {}
+
+	virtual ~SliceGpu();
+
+	void gpu_slice_forward();
+
+	virtual void forward() {
+		gpu_slice_forward();
+	}
+
+	void gpu_slice_backward();
+
+	virtual void backward(int label) {
+		gpu_slice_backward();
+	}
+};
+
+// GPU compressed spectral loss (see CompressedL2 in impl/compressed_l2.h): the forward leaves each
+// map's loss in out[map].reduce_real_ (read by CNet::getL2Loss), the backward adds the input gradients.
+class CompressedL2Gpu : public GpuMapping {
+	friend class GpuNet;
+	friend class CNet;
+	float c_, beta_, scale_;
+
+public:
+	CompressedL2Gpu(int depth, float c, float beta, float scale = 1.f) : GpuMapping(depth), c_(c), beta_(beta), scale_(scale) {}
+
+	virtual ~CompressedL2Gpu() {}
+
+	void gpu_cl2_forward();
+
+	virtual void forward() {
+		gpu_cl2_forward();
+	}
+
+	void gpu_cl2_backward();
+
+	virtual void backward(int label) {
+		gpu_cl2_backward();
+	}
+};
+
 // GPU segmented (windowed) Fourier / STFT: block-diagonal DFT of each length-w
 // window (see SegmentedFourier in impl/segfourier.h). Roots computed on the fly.
 class SegFourierGpu : public GpuMapping {
@@ -512,6 +573,156 @@ public:
 
 	virtual void backward(int label) {
 		gpu_modulus2_backward();
+	}
+};
+
+// GPU mean over tokens per dimension (see TokenMeanPool in impl/pool.h): P = getOutputLength(),
+// N = length() / P.
+class TokenMeanPoolGpu : public GpuMapping {
+
+public:
+	TokenMeanPoolGpu(int depth) : GpuMapping(depth) {
+	}
+
+	virtual ~TokenMeanPoolGpu() {
+	}
+
+	void gpu_tokenmeanpool_forward();
+
+	virtual void forward() {
+		gpu_tokenmeanpool_forward();
+	}
+
+	void gpu_tokenmeanpool_backward();
+
+	virtual void backward(int label) {
+		gpu_tokenmeanpool_backward();
+	}
+};
+
+// GPU max-magnitude token per dimension (see TokenMaxPool in impl/pool.h): P = getOutputLength(),
+// N = length() / P. The forward keeps the argmax token of every (mapping, dim) in a device buffer
+// owned by the mapping; the backward routes each output gradient to that token.
+class TokenMaxPoolGpu : public GpuMapping {
+	int *gpu_arg_ = NULL;
+	int n_arg_ = 0;
+
+	void ensureArg();
+
+public:
+	TokenMaxPoolGpu(int depth) : GpuMapping(depth) {
+	}
+
+	virtual ~TokenMaxPoolGpu();
+
+	void gpu_tokenmaxpool_forward();
+
+	virtual void forward() {
+		gpu_tokenmaxpool_forward();
+	}
+
+	void gpu_tokenmaxpool_backward();
+
+	virtual void backward(int label) {
+		gpu_tokenmaxpool_backward();
+	}
+};
+
+// GPU fixed log-mel front end (see MelPower in impl/melpower.h). The filters and the band / bin ranges of
+// the first layer of the group are copied to device buffers owned by the mapping; the standardisation
+// constants are read from that layer at every launch (setStandardize after allocation takes effect).
+class MelPowerGpu : public GpuMapping {
+	float *gpu_H_ = NULL;
+	int *gpu_lo_ = NULL, *gpu_hi_ = NULL, *gpu_mlo_ = NULL, *gpu_mhi_ = NULL;
+
+	void ensureFilters();
+
+public:
+	MelPowerGpu(int depth) : GpuMapping(depth) {
+	}
+
+	virtual ~MelPowerGpu();
+
+	void gpu_melpower_forward();
+
+	virtual void forward() {
+		gpu_melpower_forward();
+	}
+
+	void gpu_melpower_backward();
+
+	virtual void backward(int label) {
+		gpu_melpower_backward();
+	}
+};
+
+// GPU causal time-frequency convolution (see TimeFreqConv in impl/tfconv.h). The forward runs one thread per
+// output element; the backward one gather kernel per data element and one per tap (each thread owns one target
+// element within its map; the adds are atomic because a layer with several consumers is mapped once per consumer
+// on the same input). The shape is read from the first CPU layer of the group (all layers of a group share it).
+class TimeFreqConvGpu : public GpuMapping {
+public:
+	TimeFreqConvGpu(int depth) : GpuMapping(depth) {
+	}
+
+	virtual ~TimeFreqConvGpu() {
+	}
+
+	void gpu_tfconv_forward();
+
+	virtual void forward() {
+		gpu_tfconv_forward();
+	}
+
+	void gpu_tfconv_backward();
+
+	virtual void backward(int label) {
+		gpu_tfconv_backward();
+	}
+};
+
+// GPU interleave of K equal-length inputs into per-position channels (see Interleave in impl/interleave.h).
+class InterleaveGpu : public GpuMapping {
+public:
+	InterleaveGpu(int depth) : GpuMapping(depth) {
+	}
+
+	virtual ~InterleaveGpu() {
+	}
+
+	void gpu_interleave_forward();
+
+	virtual void forward() {
+		gpu_interleave_forward();
+	}
+
+	void gpu_interleave_backward();
+
+	virtual void backward(int label) {
+		gpu_interleave_backward();
+	}
+};
+
+// GPU log power log(eps + |z|^2) (see CLogPower in impl/relu.h).
+class CLogPowerGpu : public GpuMapping {
+
+public:
+	CLogPowerGpu(int depth) : GpuMapping(depth) {
+	}
+
+	virtual ~CLogPowerGpu() {
+	}
+
+	void gpu_logpower_forward();
+
+	virtual void forward() {
+		gpu_logpower_forward();
+	}
+
+	void gpu_logpower_backward();
+
+	virtual void backward(int label) {
+		gpu_logpower_backward();
 	}
 };
 

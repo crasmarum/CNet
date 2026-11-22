@@ -1,5 +1,8 @@
 #ifndef IMPL_RESIDUAL_H_
 #define IMPL_RESIDUAL_H_
+#include <cassert>
+#include <complex>
+#include <string>
 
 #include <algorithm>
 #include <omp.h>

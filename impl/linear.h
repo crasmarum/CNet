@@ -1,5 +1,9 @@
 #ifndef IMPL_LINEAR_H_
 #define IMPL_LINEAR_H_
+#include <cassert>
+#include <complex>
+#include <string>
+#include <vector>
 
 #include <algorithm>
 #include <omp.h>

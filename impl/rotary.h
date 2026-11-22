@@ -1,5 +1,7 @@
 #ifndef IMPL_ROTARY_H_
 #define IMPL_ROTARY_H_
+#include <cstdint>
+#include <string>
 
 #include <vector>
 #include <complex>

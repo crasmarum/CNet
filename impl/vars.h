@@ -1,6 +1,10 @@
 
 #ifndef VARS_H_
 #define VARS_H_
+#include <cassert>
+#include <cstdint>
+#include <sstream>
+#include <string>
 
 #include <algorithm>
 #include <complex>
@@ -77,7 +81,10 @@ public:
 		if (no_data_) {
 			return;
 		}
-		std::fill(dz_real_, dz_real_ + length_ * 4, 0.0);
+		// only the gradient segments that exist (dims_ - 2 of them, at most 4): with INFER_DIMS the buffer holds
+		// z and dz only, and clearing four segments overflowed it
+		const int g = std::max(0, std::min(4, dims_ - 2));
+		if (g > 0 && dz_real_) std::fill(dz_real_, dz_real_ + (size_t) length_ * g, 0.0);
 	}
 
 	void zero_input() {
@@ -91,7 +98,8 @@ public:
 		if (no_data_) {
 			return;
 		}
-		std::fill(dz_real_, dz_real_ + length_ * 2, 0.0);
+		const int g = std::max(0, std::min(2, dims_ - 2));
+		if (g > 0 && dz_real_) std::fill(dz_real_, dz_real_ + (size_t) length_ * g, 0.0);
 	}
 
 	void zero_dZ_star() {

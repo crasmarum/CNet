@@ -1,5 +1,12 @@
+#include <cmath>
+#include <cstdint>
+#include <vector>
 #include "kernels.h"
 #include "gpumapping.h"
+#include "../impl/slice.h"
+#include "../impl/melpower.h"
+#include "../impl/tfconv.h"
+#include "../impl/interleave.h"
 
 #include "../utils/flags.h"
 
@@ -543,6 +550,154 @@ void ConjLagGpu::gpu_conjlag_backward() {
 	CNET_KSYNC();
 }
 
+// ---- slice out[i] = in[start + i] (see Slice in impl/slice.h); one start per map ----
+__global__ void gpu_slice_forward__(GpuInVar *in, GpuOutVar *out, int P, const int *starts, int max_len) {
+	int t = blockIdx.x * blockDim.x + threadIdx.x;
+	if (t >= max_len) {
+		return;
+	}
+	int map = t / P;
+	int i = t % P;
+	int start = starts[map];
+	*Z_real_(out[map], i) = *Z_real_(in[map], start + i);
+	*Z_imag_(out[map], i) = *Z_imag_(in[map], start + i);
+}
+
+SliceGpu::~SliceGpu() {
+#ifdef __CUDACC__
+	if (gpu_starts_) { cudaFree(gpu_starts_); gpu_starts_ = NULL; }
+#endif
+}
+
+// The mapped CPU layers (ancestor and clones of every Slice in the block) are known only after the
+// mapping is built, so the per-map starts are uploaded on first use.
+void SliceGpu::ensureStarts() {
+	const int n = (int) in_.size();
+	if (gpu_starts_ && n_starts_ == n) return;
+	std::vector<int> st(n);
+	auto &funs = getCpuFun();
+	for (int i = 0; i < n; ++i) st[i] = ((Slice*) funs[i])->start();
+#ifdef __CUDACC__
+	// Owned by the mapping (a GpuHelper frees its allocations when it goes out of scope).
+	if (gpu_starts_) { cudaFree(gpu_starts_); gpu_starts_ = NULL; }
+	gpuErrchk(cudaMalloc((void**) &gpu_starts_, sizeof(int) * (size_t) n));
+	gpuErrchk(cudaMemcpy(gpu_starts_, st.data(), sizeof(int) * (size_t) n, cudaMemcpyHostToDevice));
+#endif
+	n_starts_ = n;
+}
+
+void SliceGpu::gpu_slice_forward() {
+	ensureStarts();
+	int P = getOutputLength();
+	int total_threads = in_.size() * P;
+	int no_blocks = (total_threads + maxNoThreads - 1) / maxNoThreads;
+	gpu_slice_forward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, P, gpu_starts_, total_threads);
+	CNET_KSYNC();
+}
+
+__global__ void gpu_slice_backward__(GpuInVar *in, GpuOutVar *out, int P, const int *starts, int max_len) {
+	int t = blockIdx.x * blockDim.x + threadIdx.x;
+	if (t >= max_len) {
+		return;
+	}
+	int map = t / P;
+	int i = t % P;
+	int start = starts[map];
+	atomicAdd(dZ_real_(in[map], start + i),      *dZ_real_(out[map], i));
+	atomicAdd(dZ_imag_(in[map], start + i),      *dZ_imag_(out[map], i));
+	atomicAdd(dZ_star_real_(in[map], start + i), *dZ_star_real_(out[map], i));
+	atomicAdd(dZ_star_imag_(in[map], start + i), *dZ_star_imag_(out[map], i));
+}
+
+void SliceGpu::gpu_slice_backward() {
+	ensureStarts();
+	int P = getOutputLength();
+	int total_threads = in_.size() * P;
+	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
+	gpu_slice_backward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, P, gpu_starts_, total_threads);
+	CNET_KSYNC();
+}
+
+// ---- compressed spectral loss (see CompressedL2 in impl/compressed_l2.h) ----
+// Input [Y (M) | T (M)], target S = -T. One block of kCl2Threads threads reduces one chunk of one map.
+static const int kCl2Threads = 256;
+static const float kCl2Eps = 1e-8f;
+
+__global__ void gpu_cl2_zero__(GpuOutVar *out, int n) {
+	int t = blockIdx.x * blockDim.x + threadIdx.x;
+	if (t < n) { out[t].reduce_real_ = 0.f; out[t].reduce_imag_ = 0.f; }
+}
+
+__global__ void gpu_cl2_forward__(GpuInVar *in, GpuOutVar *out, int M, int chunks, float c, float beta, float scale) {
+	__shared__ float sh[256];
+	int map = blockIdx.x / chunks, chunk = blockIdx.x % chunks;
+	int k = chunk * blockDim.x + threadIdx.x;
+	float v = 0.f;
+	if (k < M) {
+		float yr = *Z_real_(in[map], k), yi = *Z_imag_(in[map], k);
+		float sr = -*Z_real_(in[map], M + k), si = -*Z_imag_(in[map], M + k);
+		float a = sqrtf(yr * yr + yi * yi + kCl2Eps), b = sqrtf(sr * sr + si * si + kCl2Eps);
+		float pa = powf(a, c - 1.f), pb = powf(b, c - 1.f);
+		float dr = pa * yr - pb * sr, di = pa * yi - pb * si, dm = pa * a - pb * b;
+		v = scale * (beta * (dr * dr + di * di) + (1.f - beta) * dm * dm);
+	}
+	sh[threadIdx.x] = v;
+	__syncthreads();
+	for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+		if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+		__syncthreads();
+	}
+	if (threadIdx.x == 0) atomicAdd(&out[map].reduce_real_, sh[0]);
+}
+
+void CompressedL2Gpu::gpu_cl2_forward() {
+	const int n = (int) in_.size(), M = length() / 2, chunks = (M + kCl2Threads - 1) / kCl2Threads;
+	gpu_cl2_zero__ CUDA2((n + kCl2Threads - 1) / kCl2Threads, kCl2Threads) (gpu_out_ptr_, n);
+	CNET_KSYNC();
+	gpu_cl2_forward__ CUDA2(n * chunks, kCl2Threads) (gpu_in_ptr_, gpu_out_ptr_, M, chunks, c_, beta_, scale_);
+	CNET_KSYNC();
+}
+
+// dL/dz~ with respect to the first element of the pair (y; s is the target), see the CPU header.
+__device__ inline cmplx_ gpu_cl2_grad(cmplx_ y, cmplx_ s, float c, float beta) {
+	float y2 = y.real * y.real + y.imag * y.imag, s2 = s.real * s.real + s.imag * s.imag;
+	float a = sqrtf(y2 + kCl2Eps), b = sqrtf(s2 + kCl2Eps);
+	float pa = powf(a, c - 1.f), pb = powf(b, c - 1.f), pa3 = pa / (a * a);
+	cmplx_ d = cmplx(pa * y.real - pb * s.real, pa * y.imag - pb * s.imag);
+	float k = 0.5f * (c - 1.f);
+	float r1 = pa + k * y2 * pa3;
+	cmplx_ yy = y * y;
+	cmplx_ g1 = cmplx(d.real * r1, d.imag * r1) + conj_(d) * yy * (k * pa3);
+	float m2 = c * (pa * a - pb * b) * pa / a;
+	return cmplx(beta * g1.real + (1.f - beta) * m2 * y.real, beta * g1.imag + (1.f - beta) * m2 * y.imag);
+}
+
+__global__ void gpu_cl2_backward__(GpuInVar *in, GpuOutVar *out, int M, float c, float beta, float scale, int max_len) {
+	int t = blockIdx.x * blockDim.x + threadIdx.x;
+	if (t >= max_len) return;
+	int map = t / M, k = t % M;
+	cmplx_ y = cmplx(*Z_real_(in[map], k), *Z_imag_(in[map], k));
+	cmplx_ s = cmplx(-*Z_real_(in[map], M + k), -*Z_imag_(in[map], M + k));
+	cmplx_ gy = gpu_cl2_grad(y, s, c, beta) * scale;
+	cmplx_ gs = gpu_cl2_grad(s, y, c, beta) * scale;  // w.r.t. s; T = -s flips the sign
+	atomicAdd(dZ_star_real_(in[map], k), gy.real);
+	atomicAdd(dZ_star_imag_(in[map], k), gy.imag);
+	atomicAdd(dZ_real_(in[map], k), gy.real);
+	atomicAdd(dZ_imag_(in[map], k), -gy.imag);
+	atomicAdd(dZ_star_real_(in[map], M + k), -gs.real);
+	atomicAdd(dZ_star_imag_(in[map], M + k), -gs.imag);
+	atomicAdd(dZ_real_(in[map], M + k), -gs.real);
+	atomicAdd(dZ_imag_(in[map], M + k), gs.imag);
+}
+
+void CompressedL2Gpu::gpu_cl2_backward() {
+	const int M = length() / 2;
+	int total_threads = in_.size() * M;
+	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
+	gpu_cl2_backward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, M, c_, beta_, scale_, total_threads);
+	CNET_KSYNC();
+}
+
 // ---- segmented (windowed) Fourier / STFT: block-diagonal DFT, window w ----
 __device__ inline cmplx_ gpu_root(int k, int w) {   // e^{i 2pi k / w}
 	float a = 6.2831853071795864f * ((float) (k % w)) / ((float) w);
@@ -774,6 +929,293 @@ void CModulus2Gpu::gpu_modulus2_backward() {
 	int total_threads = in_.size() * length();
 	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
 	gpu_modulus2_backward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, length(), total_threads);
+	CNET_KSYNC();
+}
+
+// ---- log power log(eps + |z|^2) ----
+__global__ void gpu_logpower_forward__(GpuInVar *in, GpuOutVar *out, int length, int max_len) {
+	int thread_indx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (thread_indx >= max_len) {
+		return;
+	}
+	int map_indx = thread_indx / length;
+	int pos = thread_indx % length;
+	float re = *Z_real_(in[map_indx], pos);
+	float im = *Z_imag_(in[map_indx], pos);
+	*Z_real_(out[map_indx], pos) = logf(kLogPowerEps + re * re + im * im);
+	*Z_imag_(out[map_indx], pos) = 0.0f;
+}
+
+void CLogPowerGpu::gpu_logpower_forward() {
+	int total_threads = in_.size() * length();
+	int no_blocks = (total_threads + maxNoThreads - 1) / maxNoThreads;
+	gpu_logpower_forward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, length(), total_threads);
+	CNET_KSYNC();
+}
+
+__global__ void gpu_logpower_backward__(GpuInVar *in, GpuOutVar *out, int length, int max_len) {
+	int thread_indx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (thread_indx >= max_len) {
+		return;
+	}
+	int map_indx = thread_indx / length;
+	int pos = thread_indx % length;
+
+	auto dLdz      = dZ_(out[map_indx], pos);
+	auto dLdz_star = dZ_star_(out[map_indx], pos);
+	float re = *Z_real_(in[map_indx], pos), im = *Z_imag_(in[map_indx], pos);
+	cmplx_ z = cmplx(re, im);
+	float s = 1.0f / (kLogPowerEps + re * re + im * im);
+	cmplx_ g = dLdz + dLdz_star;
+	g = cmplx(g.real * s, g.imag * s);
+	cmplx_ dz      = g * conj_(z);   // dL/dz
+	cmplx_ dz_star = g * z;          // dL/dz~
+
+	atomicAdd(dZ_real_(in[map_indx], pos), dz.real);
+	atomicAdd(dZ_imag_(in[map_indx], pos), dz.imag);
+	atomicAdd(dZ_star_real_(in[map_indx], pos), dz_star.real);
+	atomicAdd(dZ_star_imag_(in[map_indx], pos), dz_star.imag);
+}
+
+void CLogPowerGpu::gpu_logpower_backward() {
+	int total_threads = in_.size() * length();
+	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
+	gpu_logpower_backward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, length(), total_threads);
+	CNET_KSYNC();
+}
+
+// ---- mean over tokens, per dimension ----
+__global__ void gpu_tokenmeanpool_forward__(GpuInVar *in, GpuOutVar *out, int P, int N, int max_len) {
+	int t = blockIdx.x * blockDim.x + threadIdx.x;
+	if (t >= max_len) {
+		return;
+	}
+	int map = t / P;
+	int p = t % P;
+	float sre = 0, sim = 0;
+	for (int k = 0; k < N; ++k) {
+		sre += *Z_real_(in[map], k * P + p);
+		sim += *Z_imag_(in[map], k * P + p);
+	}
+	*Z_real_(out[map], p) = sre / N;
+	*Z_imag_(out[map], p) = sim / N;
+}
+
+void TokenMeanPoolGpu::gpu_tokenmeanpool_forward() {
+	int P = getOutputLength();
+	int N = length() / P;
+	int total_threads = in_.size() * P;
+	int no_blocks = (total_threads + maxNoThreads - 1) / maxNoThreads;
+	gpu_tokenmeanpool_forward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, P, N, total_threads);
+	CNET_KSYNC();
+}
+
+__global__ void gpu_tokenmeanpool_backward__(GpuInVar *in, GpuOutVar *out, int L, int P, int N, int max_len) {
+	int t = blockIdx.x * blockDim.x + threadIdx.x;
+	if (t >= max_len) {
+		return;
+	}
+	int map = t / L;
+	int i = t % L;
+	int p = i % P;
+	atomicAdd(dZ_real_(in[map], i),      *dZ_real_(out[map], p) / N);
+	atomicAdd(dZ_imag_(in[map], i),      *dZ_imag_(out[map], p) / N);
+	atomicAdd(dZ_star_real_(in[map], i), *dZ_star_real_(out[map], p) / N);
+	atomicAdd(dZ_star_imag_(in[map], i), *dZ_star_imag_(out[map], p) / N);
+}
+
+void TokenMeanPoolGpu::gpu_tokenmeanpool_backward() {
+	int L = length();
+	int P = getOutputLength();
+	int total_threads = in_.size() * L;
+	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
+	gpu_tokenmeanpool_backward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, L, P, L / P, total_threads);
+	CNET_KSYNC();
+}
+
+// ---- fixed log-mel front end ----
+__global__ void gpu_melpower_forward__(GpuInVar *in, GpuOutVar *out, const float *H, const int *lo, const int *hi,
+		int N, int W, int M, int K, float mean, float scale, int max_len) {
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= max_len) {
+		return;
+	}
+	int map = idx / (N * M);
+	int o = idx % (N * M);
+	int t = o / M, m = o % M;
+	float P = 0.f;
+	for (int k = lo[m]; k <= hi[m]; ++k) {
+		float re = *Z_real_(in[map], t * W + k), im = *Z_imag_(in[map], t * W + k);
+		P += H[m * K + k] * (re * re + im * im);
+	}
+	*Z_real_(out[map], o) = (logf(kLogPowerEps + P) - mean) / scale;
+	*Z_imag_(out[map], o) = 0.f;
+}
+
+__global__ void gpu_melpower_backward__(GpuInVar *in, GpuOutVar *out, const float *H, const int *mlo, const int *mhi,
+		int N, int W, int M, int K, float mean, float scale, int max_len) {
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= max_len) {
+		return;
+	}
+	int map = idx / (N * K);
+	int r = idx % (N * K);
+	int t = r / K, k = r % K;
+	if (mhi[k] < 0) {
+		return;
+	}
+	cmplx_ s = cmplx(0.f, 0.f);
+	for (int m = mlo[k]; m <= mhi[k]; ++m) {
+		float h = H[m * K + k];
+		if (h == 0.f) continue;
+		int o = t * M + m;
+		float inv = expf(-(*Z_real_(out[map], o) * scale + mean));   // 1 / (eps + P_m)
+		cmplx_ g = dZ_(out[map], o) + dZ_star_(out[map], o);
+		float w = h * inv / scale;
+		s = s + cmplx(g.real * w, g.imag * w);
+	}
+	int pos = t * W + k;
+	cmplx_ z = cmplx(*Z_real_(in[map], pos), *Z_imag_(in[map], pos));
+	cmplx_ dz = s * conj_(z);
+	cmplx_ dzs = s * z;
+	atomicAdd(dZ_real_(in[map], pos), dz.real);
+	atomicAdd(dZ_imag_(in[map], pos), dz.imag);
+	atomicAdd(dZ_star_real_(in[map], pos), dzs.real);
+	atomicAdd(dZ_star_imag_(in[map], pos), dzs.imag);
+}
+
+void MelPowerGpu::ensureFilters() {
+	if (gpu_H_) {
+		return;
+	}
+#ifdef __CUDACC__
+	const MelPower *mel = (const MelPower*) getCpuFun().front();
+	const int M = mel->bands(), K = mel->bins();
+	gpuErrchk(cudaMalloc((void**) &gpu_H_, sizeof(float) * (size_t) M * K));
+	gpuErrchk(cudaMemcpy(gpu_H_, mel->filters().data(), sizeof(float) * (size_t) M * K, cudaMemcpyHostToDevice));
+	gpuErrchk(cudaMalloc((void**) &gpu_lo_, sizeof(int) * (size_t) M));
+	gpuErrchk(cudaMemcpy(gpu_lo_, mel->bandLo().data(), sizeof(int) * (size_t) M, cudaMemcpyHostToDevice));
+	gpuErrchk(cudaMalloc((void**) &gpu_hi_, sizeof(int) * (size_t) M));
+	gpuErrchk(cudaMemcpy(gpu_hi_, mel->bandHi().data(), sizeof(int) * (size_t) M, cudaMemcpyHostToDevice));
+	gpuErrchk(cudaMalloc((void**) &gpu_mlo_, sizeof(int) * (size_t) K));
+	gpuErrchk(cudaMemcpy(gpu_mlo_, mel->binLo().data(), sizeof(int) * (size_t) K, cudaMemcpyHostToDevice));
+	gpuErrchk(cudaMalloc((void**) &gpu_mhi_, sizeof(int) * (size_t) K));
+	gpuErrchk(cudaMemcpy(gpu_mhi_, mel->binHi().data(), sizeof(int) * (size_t) K, cudaMemcpyHostToDevice));
+#endif
+}
+
+MelPowerGpu::~MelPowerGpu() {
+#ifdef __CUDACC__
+	if (gpu_H_) cudaFree(gpu_H_);
+	if (gpu_lo_) cudaFree(gpu_lo_);
+	if (gpu_hi_) cudaFree(gpu_hi_);
+	if (gpu_mlo_) cudaFree(gpu_mlo_);
+	if (gpu_mhi_) cudaFree(gpu_mhi_);
+#endif
+	gpu_H_ = NULL;
+	gpu_lo_ = gpu_hi_ = gpu_mlo_ = gpu_mhi_ = NULL;
+}
+
+void MelPowerGpu::gpu_melpower_forward() {
+	ensureFilters();
+	const MelPower *mel = (const MelPower*) getCpuFun().front();
+	const int N = mel->tokens(), W = mel->window(), M = mel->bands(), K = mel->bins();
+	int total_threads = in_.size() * N * M;
+	int no_blocks = (total_threads + maxNoThreads - 1) / maxNoThreads;
+	gpu_melpower_forward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, gpu_H_, gpu_lo_, gpu_hi_,
+			N, W, M, K, mel->mean(), mel->scale(), total_threads);
+	CNET_KSYNC();
+}
+
+void MelPowerGpu::gpu_melpower_backward() {
+	ensureFilters();
+	const MelPower *mel = (const MelPower*) getCpuFun().front();
+	const int N = mel->tokens(), W = mel->window(), M = mel->bands(), K = mel->bins();
+	int total_threads = in_.size() * N * K;
+	int no_blocks = (total_threads + maxNoThreads - 1) / maxNoThreads;
+	gpu_melpower_backward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, gpu_H_, gpu_mlo_, gpu_mhi_,
+			N, W, M, K, mel->mean(), mel->scale(), total_threads);
+	CNET_KSYNC();
+}
+
+// ---- max-magnitude token, per dimension ----
+__global__ void gpu_tokenmaxpool_forward__(GpuInVar *in, GpuOutVar *out, int *arg, int P, int N, int max_len) {
+	int t = blockIdx.x * blockDim.x + threadIdx.x;
+	if (t >= max_len) {
+		return;
+	}
+	int map = t / P;
+	int p = t % P;
+	float best = -1.f;
+	int bt = 0;
+	for (int k = 0; k < N; ++k) {
+		float re = *Z_real_(in[map], k * P + p), im = *Z_imag_(in[map], k * P + p);
+		float m = re * re + im * im;
+		if (m > best) {   // first maximum on ties, as on the CPU
+			best = m;
+			bt = k;
+		}
+	}
+	arg[t] = bt;
+	*Z_real_(out[map], p) = *Z_real_(in[map], bt * P + p);
+	*Z_imag_(out[map], p) = *Z_imag_(in[map], bt * P + p);
+}
+
+__global__ void gpu_tokenmaxpool_backward__(GpuInVar *in, GpuOutVar *out, const int *arg, int P, int max_len) {
+	int t = blockIdx.x * blockDim.x + threadIdx.x;
+	if (t >= max_len) {
+		return;
+	}
+	int map = t / P;
+	int p = t % P;
+	int i = arg[t] * P + p;
+	atomicAdd(dZ_real_(in[map], i),      *dZ_real_(out[map], p));
+	atomicAdd(dZ_imag_(in[map], i),      *dZ_imag_(out[map], p));
+	atomicAdd(dZ_star_real_(in[map], i), *dZ_star_real_(out[map], p));
+	atomicAdd(dZ_star_imag_(in[map], i), *dZ_star_imag_(out[map], p));
+}
+
+void TokenMaxPoolGpu::ensureArg() {
+	const int n = (int) in_.size() * getOutputLength();
+	if (gpu_arg_ && n_arg_ == n) {
+		return;
+	}
+#ifdef __CUDACC__
+	if (gpu_arg_) {
+		cudaFree(gpu_arg_);
+		gpu_arg_ = NULL;
+	}
+	gpuErrchk(cudaMalloc((void**) &gpu_arg_, sizeof(int) * (size_t) n));
+	gpuErrchk(cudaMemset(gpu_arg_, 0, sizeof(int) * (size_t) n));
+#endif
+	n_arg_ = n;
+}
+
+TokenMaxPoolGpu::~TokenMaxPoolGpu() {
+#ifdef __CUDACC__
+	if (gpu_arg_) {
+		cudaFree(gpu_arg_);
+	}
+#endif
+	gpu_arg_ = NULL;
+}
+
+void TokenMaxPoolGpu::gpu_tokenmaxpool_forward() {
+	ensureArg();
+	int P = getOutputLength();
+	int N = length() / P;
+	int total_threads = in_.size() * P;
+	int no_blocks = (total_threads + maxNoThreads - 1) / maxNoThreads;
+	gpu_tokenmaxpool_forward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, gpu_arg_, P, N, total_threads);
+	CNET_KSYNC();
+}
+
+void TokenMaxPoolGpu::gpu_tokenmaxpool_backward() {
+	ensureArg();
+	int P = getOutputLength();
+	int total_threads = in_.size() * P;
+	int no_blocks = (total_threads + maxNoThreads - 1) / maxNoThreads;
+	gpu_tokenmaxpool_backward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, gpu_arg_, P, total_threads);
 	CNET_KSYNC();
 }
 
@@ -1051,7 +1493,7 @@ void gpu_update_adam_input(CFunc *func, float l_rate, float beta, int t) {
 // is not zero-initialised, so m and v start from 0 at t==0. Treats the real and
 // imaginary components as independent real parameters (matches CPU trueAdam).
 __global__ void gpu_true_adam_update_input__(GpuInVar in, float l_rate,
-		float beta1, float beta2, float eps, int t, float grad_clip, int max_len) {
+		float beta1, float beta2, float eps, int t, float grad_clip, int max_len, int *nonfinite) {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= max_len) {
 		return;
@@ -1059,6 +1501,16 @@ __global__ void gpu_true_adam_update_input__(GpuInVar in, float l_rate,
 
 	float gr = *dZ_star_real_(in, i);
 	float gi = *dZ_star_imag_(in, i);
+
+	// A non-finite gradient component (or one whose square overflows, which would make v infinite for the rest of
+	// the run) is dropped (treated as 0) and counted, instead of being turned into +grad_clip by fminf/fmaxf below
+	// (which silently locked a run into a constant drift).
+	const bool bad_r = !cnet_finite(gr * gr), bad_i = !cnet_finite(gi * gi);
+	if (bad_r || bad_i) {
+		if (nonfinite) atomicAdd(nonfinite, (int) bad_r + (int) bad_i);   // components dropped
+		gr = bad_r ? 0.0f : gr;
+		gi = bad_i ? 0.0f : gi;
+	}
 
 	// Optional clip-by-value: bound each gradient component to +/- grad_clip
 	// before the moment update, taming the rare large spikes that otherwise
@@ -1095,15 +1547,48 @@ __global__ void gpu_true_adam_update_input__(GpuInVar in, float l_rate,
 	*dZ_star_imag_(in, i) = 0;
 }
 
+// One device counter per GPU, allocated on first use on the then-current device (the data-parallel replicas set
+// their device before every call, so a counter is never dereferenced from another GPU): non-finite gradient
+// components dropped by the Adam update.
+static int *nonfiniteCounter(bool create) {
+#ifdef __CUDACC__
+	static int *counters[64] = {NULL};
+	int dev = 0;
+	if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return NULL;
+	if (!counters[dev] && create) {
+		gpuErrchk(cudaMalloc((void**) &counters[dev], sizeof(int)));
+		gpuErrchk(cudaMemset(counters[dev], 0, sizeof(int)));
+	}
+	return counters[dev];
+#else
+	return NULL;
+#endif
+}
+
 void gpu_update_true_adam_input(CFunc *func, float l_rate, float beta1,
 		float beta2, float eps, int t, float grad_clip) {
+	int *counter = nonfiniteCounter(true);
 	int total_threads = func->input().length_;
 	int no_blocks = (total_threads + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
 
 	gpu_true_adam_update_input__ CUDA2(no_blocks, MAX_BLOCK_SIZE)
-			(func->gpu_var_, l_rate, beta1, beta2, eps, t, grad_clip, total_threads);
+			(func->gpu_var_, l_rate, beta1, beta2, eps, t, grad_clip, total_threads, counter);
 
 	CNET_KSYNC();
+}
+
+// Number of non-finite gradient components dropped by the Adam update on the current device since the last call
+// (then zeroed).
+int gpu_nonfinite_gradients_reset() {
+	int n = 0;
+#ifdef __CUDACC__
+	int *counter = nonfiniteCounter(false);
+	if (counter) {
+		gpuErrchk(cudaMemcpy(&n, counter, sizeof(int), cudaMemcpyDeviceToHost));
+		if (n) gpuErrchk(cudaMemset(counter, 0, sizeof(int)));
+	}
+#endif
+	return n;
 }
 
 
@@ -1185,3 +1670,173 @@ void gpu_grad_from_clones(GpuCloneVar *in, int no_ancestors, int max_input_len) 
 	CNET_KSYNC();
 }
 
+
+// ---- causal time-frequency convolution (see TimeFreqConv in impl/tfconv.h) ----
+// Layout as on the CPU: data (t, b, c) at (t B + b) Ci + c; tap (o, c, tau, j) at base + ((o Ci + c) T + tau) F + j;
+// output (t, bo, o) at (t Bo + bo) Co + o, reading data(t - tau, bo S + j - F/2, c) (zero outside the plane).
+__global__ void gpu_tfconv_forward__(GpuInVar *in, GpuOutVar *out, int N, int B, int Ci, int Co, int T, int F, int S,
+		int Bo, int base, int max_len) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= max_len) {
+		return;
+	}
+	const int per_map = N * Bo * Co;
+	const int map = tid / per_map, oi = tid % per_map;
+	const int o = oi % Co, bo = (oi / Co) % Bo, t = oi / (Co * Bo);
+	float sr = 0.f, si = 0.f;
+	for (int tau = 0; tau < T; ++tau) {
+		const int ts = t - tau;
+		if (ts < 0) continue;
+		for (int j = 0; j < F; ++j) {
+			const int b = bo * S + j - F / 2;
+			if (b < 0 || b >= B) continue;
+			for (int c = 0; c < Ci; ++c) {
+				const int di = (ts * B + b) * Ci + c, wi = base + ((o * Ci + c) * T + tau) * F + j;
+				const float wr = *Z_real_(in[map], wi), wm = *Z_imag_(in[map], wi);
+				const float dr = *Z_real_(in[map], di), dm = *Z_imag_(in[map], di);
+				sr += wr * dr - wm * dm;
+				si += wr * dm + wm * dr;
+			}
+		}
+	}
+	*Z_real_(out[map], oi) = sr;
+	*Z_imag_(out[map], oi) = si;
+}
+
+// dL/d data(ts, b, c): gathers every output that read it: dz += dLo_z * tap, dz~ += dLo_z~ * conj(tap).
+__global__ void gpu_tfconv_backward_data__(GpuInVar *in, GpuOutVar *out, int N, int B, int Ci, int Co, int T, int F,
+		int S, int Bo, int base, int max_len) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= max_len) {
+		return;
+	}
+	const int per_map = N * B * Ci;
+	const int map = tid / per_map, di = tid % per_map;
+	const int c = di % Ci, b = (di / Ci) % B, ts = di / (Ci * B);
+	float gr = 0.f, gi = 0.f, sr = 0.f, si = 0.f;
+	for (int tau = 0; tau < T; ++tau) {
+		const int t = ts + tau;
+		if (t >= N) break;
+		for (int j = 0; j < F; ++j) {
+			const int num = b - j + F / 2;                    // = bo S for the output bin that reads b through tap j
+			if (num < 0 || num % S != 0) continue;
+			const int bo = num / S;
+			if (bo >= Bo) continue;
+			for (int o = 0; o < Co; ++o) {
+				const int oi = (t * Bo + bo) * Co + o, wi = base + ((o * Ci + c) * T + tau) * F + j;
+				const float wr = *Z_real_(in[map], wi), wm = *Z_imag_(in[map], wi);
+				const float ar = *dZ_real_(out[map], oi), ai = *dZ_imag_(out[map], oi);
+				const float br = *dZ_star_real_(out[map], oi), bi = *dZ_star_imag_(out[map], oi);
+				gr += ar * wr - ai * wm;
+				gi += ar * wm + ai * wr;
+				sr += br * wr + bi * wm;
+				si += bi * wr - br * wm;
+			}
+		}
+	}
+	atomicAdd(dZ_real_(in[map], di), gr);        // a layer with several consumers is mapped twice on the same input
+	atomicAdd(dZ_imag_(in[map], di), gi);        // (gpu_data.h addGpuOuts), so the accumulation must be atomic
+	atomicAdd(dZ_star_real_(in[map], di), sr);
+	atomicAdd(dZ_star_imag_(in[map], di), si);
+}
+
+// dL/d tap(o, c, tau, j): summed over every output position: dz += dLo_z * data, dz~ += dLo_z~ * conj(data).
+__global__ void gpu_tfconv_backward_taps__(GpuInVar *in, GpuOutVar *out, int N, int B, int Ci, int Co, int T, int F,
+		int S, int Bo, int base, int max_len) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= max_len) {
+		return;
+	}
+	const int n_taps = Co * Ci * T * F;
+	const int map = tid / n_taps, k = tid % n_taps;
+	const int j = k % F, tau = (k / F) % T, c = (k / (F * T)) % Ci, o = k / (F * T * Ci);
+	float gr = 0.f, gi = 0.f, sr = 0.f, si = 0.f;
+	for (int t = tau; t < N; ++t) {
+		const int ts = t - tau;
+		for (int bo = 0; bo < Bo; ++bo) {
+			const int b = bo * S + j - F / 2;
+			if (b < 0 || b >= B) continue;
+			const int oi = (t * Bo + bo) * Co + o, di = (ts * B + b) * Ci + c;
+			const float dr = *Z_real_(in[map], di), dm = *Z_imag_(in[map], di);
+			const float ar = *dZ_real_(out[map], oi), ai = *dZ_imag_(out[map], oi);
+			const float br = *dZ_star_real_(out[map], oi), bi = *dZ_star_imag_(out[map], oi);
+			gr += ar * dr - ai * dm;
+			gi += ar * dm + ai * dr;
+			sr += br * dr + bi * dm;
+			si += bi * dr - br * dm;
+		}
+	}
+	atomicAdd(dZ_real_(in[map], base + k), gr);
+	atomicAdd(dZ_imag_(in[map], base + k), gi);
+	atomicAdd(dZ_star_real_(in[map], base + k), sr);
+	atomicAdd(dZ_star_imag_(in[map], base + k), si);
+}
+
+void TimeFreqConvGpu::gpu_tfconv_forward() {
+	const TimeFreqConv *c = (const TimeFreqConv*) getCpuFun().front();
+	const int N = c->nTokens(), B = c->bins(), Ci = c->cIn(), Co = c->cOut(), T = c->tTaps(), F = c->fTaps(), S = c->stride();
+	const int Bo = c->outBins(), base = c->tapBase();
+	int total_threads = in_.size() * N * Bo * Co;
+	int no_blocks = (total_threads + maxNoThreads - 1) / maxNoThreads;
+	gpu_tfconv_forward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, N, B, Ci, Co, T, F, S, Bo, base, total_threads);
+	CNET_KSYNC();
+}
+
+void TimeFreqConvGpu::gpu_tfconv_backward() {
+	const TimeFreqConv *c = (const TimeFreqConv*) getCpuFun().front();
+	const int N = c->nTokens(), B = c->bins(), Ci = c->cIn(), Co = c->cOut(), T = c->tTaps(), F = c->fTaps(), S = c->stride();
+	const int Bo = c->outBins(), base = c->tapBase();
+	int total_threads = in_.size() * N * B * Ci;
+	int no_blocks = (total_threads + maxNoThreads - 1) / maxNoThreads;
+	gpu_tfconv_backward_data__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, N, B, Ci, Co, T, F, S, Bo, base, total_threads);
+	CNET_KSYNC();
+	total_threads = in_.size() * c->nTaps();
+	no_blocks = (total_threads + maxNoThreads - 1) / maxNoThreads;
+	gpu_tfconv_backward_taps__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, N, B, Ci, Co, T, F, S, Bo, base, total_threads);
+	CNET_KSYNC();
+}
+
+// ---- interleave K inputs of length L into per-position channels (see Interleave in impl/interleave.h) ----
+__global__ void gpu_interleave_forward__(GpuInVar *in, GpuOutVar *out, int L, int K, int max_len) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= max_len) {
+		return;
+	}
+	const int per_map = L * K;
+	const int map = tid / per_map, oi = tid % per_map;
+	const int i = oi / K, k = oi % K;
+	*Z_real_(out[map], oi) = *Z_real_(in[map], k * L + i);
+	*Z_imag_(out[map], oi) = *Z_imag_(in[map], k * L + i);
+}
+
+__global__ void gpu_interleave_backward__(GpuInVar *in, GpuOutVar *out, int L, int K, int max_len) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= max_len) {
+		return;
+	}
+	const int per_map = L * K;
+	const int map = tid / per_map, oi = tid % per_map;
+	const int i = oi / K, k = oi % K, src = k * L + i;   // one output per input position within a map; atomic because a
+	atomicAdd(dZ_real_(in[map], src),      *dZ_real_(out[map], oi));        // layer with several consumers is mapped twice
+	atomicAdd(dZ_imag_(in[map], src),      *dZ_imag_(out[map], oi));
+	atomicAdd(dZ_star_real_(in[map], src), *dZ_star_real_(out[map], oi));
+	atomicAdd(dZ_star_imag_(in[map], src), *dZ_star_imag_(out[map], oi));
+}
+
+void InterleaveGpu::gpu_interleave_forward() {
+	const Interleave *il = (const Interleave*) getCpuFun().front();
+	const int L = il->length(), K = il->k();
+	int total_threads = in_.size() * L * K;
+	int no_blocks = (total_threads + maxNoThreads - 1) / maxNoThreads;
+	gpu_interleave_forward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, L, K, total_threads);
+	CNET_KSYNC();
+}
+
+void InterleaveGpu::gpu_interleave_backward() {
+	const Interleave *il = (const Interleave*) getCpuFun().front();
+	const int L = il->length(), K = il->k();
+	int total_threads = in_.size() * L * K;
+	int no_blocks = (total_threads + maxNoThreads - 1) / maxNoThreads;
+	gpu_interleave_backward__ CUDA2(no_blocks, maxNoThreads) (gpu_in_ptr_, gpu_out_ptr_, L, K, total_threads);
+	CNET_KSYNC();
+}

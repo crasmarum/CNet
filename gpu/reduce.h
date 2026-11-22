@@ -1,6 +1,7 @@
 #ifndef GPU_REDUCE_H_
 #define GPU_REDUCE_H_
 
+#include <vector>
 #include "gpumapping.h"
 #include "compl.h"
 #include "kernels.h"
@@ -256,7 +257,8 @@ public:
 	BornAttentionGpu(int depth) : GpuMapping(depth) {}
 	virtual ~BornAttentionGpu() { free_scratch(); free_linear_scratch(); }
 	void setCarry(bool on) { carry_ = on; }
-	void resetCarry();
+	void resetCarry();          // zero the carried state of every batch slot
+	void resetCarry(int slot);  // zero the carried state of one batch slot (clone index), the others untouched
 	void gpu_born_forward();
 	void gpu_born_backward();
 	virtual void forward() override { gpu_born_forward(); }
@@ -293,7 +295,8 @@ public:
 	GatedLinearAttentionGpu(int depth) : GpuMapping(depth) {}
 	virtual ~GatedLinearAttentionGpu() { free_scratch(); }
 	void setCarry(bool on) { carry_ = on; }
-	void resetCarry();
+	void resetCarry();          // zero the carried state of every batch slot
+	void resetCarry(int slot);  // zero the carried state of one batch slot (clone index), the others untouched
 	void gpu_gla_forward();
 	void gpu_gla_backward();
 	virtual void forward() override { gpu_gla_forward(); }

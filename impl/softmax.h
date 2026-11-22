@@ -1,5 +1,9 @@
 #ifndef IMPL_SOFTMAX_H_
 #define IMPL_SOFTMAX_H_
+#include <cassert>
+#include <cmath>
+#include <complex>
+#include <string>
 
 #include <cfloat>
 

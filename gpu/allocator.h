@@ -1,5 +1,11 @@
 #ifndef GPU_ALLOCATOR_H_
 #define GPU_ALLOCATOR_H_
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <string>
 
 #include <cmath>
 #include <map>

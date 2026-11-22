@@ -22,6 +22,9 @@
 #include <random>
 #include <cmath>
 #include <memory>
+#ifdef __linux__
+#include <malloc.h>
+#endif
 
 #include "../utils/flags.h"
 #include "../impl/log.h"
@@ -149,6 +152,9 @@ int main(int argc, char **argv) {
 		// The step twin holds copies of the weights; the full N-position network (GBs of activation
 		// buffers) is only needed again for a learned positional table, which it still owns.
 		if (!sn.pos_src) netp.reset();
+#ifdef __linux__
+		malloc_trim(0);                               // hand the freed heap back to the OS (glibc keeps it otherwise)
+#endif
 #ifdef _OPENMP
 		omp_set_num_threads(std::max(1, std::min<int>(threads, omp_get_max_threads())));
 #endif

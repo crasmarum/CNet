@@ -1,5 +1,6 @@
 #ifndef IMPL_CONJLAG_H_
 #define IMPL_CONJLAG_H_
+#include <string>
 
 #include <complex>
 #include "cfunc.h"

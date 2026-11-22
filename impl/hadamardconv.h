@@ -1,5 +1,6 @@
 #ifndef IMPL_HADAMARDCONV_H_
 #define IMPL_HADAMARDCONV_H_
+#include <string>
 
 #include <complex>
 #include <vector>

@@ -1,5 +1,6 @@
 #ifndef UTILS_MYRAND_H_
 #define UTILS_MYRAND_H_
+#include <cstdlib>
 
 #include <time.h>
 #include <limits>

@@ -122,6 +122,7 @@ FLAG_INT(profile_steps, 0)  // >0: after 20 warm-up steps, profile this many ste
 FLAG_BOOL(tf32, false)      // TF32 tensor cores for the cuBLAS GEMMs (default strict FP32)
 FLAG_BOOL(ksync, true)      // false: no host sync after every kernel in eager mode (same results, less launch latency)
 FLAG_INT(seed, 1000)        // base seed for the per-rank data sampler (rank r uses seed+r)
+FLAG_INT(init_seed, 1234)   // seed of the normal weight init (-init_std); vary with -seed for independent runs
 FLAG_BOOL(emb_gauss, false) // symmetry-breaking zero-mean complex embedding init (vs default)
 FLAG_FLOAT(init_std, 0.02) // every weight (embedding included) re, im ~ N(0, init_std^2), as the PyTorch mirror. Default since
                             // 2026-10-22: CNet's old init_inputs start (pass -init_std 0 to get it) is near rank one and
@@ -640,7 +641,7 @@ int main(int argc, char **argv) {
 		// Optional symmetry-breaking embedding init: zero-mean complex (real AND imag
 		// random), giving DISTINCT per-token embeddings so the model does not start pinned at
 		// the unigram saddle. Deterministic across ranks (fixed seed).
-		if (init_std > 0.f) net.cpuNet().normalInit(init_std, 1234);   // identical on every rank
+		if (init_std > 0.f) net.cpuNet().normalInit(init_std, init_seed);   // identical on every rank
 		if (emb_gauss) {
 			CEmbedding *e0 = (CEmbedding*) net.cpuNet()[embId];
 			std::mt19937 er(98765);

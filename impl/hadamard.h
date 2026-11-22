@@ -1,5 +1,8 @@
 #ifndef IMPL_HADAMARD_H_
 #define IMPL_HADAMARD_H_
+#include <cassert>
+#include <complex>
+#include <string>
 
 
 #include <algorithm>

@@ -1,3 +1,10 @@
+#include <cassert>
+#include <complex>
+#include <cstdint>
+#include <cstring>
+#include <initializer_list>
+#include <iostream>
+#include <utility>
 #include <cctype>
 #ifndef GPU_GPU_FUNC_H_
 #define GPU_GPU_FUNC_H_
@@ -493,7 +500,7 @@ public:
 	void batchToGpu(InputFunc *inp, OutputFunc *outp, Batch *batch) {
 		assert(outp);
 		SequenceCrossEntropy* sce = dynamic_cast<SequenceCrossEntropy*>(outp);
-		if (!dynamic_cast<CrossEntropy*>(outp) && !sce) {
+		if (!dynamic_cast<CrossEntropy*>(outp) && !sce && !dynamic_cast<L2Out*>(outp) && !dynamic_cast<CompressedL2*>(outp)) {
 			std::cerr << "This type of output is not supported yet." << std::endl;
 			assert(false);
 		}
@@ -653,7 +660,14 @@ public:
 			}
 			gpu_update_true_adam_input(fun, l_rate, beta1, beta2, eps, t, grad_clip);
 		}
+		const int nf = gpu_nonfinite_gradients_reset();
+		if (nf > 0) {
+			nonfinite_total_ += nf;
+			std::cerr << "warning: step " << t << ": " << nf << " non-finite gradient components dropped by Adam ("
+			          << nonfinite_total_ << " so far)" << std::endl;
+		}
 	}
+	long nonfinite_total_ = 0;
 
 	bool getInputsFromGpu() {
 		for (auto fun : net_->inputs()) {
@@ -845,6 +859,12 @@ public:
 		if (!gpu_ptr) {
 			return "AllocateNet error: float_allocate_on_gpu";
 		}
+		// Zero the arena: the Adam kernel seeds its moments only at t == 0, and not every driver starts at 0.
+#ifdef __CUDACC__
+		gpuErrchk(cudaMemset(gpu_ptr, 0, net_->getTotalSizeBytes() * no_batches));
+#else
+		std::fill(gpu_ptr, gpu_ptr + (net_->getTotalSizeBytes() / sizeof(float)) * no_batches, 0.f);
+#endif
 		std::cout << "Allocated: " << std::to_string(net_->getTotalSizeBytes() * no_batches)
 				  << (hasGPU() ? " bytes on GPU." : " bytes on CPU") << std::endl;
 		gpu_net_.setAllocatedMemoryLengthBytes(net_->getTotalSizeBytes() * no_batches); // TODO: add the other allocation sizes
@@ -1292,6 +1312,42 @@ public:
 		return loss / batch->size();
 	}
 
+	// Sum |z|^2 of an L2Out output, summed over the batch (the L2 kernel leaves each
+	// clone's value in reduce_real_); optionally also per example. Call it right after GpuForward.
+	float getL2Loss(OutputFunc *outp, std::vector<float> *per_example = nullptr) {
+		auto c_fun = dynamic_cast<CFunc*>(outp);
+		assert(c_fun);
+		GpuMapping *mp = getMappingFor(c_fun);
+		L2Gpu *l2 = dynamic_cast<L2Gpu*>(mp);
+		CompressedL2Gpu *cl2 = dynamic_cast<CompressedL2Gpu*>(mp);
+		if (!l2 && !cl2) {
+			std::cerr << "getL2Loss: the output is not an L2Out or CompressedL2." << std::endl;
+			assert(l2 || cl2);
+			return 0.f;
+		}
+		std::vector<GpuOutVar> tmp(mp->getOuts().size());
+		const bool ok = helper_.out_var_copy_from_gpu(tmp.size(), mp->gpu_out_ptr_, &tmp[0]);
+		assert(ok);
+		if (!ok) return 0.f;
+		float loss = 0.f;
+		if (per_example) per_example->clear();
+		for (auto &gout : tmp) {
+			loss += gout.reduce_real_;
+			if (per_example) per_example->push_back(gout.reduce_real_);
+		}
+		return loss;
+	}
+
+	// Copies the input vector of batch element `which` of a mapping back to the host
+	// (e.g. the [Y | -S] input of a loss layer, to read a network's output).
+	bool inputFromGpu(GpuMapping &mapping, int which, Vars &out) {
+		auto &funs = mapping.getCpuFun();
+		if (which < 0 || which >= (int) funs.size()) return false;
+		CFunc *fun = funs[which];
+		if (out.length_ != fun->input().length_) return false;
+		return helper_.float_copy_from_gpu(2 * out.length_, fun->gpu_var_.input_ptr_, out.real_);
+	}
+
 	// Number of correct predictions in the current batch (argmax |z_k|^2 vs the
 	// label), computed on the GPU from the activations already in place. Call it
 	// right after GpuForward. Almost free: a tiny kernel plus a small int copy,
@@ -1374,10 +1430,10 @@ public:
 			std::vector<GpuOutVar> tmp(outp->out_.size());
 			assert(helper_.out_var_copy_from_gpu(tmp.size(), outp->gpu_out_ptr_, &tmp[0]));
 
-			if (L2Gpu *l2 = dynamic_cast<L2Gpu*>(outp)) {
+			if (dynamic_cast<L2Gpu*>(outp) || dynamic_cast<CompressedL2Gpu*>(outp)) {
 				int indx = 0;
 				for (auto gout : tmp) {
-					ret[l2->cpu_func_[indx]->uid()] = gout.reduce_real_;
+					ret[outp->getCpuFun()[indx]->uid()] = gout.reduce_real_;
 					indx++;
 				}
 			} else if (CrossEntropyGpu *ce = dynamic_cast<CrossEntropyGpu*>(outp)) {
@@ -1397,10 +1453,16 @@ public:
 					auto z = std::complex<float>(tmp[label], tmp[fun->input().length_ + label]);
 
 					float nrm = norm(z);
-					gout.reduce_real_ = (gout.reduce_real_ < 1e-15 ? 1e-15 : gout.reduce_real_);
-
-					float prob = nrm / gout.reduce_real_;
-					prob = (prob < 1e-15 ? 1e-15 : prob);
+					const CrossEntropy *cpu_ce = dynamic_cast<CrossEntropy*>(fun);
+					const float ce_eps = cpu_ce ? cpu_ce->eps() : 0.f;
+					float prob;
+					if (ce_eps > 0.f) {   // smoothed Born rule, same expression as the CPU layer and the kernel
+						prob = (nrm + ce_eps) / (gout.reduce_real_ + fun->input().length_ * ce_eps);
+					} else {
+						gout.reduce_real_ = (gout.reduce_real_ < 1e-15 ? 1e-15 : gout.reduce_real_);
+						prob = nrm / gout.reduce_real_;
+						prob = (prob < 1e-15 ? 1e-15 : prob);
+					}
 					ret[ce->cpu_func_[indx]->uid()] = -std::log(prob);
 					indx++;
 				}

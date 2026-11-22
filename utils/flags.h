@@ -1,5 +1,6 @@
 #ifndef UTILS_FLAGS_H_
 #define UTILS_FLAGS_H_
+#include <cstdlib>
 
 #include <algorithm>
 #include <iostream>

@@ -92,6 +92,18 @@ The following code shows how to build a minimal neural net for the MNIST/Fashion
 
 Please see the file [cnet.cpp](https://github.com/crasmarum/CNet/blob/main/cnet.cpp) for how to train on CPU/GPU the above complex valued neural net with the MNIST/Fashion MNIST datasets.
 
+## Keyword spotting and speech enhancement from the waveform
+
+Two speech examples train complex transformers with Born attention directly from audio, with no external feature extraction:
+
+* [examples/kws.cpp](examples/kws.cpp) — Speech Commands (35 words, or any keyword subset with unknown/silence classes made by `data/speechcommands_to_bin.py`): `SegmentedFourier` over Hann frames, a `CLogPower` or `MelPower` front end (`-power_mode log|mel`, `-mel_bands 64`, `-mel_bands 0` for one-sided log power), pre-norm `BornAttention`/`GatedLinearAttention` blocks (`-mixer born|gla|none`, `-trunk_gelu`), a flat, pooled or mean+max readout (`-head flat|pool|meanmax`) and the Born-rule `CrossEntropy` with the optional smoothed rule (`-ce_eps`). `-restore model.mod -eval_shifts_ms "-100,0,100"` evaluates a saved model with every clip shifted in time (a controlled version of the shift augmentation). `-conv_channels 4 -conv_frames 3 -conv_bins 5 -conv_stride 4` adds a causal `TimeFreqConv` + `CGelu` on the power stream before its filterbank.
+* [examples/se.cpp](examples/se.cpp) — VoiceBank-DEMAND denoising: one input `[noisy frames | -clean frames]`, `Slice`, complex and log-power streams, Born blocks, a complex mask $Y = X + M\odot X$, and `L2Out`, `CompressedL2` or both as the loss (`-loss_type mse|compressed|both`); `-enhance out.bin` writes the enhanced test set (overlapping segments with a raised-cosine ramp-in), `-restore` re-scores a checkpoint, `-check` compares the CPU and GPU graphs on one example. `-local_mask true` adds the frequency-local residual mask path (`Interleave` + `TimeFreqConv` + per-bin `TokenwiseLinear`).
+* [examples/kws_infer.cpp](examples/kws_infer.cpp) and [examples/se_infer.cpp](examples/se_infer.cpp) run restored models on the CPU (no GPU needed): one WAV at a time (`-wav`), or a whole test file (`kws_infer -eval_bin kws_test.bin -eval_shifts_ms ...` prints the accuracy per shift at about 11 ms per clip on a laptop; `se_infer -eval_bin se_test.bin -out_bin enhanced.bin` enhances the 824 VoiceBank test clips in about two minutes, to be scored with `data/se_metrics.py` for PESQ, STOI and SI-SDR). The `demo_listen.sh` and `demo_denoise.sh` scripts in the parent directory wrap them with a microphone.
+
+Model files store the graph and the weights but not every training flag: the Born decay schedule and linear mode are re-applied from flags, and models written before the saver stored the causal flag restore as causal (`-causal false` on `kws -restore`, `kws_infer`, `se`, `se_infer` for old non-causal files).
+
+**Constant-state streaming.** [impl/framenet.h](impl/framenet.h) rebuilds a trained audio model as its $N{=}1$ twin (the audio counterpart of `stepnet.h`): one Hann frame in per hop, `BornAttention` in step mode (state $d_h^2 + d_h^3$ complex per head), RoPE at the absolute frame index, and a `FrameRing` of the last $N$ token projections so the trained whole-window readouts (flat `Linear`, `TokenMeanPool`/`TokenMaxPool`) run unchanged on a sliding window. [examples/kws_stream.cpp](examples/kws_stream.cpp) (`-eval_bin … -check_clips` compares the twin with the full graph: equal to $10^{-6}$; `-wav` / `-stdin_pcm` detect commands with posterior smoothing, threshold and hysteresis, printing a word in capitals once its smoothed posterior reaches `-high_prob` (0.95); $0.9$ ms per 10 ms hop single-threaded, 285 KiB of state for the r19 model) and [examples/se_stream.cpp](examples/se_stream.cpp) (`-check`, `-wav`, `-eval_bin` → SEE1; causal running or fixed gain; $4.5$ ms per 16 ms hop, 4.1 MiB of state, 16–32 ms algorithmic latency; the streamed s1 model matches its offline segment quality with a fixed gain; `-identity` feeds $Y = X$ from the twin's own DFT layer back through the synthesis path and must return the input exactly, which checks the unitary DFT pair, the per-frame gain reversal and the overlap-add normaliser at the boundaries: frame $f$ covers samples $[fh, fh+W)$ from sample 0 with no pre-padding, the first $h$ samples are normalised by one frame's $w^2$, the last frame is zero-padded, and samples with $\sum w^2 < 10^{-3}$ are zero, as in `se_infer`/`se.cpp`). [data/kws_listen_stream.py](data/kws_listen_stream.py) feeds the microphone into one long-lived `kws_stream`, and [data/kws_continuous_eval.py](data/kws_continuous_eval.py) builds a continuous test stream from KWS1 clips with noisy gaps and scores recall, false accepts per hour and latency. Non-causal models are refused (the step recurrence is causal). `-infer_dims true` builds the twin with `Vars::INFER_DIMS` (z and dz only, half the activation memory); the twin checks pass with it since `zero_gradients()` clears only the segments that exist.
+
 ## Adding Custom Complex Valued Functions / NN Layers
 
 In order to add a new complex valued function, say $Sigmoid : \mathbb C^n \to \mathbb C^n$ given by $Sigmoid(z)_i = 1 / (1 + e^{-z_i})$,
@@ -654,6 +666,106 @@ auto mag  = cnet.add(new CModulus2(InSize(N)), {stft});               // |.|^2 s
 
 Empirically, on RML a segmented-Fourier branch (windows `{16, 32}`) gave **no gain over the cyclic spectrum** above — the two features are redundant — which we record as an honest negative. It is provided as a general-purpose spectral/time–frequency primitive.
 
+## Log Power Layer
+
+`CLogPower` turns a complex spectrum into a real log-power feature, element by element:
+
+$$\mathrm{CLogPower}(z)_k = \log\big(\varepsilon + |z_k|^2\big) + 0\,i, \qquad \varepsilon = 10^{-6}.$$
+
+The imaginary part of the output is zero; the layer is parameter-free. With $g = \partial L/\partial y + \partial L/\partial \bar y$ the Wirtinger backward is $\partial L/\partial z = g\,\bar z/(\varepsilon+|z|^2)$ and $\partial L/\partial \bar z = g\,z/(\varepsilon+|z|^2)$. Applied to the output of `SegmentedFourier` it gives the log spectrogram used by the keyword-spotting and speech-enhancement examples. Note that $\varepsilon$ is fixed (the GPU table builds the mapping from the depth alone), so the floor sits at $\log 10^{-6} = -13.8$ for unit-scale inputs, and that the log of a two-sided spectrum of a real signal carries every bin twice; `MelPower` below avoids both.
+
+```c++
+#include "impl/relu.h"
+
+auto spec = cnet.add(new SegmentedFourier(InSize(N * W), W), {inp});   // N frames x W bins
+auto lp   = cnet.add(new CLogPower(InSize(N * W)), {spec});            // log(eps + |X|^2), real
+```
+
+## Log-Mel Power (Fixed Filterbank) Layer
+
+`MelPower` is the standard speech front end as a fixed, parameter-free layer on the two-sided STFT tokens that `SegmentedFourier` writes ($N$ frames of $W$ bins, token-major). For frame $t$ and band $m$
+
+$$\mathrm{MelPower}(X)_{t,m} = \frac{1}{\sigma}\Big(\log\big(\varepsilon + \textstyle\sum_{k \le W/2} H_{m,k}\,|X_{t,k}|^2\big) - \mu\Big) + 0\,i,$$
+
+with $H$ the $M$ unit-peak triangular filters of the HTK mel scale between `fmin` and `fmax` on the one-sided bins $k = 0..W/2$ ($f_k = k f_s/W$), so the conjugate-mirror bins of a real signal are never read and get a zero gradient. $\mu$ and $\sigma$ standardise the features (`setStandardize(mean, scale)`; default $0$, $1$) and are **stored in the model file** together with $W$, $M$, $f_s$, `fmin`, `fmax`, so a restored model needs no flags. With `linear = true` the filters are the identity over the $W/2+1$ one-sided bins ($M$ must be $W/2+1$): standardised one-sided log power without mel pooling, which separates the effect of centring from that of the band structure. The Wirtinger backward is that of `CLogPower` summed over the bands that read a bin, with $1/(\varepsilon + P_m)$ recovered from the layer's own output as $\exp(-(y_m\sigma+\mu))$. The constructor takes the frame count, the window, the number of bands and optionally the sample rate, the band edges and the linear flag:
+
+```c++
+#include "impl/melpower.h"
+
+int N = 100, W = 512, M = 64;
+auto spec = cnet.add(new SegmentedFourier(InSize(N * W), W), {inp});
+auto mel  = cnet.add(new MelPower(N, W, M, 16000.f, 20.f, 8000.f), {spec});       // N x 64, real
+((MelPower*) cnet[mel])->setStandardize(-5.11f, 4.95f);                           // training-set statistics
+auto emb  = cnet.add(new TokenwiseLinear(N, M, E), {mel, wmel});                  // 64 -> E instead of 512 -> E
+auto lin  = cnet.add(new MelPower(N, W, W / 2 + 1, 16000.f, 20.f, 8000.f, true), {spec});   // one-sided log power
+```
+
+Checked by central finite differences on CPU (also in the linear mode, where the output is compared with the per-bin log power directly), save/restore with the constants, and GPU against CPU at $N{=}100$, $W{=}512$, $M{=}64$ and $M{=}257$ (`make test_melpower`). Two caveats: the GPU mapping copies the filter bank of the **first** layer of its group (layers of one type and size at one depth share a mapping), so use one `MelPower` per graph or give several the same $W$, $M$, $f_s$, `fmin`, `fmax`; and the statistics must come from the whole training set — the keyword-spotting trainer estimates them on 512 clips strided over the (class-grouped) training file.
+
+## Token Pooling Layers: TokenMeanPool and TokenMaxPool
+
+Both reduce $N$ tokens of $P$ complex dims (token-major, dim $p$ of token $t$ at index $tP+p$) to one $P$-vector, and both are parameter-free and shift-invariant.
+
+* `TokenMeanPool(InSize(N P), OutSize(P))`: $y_p = \frac{1}{N}\sum_t x_{t,p}$; the gradient is spread uniformly ($\partial L/\partial x_{t,p} = \partial L/\partial y_p / N$, same for the conjugate).
+* `TokenMaxPool(InSize(N P), OutSize(P))`: $y_p = x_{t^*,p}$ with $t^* = \arg\max_t |x_{t,p}|$ (the first maximum on ties, the same rule on CPU and GPU), so the pooled value keeps the phase of the strongest token; the gradient goes to that token only (the layer is piecewise linear, so a finite-difference check is valid only while the arg-max does not change). The GPU mapping keeps the arg-max of every (example, dim) in a device buffer it owns between the forward and the backward.
+
+A shift-invariant classifier readout concatenates the two (the `-head meanmax` option of the keyword-spotting example): because a layer's input is the concatenation of its predecessors' outputs in the order given, a `Linear` over `{mean, max, weights}` sees $[\,\text{mean} \mid \text{max}\,]$ as its $2P$ data inputs.
+
+```c++
+#include "impl/pool.h"
+
+int N = 100, P = 64, Hd = 128;
+auto a    = cnet.add(new CGelu(InSize(N * P)), {proj});                          // per-token features
+auto mean = cnet.add(new TokenMeanPool(InSize(N * P), OutSize(P)), {a});
+auto mx   = cnet.add(new TokenMaxPool(InSize(N * P), OutSize(P)), {a});
+auto h1   = cnet.add(new Linear(InSize(2 * P), InSize(2 * P * Hd)), {mean, mx, w});   // input [mean | max]
+```
+
+`make test_tokenpool` and `make test_tokenmaxpool` check both against finite differences, save/restore and the GPU kernels. A caveat from the keyword-spotting study: a mean over `CGelu` outputs is a sample-insensitive positive vector plus an informative part attenuated by $N^{-1/2}$, and with the exact Born-rule loss this readout collapsed to all-zero logits; the smoothed rule below removes the collapse, and the max-magnitude statistic keeps a token-specific signal.
+
+## Slice Layer
+
+`Slice(InSize(N), OutSize(P), start)` copies the window $x_{\text{start}}, \ldots, x_{\text{start}+P-1}$ of its input to its output; the backward adds the output gradients into that window and nothing elsewhere. It is how one example vector carries several signals through a single `CInput`: the speech-enhancement trainer feeds `[noisy frames | -clean frames]` as one input of $2NW$ values, slices the two halves after a shared `SegmentedFourier`, and uses the negated clean half as the target of a `Residual` (so `Residual(Y, -S)` is the error $Y - S$ that `L2Out` squares). The GPU mapping stores one `start` per layer of its group (a mapping serves every `Slice` of the same size at the same depth, so a per-layer parameter must be per-map; see [CNET_NOTES.md](../CNET_NOTES.md)).
+
+```c++
+#include "impl/slice.h"
+
+int NW = N * W;
+auto spec  = cnet.add(new SegmentedFourier(InSize(2 * NW), W), {inp});   // [X | -S] framed together
+auto X     = cnet.add(new Slice(InSize(2 * NW), OutSize(NW), 0), {spec});
+auto negS  = cnet.add(new Slice(InSize(2 * NW), OutSize(NW), NW), {spec});
+```
+
+## Time-Frequency Convolution Layer (TimeFreqConv)
+
+`TimeFreqConv(N, B, C_in, C_out, T, F, S)` is a small causal convolution over the time-frequency plane with complex taps shared by every position: a detector of short spectral transitions in front of the first token-mixing block. The data input holds $N$ frames of $B$ bins with $C_{in}$ channels per bin (channel fastest) and the taps follow the data in the same input vector, exactly like the weight of `TokenwiseLinear`, so they come from a `CInput` of `nTaps()` $= C_{out} C_{in} T F$ values:
+
+$$y_{t,b',o} = \sum_{c,\tau,j} w_{o,c,\tau,j}\; x_{t-\tau,\; b'S + j - \lfloor F/2\rfloor,\; c},\qquad b' < \lceil B/S\rceil,$$
+
+with zeros for $t-\tau<0$ (causal: frame $t$ sees frames $t-T+1\ldots t$ only) and outside the bins. The map is holomorphic in the data and in the taps, so the Wirtinger backward mirrors `TokenwiseLinear`. With $T=1$ the layer is frequency-only and needs no state; with $T>1$ the streaming twin ([impl/framenet.h](impl/framenet.h)) keeps a ring of the last $T$ input frames. The keyword-spotting trainer adds it to the power stream with `-conv_channels 4 -conv_frames 3 -conv_bins 5 -conv_stride 4` (then a `CGelu`, then the usual filterbank); the GPU backward uses one gather kernel per data element and one per tap, without atomics.
+
+```c++
+#include "impl/tfconv.h"
+
+auto conv = new TimeFreqConv(N, W, 1, 4, 3, 5, 4);                      // N frames x W bins -> N x (W/4) x 4
+auto c    = cnet.add(conv, {logpower, cnet.add(new CInput(OutSize(conv->nTaps())))});
+auto a    = cnet.add(new CGelu(InSize(conv->outSize())), {c});
+auto emb  = cnet.add(new TokenwiseLinear(N, conv->outBins() * 4, E), {a, filterbank});
+```
+
+## Interleave Layer
+
+`Interleave(L, K)` takes $K$ inputs of the same length $L$ (concatenated in its input vector) and puts the $K$ values of each position side by side, $y_{iK+k} = x^{(k)}_i$, so that per-position layers see them as channels: a permutation whose backward routes the gradients back unchanged. The speech-enhancement trainer's frequency-local mask path (`-local_mask true -local_channels 8 -local_bins 5`) interleaves the noisy spectrum with the mask pre-activation of each bin, runs a `TimeFreqConv` with $C_{in}=2$, $T=1$ and five bins, a `CGelu`, a per-bin `TokenwiseLinear(N W, 8, 1)` and adds the result to the mask.
+
+```c++
+#include "impl/interleave.h"
+
+auto Z  = cnet.add(new Interleave(NW, 2), {X, M});                       // per bin: [X_p | M_p]
+auto lc = cnet.add(new TimeFreqConv(N, W, 2, 8, 1, 5, 1), {Z, taps});
+auto lr = cnet.add(new TokenwiseLinear(N * W, 8, 1), {cnet.add(new CGelu(InSize(N * W * 8)), {lc}), u});
+M = cnet.add(new Residual(InSize(NW), InSize(NW)), {M, lr});
+```
+
 ## Chirp Filter (Coherent Dedispersion) Layer
 
 `ChirpFilter` applies `K` learnable coherent-dedispersion filters to one channel of complex baseband, the physics front end for detecting dispersed radio bursts. Each filter is an all-pass phase in the Fourier domain (the FFT–Hadamard pattern with the frequency response constrained to a quadratic phase), and its dispersion measure is the only parameter:
@@ -699,6 +811,22 @@ auto sigm = net.add(new CSigmoid(InSize(128)), {inp});
 auto l2 = net.add(new L2Out(InSize(128)), {sigm});
 ```
 
+## Compressed-Spectrum L2 Loss (CompressedL2)
+
+`CompressedL2` is the magnitude-compressed spectral loss of Braun and Tashev, used for speech enhancement where a plain complex MSE optimises SNR but leaves perceptual quality (PESQ) behind. Its input is the concatenation $[\,Y \mid T\,]$ of two blocks of $M$ complex values, with the target $S = -T$ (so the same `[Y | -S]` layout as `Residual` + `L2Out`); with $a = \sqrt{|y|^2+10^{-8}}$, $b = \sqrt{|s|^2+10^{-8}}$ and the compressed spectra $u = a^{c-1}y$, $v = b^{c-1}s$,
+
+$$\mathrm{CompressedL2}(Y, T) = \sum_k \Big(\beta\,|u_k - v_k|^2 + (1-\beta)\,(a_k^{\,c} - b_k^{\,c})^2\Big),$$
+
+$c = 0.3$ and $\beta = 0.5$ by default (stored in the model file). The Wirtinger gradients cover both halves. Like `L2Out` it is a terminal loss (no consumer), which the GPU needs to know: terminal mappings are special-cased in `GpuNet::addGpuOuts`, `batchToGpu` and `getLoss`/`getL2Loss`, where the per-example value is read back from `reduce_real_`. Two terminal losses in one graph simply add their gradients (the first one added is the main output); `setScale(s)` weights this loss in such a sum (not stored). Checked by finite differences for $c \in \{0.3, 1\}$, $\beta \in \{0, 0.5, 1\}$ and against the GPU at $M = 63{,}488$ (`make test_compressed_l2`).
+
+```c++
+#include "impl/compressed_l2.h"
+
+auto Y    = cnet.add(new Residual(InSize(NW), InSize(NW)), {X, masked});          // Y = X + M.X
+auto loss = cnet.add(new CompressedL2(InSize(2 * NW), 0.3f, 0.5f), {Y, negS});   // input [Y | -S]
+((CompressedL2*) cnet[loss])->setScale(1.f);
+```
+
 ## Cross Entropy Loss function
 
 The CrossEntropy loss implements the multivariable function
@@ -718,6 +846,12 @@ auto l_data = cnet.add(new CInput(OutSize(28 * 28 * 10)));
 auto lin = cnet.add(new Linear(InSize(28 * 28), InSize(28 * 28 * 10)), {gelu, l_data});
 auto ce = cnet.add(new CrossEntropy(InSize(10)), {lin});
 ```
+
+**Smoothed Born rule.** `setEps(eps)` (the `-ce_eps` flag of the keyword-spotting trainer) replaces the probabilities by
+
+$$p_c = \frac{|z_c|^2 + \epsilon}{\sum_j |z_j|^2 + C\,\epsilon},$$
+
+in the loss, in `getProbability` and in the gradient, on CPU and GPU alike: the loss is $\ln C$ with a zero gradient at $z = 0$, no clamp is needed, and the arg-max (`get_prediction`, `getPredictions`) is unchanged; `sample()` keeps the exact rule. Unlike the gradient-only floor of `SequenceCrossEntropy` below, this changes the forward loss too. It was added after a pooled readout drove every logit to exactly zero, where the exact rule's gradient is $0/0$; `eps` is not stored in model files (pass it again when restoring), and it must be set before the GPU allocation (the kernels read it from the first layer of a mapping, and the batch clones copy it when they are made). `make test_crossent_eps` checks finite differences, the degenerate $z=0$ case and GPU parity for both rules.
 
 ## Sequence Cross Entropy Loss function
 
@@ -766,6 +900,8 @@ net.trueAdamUpdate(l_rate, batch_size, beta1, beta2, eps, step);
 Because the Born-rule `CrossEntropy` / `SequenceCrossEntropy` losses are ill-conditioned, full Adam (`trueAdamUpdate`) with gradient clipping is recommended over plain SGD for classification and language-model training.
 
 The ill-conditioning is concrete: the exact gradient of $-\log(|z_t|^2/\|z\|^2)$ grows like $1/|z_t|$ when the model assigns a near-zero amplitude to the *correct* token, so a single hard example can produce an explosive update that parameter-level gradient clipping cannot catch (the bad gradient is already summed into the minibatch). `SequenceCrossEntropy` therefore offers an optional **probability floor** `setEps(eps)` (the `-ce_eps` flag in the language-model example): the target modulus is clamped from below, $|z_t|^2 \leftarrow \max(|z_t|^2,\ \varepsilon\,\|z\|^2)$, **in the gradient only** — a uniform measurement-noise floor, i.e. label-smoothing for the Born rule. The forward loss stays exact, so the reported metric is unchanged; only the optimization is regularised, and `eps = 0` is bit-identical to the exact gradient. A value around $10^{-3}$ removes the training-loss spikes that otherwise appear with deep models and higher learning rates.
+
+Two safety nets in the GPU `trueAdamUpdate`: a gradient component that is not finite, or whose square overflows (which would leave the second moment at $+\infty$ and freeze the parameter), is dropped and counted — `CNet::trueAdamUpdate` prints a warning with the count (`gpu_nonfinite_gradients_reset()`, one device counter per GPU) — instead of being turned into $+$`grad_clip` by the IEEE min/max of the clip, which once locked a run into a constant drift; and the GPU arena is zeroed at allocation, because the kernel seeds its moments only at `t == 0` and not every driver starts its step count there.
 
 # Building the Software
 

@@ -1,5 +1,9 @@
 #ifndef IMPL_RELU_H_
 #define IMPL_RELU_H_
+#include <cassert>
+#include <cmath>
+#include <complex>
+#include <string>
 
 #include <cfloat>
 
@@ -287,6 +291,80 @@ public:
 	bool operator!=(const CModulus2& rhs) const
 	{
 		return !operator==(rhs);
+	}
+};
+
+// Log power w = log(eps + |z|^2) (real output, imaginary part 0), eps = kLogPowerEps.
+// The compressive loudness scale of speech front ends (log spectrogram): a learned
+// filterbank on log power sees quiet and loud frames on comparable scales, which
+// |z|^2 alone does not give. Non-holomorphic; with p = |z|^2, dw/dp = 1/(eps + p), so
+// it is CModulus2's backward scaled by that factor:
+//   dL/dz   = (dLdz + dLdz_star) * conj(z) / (eps + |z|^2)
+//   dL/dz~  = (dLdz + dLdz_star) * z       / (eps + |z|^2)
+// eps is fixed (the GPU layer table builds mappings from the depth alone): with unit-scale
+// inputs it puts the floor at log(1e-6) = -13.8.
+constexpr float kLogPowerEps = 1e-6f;   // constexpr: also read by the CUDA kernels
+class CLogPower: public CFunc {
+
+public:
+	CLogPower(Uid uid, InSize in_size) : CFunc(uid, in_size, OutSize(in_size.value())) {
+	}
+
+	CLogPower(InSize in_size) : CFunc(in_size, OutSize(in_size.value())) {
+	}
+
+	virtual ~CLogPower() {
+	}
+
+	virtual CFunc* clone(Uid uid) {
+		return new CLogPower(uid, InSize(input().length_));
+	}
+
+	virtual std::string getName() {
+		return "CLogPower_" + std::to_string(uid_);
+	}
+
+	virtual void forward() {
+		assert(no_outputs());
+		for (int indx = 0; indx < no_outputs(); ++indx) {
+			#pragma omp parallel for
+			for (int out_ind = 0; out_ind < out_size_; ++out_ind) {
+				float re = input().real_[out_ind];
+				float im = input().imag_[out_ind];
+				output(indx).real_[offset(indx) + out_ind] = logf(kLogPowerEps + re * re + im * im);
+				output(indx).imag_[offset(indx) + out_ind] = 0.0f;
+			}
+		}
+	}
+
+	virtual void backward() {
+		for (int indx = 0; indx < no_outputs(); ++indx) {
+			#pragma omp parallel for
+			for (int in_indx = 0; in_indx < input().length_; ++in_indx) {
+				auto dLdz      = output(indx).dz(offset(indx) + in_indx);
+				auto dLdz_star = output(indx).dz_star(offset(indx) + in_indx);
+
+				std::complex<float> z(input().real_[in_indx], input().imag_[in_indx]);
+				auto g = (dLdz + dLdz_star) / (kLogPowerEps + std::norm(z));
+				auto sum_dz      = g * std::conj(z);
+				auto sum_star_dz = g * z;
+
+				input().dz_real_[in_indx] += sum_dz.real();
+				input().dz_imag_[in_indx] += sum_dz.imag();
+				input().dz_star_real_[in_indx] += sum_star_dz.real();
+				input().dz_star_imag_[in_indx] += sum_star_dz.imag();
+			}
+		}
+	}
+
+	virtual void backward(int label) {
+	}
+
+	virtual std::complex<float>      dz(int out_indx, int in_index) {
+		return 0;
+	}
+	virtual std::complex<float> dz_star(int out_indx, int in_index) {
+		return 0;
 	}
 };
 

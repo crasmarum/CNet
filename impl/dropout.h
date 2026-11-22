@@ -1,6 +1,8 @@
 #ifndef IMPL_DROPOUT_H_
 #define IMPL_DROPOUT_H_
 
+#include <complex>
+#include <string>
 #include "cfunc.h"
 #include "vars.h"
 

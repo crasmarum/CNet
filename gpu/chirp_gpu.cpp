@@ -1,5 +1,7 @@
 // GPU forms of ChirpFilter and BoxcarMax. CPU references and the Wirtinger derivations: impl/chirp.h.
 // Layout per clone (CNet planar vars): input [x (L) | fc (1) | d (K)], output [y_0 (L) | ... | y_{K-1} (L)].
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>

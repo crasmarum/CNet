@@ -1,5 +1,8 @@
 #ifndef IMPL_CHIRP_H_
 #define IMPL_CHIRP_H_
+#include <algorithm>
+#include <cassert>
+#include <string>
 
 #include <cmath>
 #include <complex>

@@ -4,6 +4,11 @@
 #include "../utils/flags.h"
 #include "../utils/stopwatch.h"
 #include "../utils/myrand.h"
+#include <cassert>
+#include <cmath>
+#include <complex>
+#include <cstdint>
+#include <cstdlib>
 
 #include <fstream>
 #include <iostream>

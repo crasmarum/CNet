@@ -1,0 +1,134 @@
+% Three pages for a non-technical reader: what the streaming voice technology is, what it achieved in two days,
+% and how to run the demo from GitHub. Build: latexmk -pdf voice_demo.tex
+\documentclass[aspectratio=169,10pt]{beamer}
+\usetheme{default}
+\usecolortheme{seagull}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}{\hspace*{1.2em}\tiny Phasefield \textperiodcentered\ Marcel Crasmaru \textperiodcentered\ 22 November 2026 \textperiodcentered\ github.com/crasmarum/CNet \hfill \insertframenumber/3\hspace*{1.2em}\vspace*{0.5em}}
+\setbeamertemplate{itemize items}[circle]
+\setbeamerfont{frametitle}{size=\large,series=\bfseries}
+\setbeamercolor{frametitle}{fg=black!85}
+\setbeamercolor{block title}{bg=black!8,fg=black!85}
+\setbeamercolor{block body}{bg=black!3}
+\setbeamersize{text margin left=1.2em,text margin right=1.2em}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\definecolor{accent}{RGB}{0,90,140}
+\newcommand{\num}[1]{\textcolor{accent}{\textbf{#1}}}
+
+\begin{document}
+
+% ------------------------------------------------------------------ page 1
+\begin{frame}{Voice AI that listens all the time, on a tiny processor}
+\small
+\begin{columns}[T]
+\begin{column}{0.54\textwidth}
+\textbf{The problem.} Small robots, wearables and appliances must hear you continuously, with no cloud link, no graphics chip and a small battery. Today's speech models are built for short clips: they re-read the last second at every step, or they stream with approximations.
+
+\medskip
+\textbf{What we built.} \emph{Born attention} weighs earlier sound by a probability, as a measurement does in quantum physics. The consequence: the model runs \num{one 10-millisecond frame at a time}, with a memory that \num{never grows}, and gives \num{exactly} the result it would give from the whole recording.
+
+\medskip
+\textbf{Two models, one stack.} A command spotter and a noise remover, trained from the raw waveform in our own framework (CNet: C++/CUDA, complex numbers built in) and run as streams on a plain CPU.
+\end{column}
+\begin{column}{0.44\textwidth}
+\begin{block}{What the stream costs, one laptop core}
+\scriptsize\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+ & Spotter & Denoiser \\
+\midrule
+memory between frames & 334 KiB & 4.1 MiB \\
+compute per frame of audio & 0.65 / 10 ms & 5.2 / 16 ms \\
+faster than real time & 15$\times$ & 3$\times$ \\
+match with the offline model & 1 in 10$^6$ & 1 in 10$^5$ \\
+model file & 1.4 MB & 6.8 MB \\
+\bottomrule
+\end{tabular}
+\end{block}
+\begin{block}{Against the alternatives}
+\scriptsize
+\begin{itemize}
+\item \emph{Standard transformers}: memory grows with time, or a fixed window forgets abruptly.
+\item \emph{``Linear'' attention}: constant memory but approximate; Born was ahead at every matched checkpoint on spotting, 48 of 50 on denoising.
+\item \emph{No attention}: 15 points of accuracy lost.
+\end{itemize}
+\end{block}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ------------------------------------------------------------------ page 2
+\begin{frame}{Two models in two days (20--22 November 2026)}
+\small
+\begin{columns}[T]
+\begin{column}{0.52\textwidth}
+\begin{block}{Command spotter: Google's 35-word benchmark, trained from scratch on one rented GPU}
+\scriptsize
+\begin{itemize}
+\item \num{95.1\%} of test clips correct with \num{123k} parameters.
+\item Within \num{one point} of the standard model of the same size; 2.5 points from the best published, which train four to five times longer or start from large pretrained models.
+\item Listening continuously to 15 minutes of noisy audio, seven commands: \num{80\%} caught, \num{6} false alarms.
+\end{itemize}
+\end{block}
+\begin{block}{Noise remover: VoiceBank-DEMAND, the standard noisy-speech test}
+\scriptsize
+\begin{itemize}
+\item Speech quality score (PESQ, 1 to 4.5) from \num{1.97} to \num{2.60}; noise power cut \num{8$\times$} (9 dB).
+\item The stream is within 0.02 of the offline score.
+\item 0.3 to 0.6 short of the best published models; the lever that moves it is known (the training objective).
+\end{itemize}
+\end{block}
+\end{column}
+\begin{column}{0.46\textwidth}
+\textbf{Why it matters.}
+\begin{itemize}
+\item Runs on a Raspberry-Pi-class processor: no cloud, nothing leaves the device, a constant cost per second however long it listens.
+\item One stack from training to deployment: a 0.4 MB program plus the model file, no runtime dependencies.
+\item Reproducible: 36 documented training runs, matched-pair comparisons, a 23-page technical report with the failures as well as the results.
+\end{itemize}
+\medskip
+\textbf{Next.} Measure on the robot's processor; train the spotter on continuous audio; the extra loss term for the noise remover; repeat the key comparisons over several random seeds.
+\end{column}
+\end{columns}
+\end{frame}
+
+% ------------------------------------------------------------------ page 3
+\begin{frame}[fragile]{Try it yourself: ten minutes from GitHub to your microphone}
+\small
+\begin{columns}[T]
+\begin{column}{0.5\textwidth}
+\textbf{You need} a Mac (Xcode command-line tools, \texttt{brew install libomp}) or a Linux machine (\texttt{g++}, \texttt{make}, \texttt{python3-venv}, \texttt{libportaudio2}), and a microphone.
+
+\medskip
+\textbf{Build} (about two minutes):
+\begin{semiverbatim}\scriptsize
+git clone https://github.com/crasmarum/CNet.git
+cd CNet/voice_demo
+./build.sh
+\end{semiverbatim}
+
+\textbf{Run:}
+\begin{semiverbatim}\scriptsize
+./play_demo.sh   # bundled clip, before and after
+./listen.sh      # say stop, go, left, right ...
+./denoise.sh     # record 5 s with noise, hear it cleaned
+\end{semiverbatim}
+\end{column}
+\begin{column}{0.48\textwidth}
+\textbf{What you will see.}
+\begin{itemize}
+\item \texttt{play\_demo.sh}: seven seconds of a noisy test recording, then the cleaned version from the stream.
+\item \texttt{listen.sh}: a time and a word at each detection, in CAPITALS when the model is sure, plus its current best guess twice a second. Ctrl-C stops it.
+\item \texttt{denoise.sh}: records you with some background noise, then plays the recording and the cleaned version.
+\end{itemize}
+\medskip
+\textbf{Variants.} \texttt{listen.sh --all} (35 words), \texttt{listen.sh --ptt} (push to talk), \texttt{denoise.sh --file your.wav}, \texttt{denoise.sh --offline}.
+
+\medskip
+\textbf{In the folder.} \texttt{models/} (1.4 MB spotter, 6.8 MB noise remover), \texttt{py/} (microphone scripts), \texttt{clips/} (the demo recording), this deck in \texttt{presentation/}; the technical report is in the repository.
+\end{column}
+\end{columns}
+\end{frame}
+
+\end{document}

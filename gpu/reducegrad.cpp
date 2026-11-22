@@ -1,3 +1,8 @@
+#include <cassert>
+#include <cmath>
+#include <cstdint>
+#include <iostream>
+#include <vector>
 
 #include <map>
 #include "reduce.h"

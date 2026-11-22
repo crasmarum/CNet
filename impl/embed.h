@@ -1,5 +1,12 @@
 #ifndef IMPL_EMBED_H_
 #define IMPL_EMBED_H_
+#include <cassert>
+#include <cmath>
+#include <complex>
+#include <cstring>
+#include <initializer_list>
+#include <iostream>
+#include <string>
 
 #include <algorithm>
 #include <omp.h>

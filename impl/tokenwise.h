@@ -1,5 +1,9 @@
 #ifndef IMPL_TOKENWISE_H_
 #define IMPL_TOKENWISE_H_
+#include <cassert>
+#include <cstdint>
+#include <string>
+#include <vector>
 
 #include <complex>
 #include <omp.h>

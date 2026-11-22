@@ -1,5 +1,7 @@
 #ifndef IMPL_TOKENNORM_H_
 #define IMPL_TOKENNORM_H_
+#include <cassert>
+#include <string>
 
 #include <vector>
 #include <complex>

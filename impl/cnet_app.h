@@ -31,6 +31,8 @@
 // -val_batches -log_every -save_path -init_model -init_std -grad_clip -grad_norm_clip -ce_eps -seed
 // -nccl_id -tf32. CNet's global kernel flags (-tw_cublas, -tw_real_loss, -born_chunk, ...) apply too.
 #pragma once
+#include <algorithm>
+#include <cstdint>
 
 #include <chrono>
 #include <cmath>

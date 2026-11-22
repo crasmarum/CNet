@@ -1,5 +1,7 @@
 #ifndef IMPL_PAD_H_
 #define IMPL_PAD_H_
+#include <cassert>
+#include <string>
 
 #include <algorithm>
 #include <vector>

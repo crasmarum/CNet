@@ -1,5 +1,8 @@
 #ifndef IMPL_GLA_H_
 #define IMPL_GLA_H_
+#include <algorithm>
+#include <cstdint>
+#include <string>
 
 #include <vector>
 #include <cassert>

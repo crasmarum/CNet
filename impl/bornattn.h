@@ -1,5 +1,8 @@
 #ifndef IMPL_BORNATTN_H_
 #define IMPL_BORNATTN_H_
+#include <cmath>
+#include <cstdint>
+#include <string>
 
 #include <vector>
 #include <cassert>
@@ -72,6 +75,7 @@ public:
 	int headDim() const { return d_ / H_; }
 	void setLinear(bool on, int chunk = 512) { linear_ = on; chunk_ = chunk; }
 	void setDecay(bool on) { decay_ = on; }
+	void setCausal(bool on) { causal_ = on; }   // before the GPU allocation; for model files written without the flag
 	bool decay() const { return decay_; }
 	// Decay schedule gamma_h = 1 - 2^-(base + step*h); default base 5, step 1 (RetNet: 31/32, 63/64, ...). Set once at
 	// startup with setDecaySchedule (also copies it to the GPU); not stored in model files, so pass the same flags

@@ -1,0 +1,13 @@
+bin/
+obj/
+.venv/
+clips/clip2_enhanced.wav
+presentation/*.aux
+presentation/*.log
+presentation/*.nav
+presentation/*.out
+presentation/*.snm
+presentation/*.toc
+presentation/*.fdb_latexmk
+presentation/*.fls
+presentation/*.synctex.gz

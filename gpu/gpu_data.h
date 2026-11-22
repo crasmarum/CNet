@@ -1,5 +1,8 @@
 #ifndef GPU_DATA_H_
 #define GPU_DATA_H_
+#include <cassert>
+#include <cstdint>
+#include <iostream>
 
 #include <vector>
 #include <map>
@@ -58,7 +61,13 @@ public:
 		X(isPad,            PadGpu)           \
 		X(isGelu,           GeluGpu)          \
 		X(isModulus2,       CModulus2Gpu)     \
+		X(isLogPower,       CLogPowerGpu)     \
 		X(isMeanPool,       MeanPoolGpu)      \
+		X(isTokenMeanPool,  TokenMeanPoolGpu) \
+		X(isTokenMaxPool,   TokenMaxPoolGpu)  \
+		X(isMelPower,       MelPowerGpu)      \
+		X(isTimeFreqConv,   TimeFreqConvGpu)  \
+		X(isInterleave,     InterleaveGpu)    \
 		X(isSeqCrossEntropy, SequenceCrossEntropyGpu) \
 		X(isBornAttention,  BornAttentionGpu)  \
 		X(isTokenNorm,      TokenNormGpu)      \
@@ -83,6 +92,12 @@ public:
 		        break;
 		    case isConjLag:
 		    	add(new ConjLagGpu(depth, ((ConjLagProduct*)block[0])->tau()), gpu_ptr, block);
+		        break;
+		    case isSlice:
+		    	add(new SliceGpu(depth, ((Slice*)block[0])->start()), gpu_ptr, block);
+		        break;
+		    case isCompressedL2:
+		    	add(new CompressedL2Gpu(depth, ((CompressedL2*)block[0])->c(), ((CompressedL2*)block[0])->beta(), ((CompressedL2*)block[0])->scale()), gpu_ptr, block);
 		        break;
 		    case isSegFourier:
 		    	add(new SegFourierGpu(depth, ((SegmentedFourier*)block[0])->window()), gpu_ptr, block);
@@ -121,7 +136,8 @@ public:
 					outVar.out_length_ = cpu_fun->input().length_;
 
 					map->out_.push_back(outVar);
-				} else if (L2Gpu *ce = dynamic_cast<L2Gpu*>(map)) {
+				} else if (dynamic_cast<L2Gpu*>(map) || dynamic_cast<CompressedL2Gpu*>(map)) {
+					// terminal scalar losses: the out var only carries the reduced loss, no next() to wire
 					GpuOutVar outVar;
 					outVar.out_ptr_ = map->in_[indx].input_ptr_
 							+ (hasGradients_ ? Vars::dims_ : 2) * cpu_fun->input().length_;

@@ -1,5 +1,9 @@
 #ifndef IMPL_L2OUT_H_
 #define IMPL_L2OUT_H_
+#include <cassert>
+#include <cmath>
+#include <complex>
+#include <string>
 
 #include <algorithm>
 #include "cfunc.h"

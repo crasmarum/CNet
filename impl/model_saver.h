@@ -1,5 +1,10 @@
 #ifndef CPU_MODEL_SAVER_H_
 #define CPU_MODEL_SAVER_H_
+#include <algorithm>
+#include <cassert>
+#include <cstdint>
+#include <sstream>
+#include <string>
 
 #include <stdlib.h>
 #include <fstream>
@@ -776,6 +781,20 @@ private:
 		return true;
 	}
 
+	bool Write(CLogPower *mod, BinaryWriter &writer) {
+		writer.write_int32(isLogPower);
+		writeFuncInfo(writer, mod);
+		return true;
+	}
+
+	bool RestoreLogPower(ComplexNet &net, BinaryReader &reader) {
+		L_(lDebug) <<  "RestoreLogPower";
+		std::vector<int> prev;
+		readFuncInfo(reader, prev);
+		net.add(new CLogPower(Uid(uid), InSize(out_size)), prev);
+		return true;
+	}
+
 	bool Write(CModulus2 *mod, BinaryWriter &writer) {
 		writer.write_int32(isModulus2);
 		writeFuncInfo(writer, mod);
@@ -905,6 +924,145 @@ private:
 		return true;
 	}
 
+	bool Write(TokenMeanPool *pool, BinaryWriter &writer) {
+		writer.write_int32(isTokenMeanPool);
+		writeFuncInfo(writer, pool);   // in_size / out_size define the token count
+		return true;
+	}
+
+	bool RestoreTokenMeanPool(ComplexNet &net, BinaryReader &reader) {
+		L_(lDebug) << "RestoreTokenMeanPool";
+		std::vector<int> prev;
+		readFuncInfo(reader, prev);
+		net.add(new TokenMeanPool(Uid(uid), InSize(in_size), OutSize(out_size)), prev);
+		return true;
+	}
+
+	bool Write(TokenMaxPool *pool, BinaryWriter &writer) {
+		writer.write_int32(isTokenMaxPool);
+		writeFuncInfo(writer, pool);   // in_size / out_size define the token count
+		return true;
+	}
+
+	bool RestoreTokenMaxPool(ComplexNet &net, BinaryReader &reader) {
+		L_(lDebug) << "RestoreTokenMaxPool";
+		std::vector<int> prev;
+		readFuncInfo(reader, prev);
+		net.add(new TokenMaxPool(Uid(uid), InSize(in_size), OutSize(out_size)), prev);
+		return true;
+	}
+
+	bool Write(MelPower *mel, BinaryWriter &writer) {
+		writer.write_int32(isMelPower);
+		writeFuncInfo(writer, mel);
+		writer.write_int32(mel->window());   // in_size = N W, out_size = N M
+		writer.write_int32(mel->linear() ? -mel->bands() : mel->bands());   // negative: identity filters (one-sided log power)
+		writer.write_float(mel->sampleRate());
+		writer.write_float(mel->fmin());
+		writer.write_float(mel->fmax());
+		writer.write_float(mel->mean());     // standardisation constants travel with the model
+		writer.write_float(mel->scale());
+		return true;
+	}
+
+	bool RestoreMelPower(ComplexNet &net, BinaryReader &reader) {
+		L_(lDebug) << "RestoreMelPower";
+		std::vector<int> prev;
+		readFuncInfo(reader, prev);
+		int32_t W = 0, M = 0;
+		float fs = 0, fmin = 0, fmax = 0, mean = 0, scale = 1;
+		if (!reader.read_int32(&W) || !reader.read_int32(&M) || !reader.read_float(&fs) || !reader.read_float(&fmin)
+				|| !reader.read_float(&fmax) || !reader.read_float(&mean) || !reader.read_float(&scale)) return false;
+		bool linear = false;
+		if (M < 0) { M = -M; linear = true; }
+		if (W <= 0 || M <= 0 || in_size % W != 0 || out_size != (in_size / W) * M) return false;
+		MelPower *mel = new MelPower(Uid(uid), in_size / W, W, M, fs, fmin, fmax, linear);
+		mel->setStandardize(mean, scale);
+		net.add(mel, prev);
+		return true;
+	}
+
+	bool Write(TimeFreqConv *c, BinaryWriter &writer) {
+		writer.write_int32(isTimeFreqConv);
+		writeFuncInfo(writer, c);
+		writer.write_int32(c->n_tokens_);
+		writer.write_int32(c->bins_);
+		writer.write_int32(c->c_in_);
+		writer.write_int32(c->c_out_);
+		writer.write_int32(c->t_taps_);
+		writer.write_int32(c->f_taps_);
+		writer.write_int32(c->stride_);
+		return true;
+	}
+
+	bool RestoreTimeFreqConv(ComplexNet &net, BinaryReader &reader) {
+		L_(lDebug) << "RestoreTimeFreqConv";
+		std::vector<int> prev;
+		readFuncInfo(reader, prev);
+		int32_t n = 0, b = 0, ci = 0, co = 0, t = 0, f = 0, s = 0;
+		if (!reader.read_int32(&n) || !reader.read_int32(&b) || !reader.read_int32(&ci) || !reader.read_int32(&co)
+				|| !reader.read_int32(&t) || !reader.read_int32(&f) || !reader.read_int32(&s)) return false;
+		if (n <= 0 || b <= 0 || ci <= 0 || co <= 0 || t <= 0 || f <= 0 || s <= 0) return false;
+		TimeFreqConv *c = new TimeFreqConv(Uid(uid), n, b, ci, co, t, f, s);
+		if (c->input().length_ != in_size || c->outSize() != out_size) { delete c; return false; }
+		net.add(c, prev);
+		return true;
+	}
+
+	bool Write(Interleave *il, BinaryWriter &writer) {
+		writer.write_int32(isInterleave);
+		writeFuncInfo(writer, il);
+		writer.write_int32(il->length_);
+		writer.write_int32(il->k_);
+		return true;
+	}
+
+	bool RestoreInterleave(ComplexNet &net, BinaryReader &reader) {
+		L_(lDebug) << "RestoreInterleave";
+		std::vector<int> prev;
+		readFuncInfo(reader, prev);
+		int32_t L = 0, K = 0;
+		if (!reader.read_int32(&L) || !reader.read_int32(&K)) return false;
+		if (L <= 0 || K <= 0 || L * K != in_size || in_size != out_size) return false;
+		net.add(new Interleave(Uid(uid), L, K), prev);
+		return true;
+	}
+
+	bool Write(Slice *s, BinaryWriter &writer) {
+		writer.write_int32(isSlice);
+		writeFuncInfo(writer, s);
+		writer.write_int32(s->start());   // in_size / out_size and the start define the layer
+		return true;
+	}
+
+	bool RestoreSlice(ComplexNet &net, BinaryReader &reader) {
+		L_(lDebug) << "RestoreSlice";
+		std::vector<int> prev;
+		readFuncInfo(reader, prev);
+		int32_t start = 0;
+		if (!reader.read_int32(&start)) return false;
+		net.add(new Slice(Uid(uid), InSize(in_size), OutSize(out_size), start), prev);
+		return true;
+	}
+
+	bool Write(CompressedL2 *cl, BinaryWriter &writer) {
+		writer.write_int32(isCompressedL2);
+		writeFuncInfo(writer, cl);
+		writer.write_float(cl->c());
+		writer.write_float(cl->beta());
+		return true;
+	}
+
+	bool RestoreCompressedL2(ComplexNet &net, BinaryReader &reader) {
+		L_(lDebug) << "RestoreCompressedL2";
+		std::vector<int> prev;
+		readFuncInfo(reader, prev);
+		float c = 0.3f, beta = 0.5f;
+		if (!reader.read_float(&c) || !reader.read_float(&beta)) return false;
+		net.add(new CompressedL2(Uid(uid), InSize(in_size), c, beta), prev);
+		return true;
+	}
+
 	bool Write(MeanPool *pool, BinaryWriter &writer) {
 		writer.write_int32(isMeanPool);
 		writeFuncInfo(writer, pool);   // in_size / out_size carry the pool factor
@@ -1030,7 +1188,7 @@ private:
 	bool Write(BornAttention *ba, BinaryWriter &writer) {
 		writer.write_int32(isBornAttention);
 		writeFuncInfo(writer, ba);
-		writer.write_int32(ba->nTokens());
+		writer.write_int32(ba->causal() ? ba->nTokens() : -ba->nTokens());   // negative tokens: full (non-causal) attention
 		if (ba->heads() == 1 && ba->eps() == 0.f && !ba->decay()) {
 			writer.write_int32(ba->dim());
 		} else {
@@ -1050,6 +1208,8 @@ private:
 		int n_tokens = 0, dim = 0, heads = 1;
 		float eps = 0.f;
 		assert(reader.read_int32(&n_tokens));
+		bool causal = true;
+		if (n_tokens < 0) { n_tokens = -n_tokens; causal = false; }   // negative tokens: full attention (files since 21 Nov 2026)
 		assert(reader.read_int32(&dim));
 		bool decay = false;
 		if (dim < 0) {
@@ -1058,7 +1218,7 @@ private:
 			if (heads < 0) { heads = -heads; decay = true; }
 			assert(reader.read_float(&eps, 1));
 		}
-		auto *ba = new BornAttention(Uid(uid), n_tokens, dim, true, eps, heads);
+		auto *ba = new BornAttention(Uid(uid), n_tokens, dim, causal, eps, heads);
 		ba->setDecay(decay);
 		net.add(ba, prev);
 		return true;

@@ -98,7 +98,7 @@ FW_OBJS = $(addprefix $(OBJ_DIR)/, $(notdir $(FW_SRCS:.cpp=.o)))
 # --- Build Rules ---
 
 # Phony targets are not actual files. 'all' is the default goal.
-.PHONY: all clean run info app dp_shakespeare generate gollm radioml mnist_hadamard bench_mixer bench_clone bench_bornattn test_conjlag_fd test_hadamardconv_fd test_hadamardconv_gpu test_bornattn_mh test_gla test_chirp_fd test_chirp_gpu chime_detect
+.PHONY: all clean run info app dp_shakespeare generate gollm radioml mnist_hadamard bench_mixer bench_clone bench_bornattn test_conjlag_fd test_hadamardconv_fd test_hadamardconv_gpu test_bornattn_mh test_gla test_chirp_fd test_chirp_gpu chime_detect kws test_logpower test_tokenpool test_tokenmaxpool test_melpower test_tfconv test_interleave test_slice kws_stream se_stream test_crossent_eps test_compressed_l2 se kws_infer se_infer test_born_carry
 .DEFAULT_GOAL := all
 
 # Standalone multi-GPU data-parallel tiny-shakespeare example (its own main).
@@ -139,6 +139,13 @@ radioml: $(FW_OBJS)
 	@echo "==> Built $(TARGET_DIR)/radioml"
 
 # Dispersed-burst detection in raw CHIME voltages with ChirpFilter + BoxcarMax (examples/chime_detect.cpp). No NCCL.
+# Keyword spotting on Speech Commands v2 (examples/kws.cpp): Born-attention classifier on an STFT front end.
+kws: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/kws.cpp -o $(OBJ_DIR)/kws.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/kws.o $(LDFLAGS) -o $(TARGET_DIR)/kws
+	@echo "==> Built $(TARGET_DIR)/kws"
+
 chime_detect: $(FW_OBJS)
 	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
 	$(CXX) $(CXXFLAGS) -c examples/chime_detect.cpp -o $(OBJ_DIR)/chime_detect.o
@@ -200,6 +207,111 @@ test_chirp_gpu: $(FW_OBJS)
 	$(CXX) $(CXXFLAGS) -c examples/test_chirp_gpu.cpp -o $(OBJ_DIR)/test_chirp_gpu.o
 	$(CXX) $(FW_OBJS) $(OBJ_DIR)/test_chirp_gpu.o $(LDFLAGS) -o $(TARGET_DIR)/test_chirp_gpu
 	@echo "==> Built $(TARGET_DIR)/test_chirp_gpu"
+
+# TokenMeanPool checks: CPU finite differences, save/restore, and GPU-vs-CPU parity on a CUDA build.
+test_tokenpool: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/test_tokenpool.cpp -o $(OBJ_DIR)/test_tokenpool.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/test_tokenpool.o $(LDFLAGS) -o $(TARGET_DIR)/test_tokenpool
+	@echo "==> Built $(TARGET_DIR)/test_tokenpool"
+
+test_tokenmaxpool: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/test_tokenmaxpool.cpp -o $(OBJ_DIR)/test_tokenmaxpool.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/test_tokenmaxpool.o $(LDFLAGS) -o $(TARGET_DIR)/test_tokenmaxpool
+	@echo "==> Built $(TARGET_DIR)/test_tokenmaxpool"
+
+kws_stream: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/kws_stream.cpp -o $(OBJ_DIR)/kws_stream.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/kws_stream.o $(LDFLAGS) -o $(TARGET_DIR)/kws_stream
+	@echo "==> Built $(TARGET_DIR)/kws_stream"
+
+se_stream: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/se_stream.cpp -o $(OBJ_DIR)/se_stream.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/se_stream.o $(LDFLAGS) -o $(TARGET_DIR)/se_stream
+	@echo "==> Built $(TARGET_DIR)/se_stream"
+
+test_melpower: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/test_melpower.cpp -o $(OBJ_DIR)/test_melpower.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/test_melpower.o $(LDFLAGS) -o $(TARGET_DIR)/test_melpower
+	@echo "==> Built $(TARGET_DIR)/test_melpower"
+
+test_tfconv: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/test_tfconv.cpp -o $(OBJ_DIR)/test_tfconv.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/test_tfconv.o $(LDFLAGS) -o $(TARGET_DIR)/test_tfconv
+	@echo "==> Built $(TARGET_DIR)/test_tfconv"
+
+test_interleave: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/test_interleave.cpp -o $(OBJ_DIR)/test_interleave.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/test_interleave.o $(LDFLAGS) -o $(TARGET_DIR)/test_interleave
+	@echo "==> Built $(TARGET_DIR)/test_interleave"
+
+se_infer: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/se_infer.cpp -o $(OBJ_DIR)/se_infer.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/se_infer.o $(LDFLAGS) -o $(TARGET_DIR)/se_infer
+	@echo "==> Built $(TARGET_DIR)/se_infer"
+
+kws_infer: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/kws_infer.cpp -o $(OBJ_DIR)/kws_infer.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/kws_infer.o $(LDFLAGS) -o $(TARGET_DIR)/kws_infer
+	@echo "==> Built $(TARGET_DIR)/kws_infer"
+
+se: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/se.cpp -o $(OBJ_DIR)/se.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/se.o $(LDFLAGS) -o $(TARGET_DIR)/se
+	@echo "==> Built $(TARGET_DIR)/se"
+
+test_crossent_eps: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/test_crossent_eps.cpp -o $(OBJ_DIR)/test_crossent_eps.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/test_crossent_eps.o $(LDFLAGS) -o $(TARGET_DIR)/test_crossent_eps
+	@echo "==> Built $(TARGET_DIR)/test_crossent_eps"
+
+test_compressed_l2: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/test_compressed_l2.cpp -o $(OBJ_DIR)/test_compressed_l2.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/test_compressed_l2.o $(LDFLAGS) -o $(TARGET_DIR)/test_compressed_l2
+	@echo "==> Built $(TARGET_DIR)/test_compressed_l2"
+
+test_segfourier_conv: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/test_segfourier_conv.cpp -o $(OBJ_DIR)/test_segfourier_conv.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/test_segfourier_conv.o $(LDFLAGS) -o $(TARGET_DIR)/test_segfourier_conv
+	@echo "==> Built $(TARGET_DIR)/test_segfourier_conv"
+
+test_tokenwise_wide: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/test_tokenwise_wide.cpp -o $(OBJ_DIR)/test_tokenwise_wide.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/test_tokenwise_wide.o $(LDFLAGS) -o $(TARGET_DIR)/test_tokenwise_wide
+	@echo "==> Built $(TARGET_DIR)/test_tokenwise_wide"
+
+test_slice: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/test_slice.cpp -o $(OBJ_DIR)/test_slice.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/test_slice.o $(LDFLAGS) -o $(TARGET_DIR)/test_slice
+	@echo "==> Built $(TARGET_DIR)/test_slice"
+
+# Carried Born-attention state across consecutive GPU forwards (setCarry / resetCarry(slot), linear mode); GPU only.
+test_born_carry: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/test_born_carry.cpp -o $(OBJ_DIR)/test_born_carry.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/test_born_carry.o $(LDFLAGS) -o $(TARGET_DIR)/test_born_carry
+	@echo "==> Built $(TARGET_DIR)/test_born_carry"
+
+# CLogPower checks: CPU finite differences, save/restore, and GPU-vs-CPU parity on a CUDA build.
+test_logpower: $(FW_OBJS)
+	@mkdir -p $(TARGET_DIR) $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c examples/test_logpower.cpp -o $(OBJ_DIR)/test_logpower.o
+	$(CXX) $(FW_OBJS) $(OBJ_DIR)/test_logpower.o $(LDFLAGS) -o $(TARGET_DIR)/test_logpower
+	@echo "==> Built $(TARGET_DIR)/test_logpower"
 
 # Standalone CPU finite-difference gradient check for HadamardConv (no NCCL).
 test_hadamardconv_fd: $(FW_OBJS)

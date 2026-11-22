@@ -1,5 +1,8 @@
 #ifndef IMPL_CINPUT_H_
 #define IMPL_CINPUT_H_
+#include <cassert>
+#include <complex>
+#include <string>
 
 #include <algorithm>
 #include <omp.h>

@@ -1,5 +1,7 @@
 #ifndef IMPL_BATCH_H_
 #define IMPL_BATCH_H_
+#include <algorithm>
+#include <cassert>
 
 #include <assert.h>
 #include <complex>

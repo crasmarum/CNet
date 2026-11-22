@@ -1,5 +1,9 @@
 #ifndef IMPL_FT_H_
 #define IMPL_FT_H_
+#include <algorithm>
+#include <cassert>
+#include <complex>
+#include <string>
 
 #include <cfloat>
 #include <cmath>

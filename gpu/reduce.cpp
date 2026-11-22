@@ -1,3 +1,9 @@
+#include <cassert>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <iostream>
+#include <vector>
 #include <cstdlib>
 #include "reduce.h"
 #include "allocator.h"
@@ -1054,6 +1060,19 @@ void BornAttentionGpu::resetCarry() {
 #endif
 }
 
+// The state is laid out per (clone, head): M [bh][2][d2][dh], Z [bh][d2] with bh = clone*H + h (see
+// ensure_linear_scratch and the state GEMMs of gpu_born_linear_forward), so slot `slot` owns H*2*d2*dh floats of
+// carry_M_ and H*d2 floats of carry_Z_. Before the first forward nothing is allocated and the state is zero anyway.
+void BornAttentionGpu::resetCarry(int slot) {
+#ifdef __CUDACC__
+	if (carry_M_ && slot >= 0 && slot < lin_B_) {
+		const size_t perM = (size_t) lin_H_ * 2 * lin_d2_ * lin_dh_, perZ = (size_t) lin_H_ * lin_d2_;
+		gpuErrchk(cudaMemset(carry_M_ + (size_t) slot * perM, 0, sizeof(float) * perM));
+		gpuErrchk(cudaMemset(carry_Z_ + (size_t) slot * perZ, 0, sizeof(float) * perZ));
+	}
+#endif
+}
+
 
 // ---------------- linear form: backward ----------------
 //
@@ -1739,7 +1758,7 @@ void SoftMaxGpu::gpu_soft_max_forward(int block_size) {
 
 
 __global__ void cross_ent_end__(int no_mappings, cmplx_ *tmp_in, GpuInVar *in, GpuOutVar *out,
-		int* labels, int in_stride, int max_len) {
+		int* labels, int in_stride, int max_len, float eps) {
 
 	int thread_indx = blockIdx.x * blockDim.x + threadIdx.x;
 	if (thread_indx >= max_len) {
@@ -1760,9 +1779,13 @@ __global__ void cross_ent_end__(int no_mappings, cmplx_ *tmp_in, GpuInVar *in, G
 			int label = labels[map_indx];
 			float ret = pow(in[map_indx].input_ptr_[label], 2)
 					   + pow(in[map_indx].input_ptr_[in[map_indx].input_length_ + label], 2);
-			sum.real = (sum.real < 1e-15 ? 1e-15 : sum.real);
-			ret = ret / sum.real;
-			ret = (ret < 1e-15 ? 1e-15 : ret);
+			if (eps > 0.f) {                                   // smoothed Born rule: finite at z == 0, identical on the CPU
+				ret = (ret + eps) / (sum.real + in[map_indx].input_length_ * eps);
+			} else {
+				sum.real = (sum.real < 1e-15 ? 1e-15 : sum.real);
+				ret = ret / sum.real;
+				ret = (ret < 1e-15 ? 1e-15 : ret);
+			}
 			out[map_indx].reduce_imag_ = -std::log(ret);
 
 //			printf("ce %d %d %d %f %f\n", thread_indx, map_indx, label, out[map_indx].reduce_imag_, out[map_indx].reduce_real_);
@@ -1795,7 +1818,8 @@ void CrossEntropyGpu::gpu_cross_ent_forward(int block_size) {
 //			  << block_size << " no_threads: " << no_threads << std::endl;
 
 	cross_ent_end__ CUDA( grid, block_size, block_size * sizeof(cmplx_) )
-		(getNoMappings(), gpu_buffer, gpu_in_ptr_, gpu_out_ptr_, gpu_labels_, in_stride, no_threads);
+		(getNoMappings(), gpu_buffer, gpu_in_ptr_, gpu_out_ptr_, gpu_labels_, in_stride, no_threads,
+		 ((CrossEntropy*) getCpuFun().front())->eps());
 
 	CNET_KSYNC();
 }
@@ -2064,7 +2088,7 @@ void TokenwiseLinearGpu::gpu_tokenwise_forward() {
 
 
 __global__ void gpu_cross_ent_backward__(GpuInVar *in, GpuOutVar *out, int map_length, int label,
-		int *labels, int max_len) {
+		int *labels, int max_len, float eps) {
 	int thread_indx = blockIdx.x * blockDim.x + threadIdx.x;
 	if (thread_indx >= max_len) {
 		return;
@@ -2075,12 +2099,28 @@ __global__ void gpu_cross_ent_backward__(GpuInVar *in, GpuOutVar *out, int map_l
 	float square_norm_ = out[map_indx].reduce_real_;
 
 	float square_mod = (Z_(in[map_indx], pos) * conj_(Z_(in[map_indx], pos))).real;
-	square_mod = (square_mod < 1e-15 ? 1e-15 : square_mod);
 
 	float grad_real = 0;
 	float grad_imag = 0;
 
 	label = labels ? labels[map_indx] : label;
+
+	if (eps > 0.f) {                                           // smoothed Born rule: dL/dz~ = z/(S + C eps) - [label] z/(|z|^2 + eps)
+		const float denom = square_norm_ + map_length * eps;
+		grad_real = *Z_real_(in[map_indx], pos) / denom;
+		grad_imag = *Z_imag_(in[map_indx], pos) / denom;
+		if (label == pos) {
+			grad_real -= *Z_real_(in[map_indx], pos) / (square_mod + eps);
+			grad_imag -= *Z_imag_(in[map_indx], pos) / (square_mod + eps);
+		}
+		atomicAdd(dZ_star_real_(in[map_indx], pos), grad_real);
+		atomicAdd(dZ_star_imag_(in[map_indx], pos), grad_imag);
+		atomicAdd(dZ_real_(in[map_indx], pos), grad_real);
+		atomicAdd(dZ_imag_(in[map_indx], pos), -grad_imag);
+		return;
+	}
+	square_norm_ = (square_norm_ < 1e-15 ? 1e-15 : square_norm_);   // as the CPU forward: no 0/0 when every logit is 0
+	square_mod = (square_mod < 1e-15 ? 1e-15 : square_mod);
 
 	if (label == pos) {
 		grad_real = - *Z_real_(in[map_indx], pos) * (square_norm_ - square_mod) / (square_mod * square_norm_);
@@ -2105,7 +2145,7 @@ void CrossEntropyGpu::gpu_cross_ent_backward(int label) {
 //			  << " segment len: " << length() << " no_mappings: " << getNoMappings() << "\n";
 
 	gpu_cross_ent_backward__ CUDA2( grid, MAX_BLOCK_SIZE )
-			(gpu_in_ptr_, gpu_out_ptr_, length(), label, gpu_labels_, no_threads);
+			(gpu_in_ptr_, gpu_out_ptr_, length(), label, gpu_labels_, no_threads, ((CrossEntropy*) getCpuFun().front())->eps());
 
 	CNET_KSYNC();
 }

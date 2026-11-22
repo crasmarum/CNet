@@ -1,5 +1,7 @@
 #ifndef IMPL_SEGFOURIER_H_
 #define IMPL_SEGFOURIER_H_
+#include <cmath>
+#include <string>
 
 #include <complex>
 #include "cfunc.h"
@@ -15,7 +17,7 @@
 // stream, F=window frequency bins).
 //
 // Output index b*w+p (window b, frequency p):
-//   y_{b,p} = (1/sqrt(w)) sum_{q=0}^{w-1} x_{b,q} * root(p*q),  root(k)=e^{i2pi k/w}
+//   y_{b,p} = (1/sqrt(w)) sum_{q=0}^{w-1} x_{b,q} * root(p*q),  root(k)=e^{-i2pi k/w} (UnityRoots in utils.h)
 // This is a holomorphic linear map y = M x (block-diagonal), so the Wirtinger
 // backward mirrors FourierTrans, per window: dL/dx += sum_p dz_p * root(p*q),
 // dL/dx~ += sum_p dz~_p * conj(root(p*q)), scaled by 1/sqrt(w).

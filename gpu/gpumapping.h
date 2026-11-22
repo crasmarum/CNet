@@ -1,5 +1,6 @@
 #ifndef GPU_GPUMAPPING_H_
 #define GPU_GPUMAPPING_H_
+#include <cassert>
 
 #include <vector>
 #include <map>

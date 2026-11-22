@@ -1,6 +1,10 @@
 #ifndef IMPL_CNET_H_
 #define IMPL_CNET_H_
+#include <cassert>
+#include <cstdint>
+#include <iostream>
 
+#include <climits>
 #include <vector>
 #include <map>
 #include <string>
@@ -28,6 +32,11 @@
 #include "softmax.h"
 #include "pad.h"
 #include "pool.h"
+#include "slice.h"
+#include "compressed_l2.h"
+#include "melpower.h"
+#include "tfconv.h"
+#include "interleave.h"
 #include "tokenwise.h"
 #include "seqcrossent.h"
 #include "bornattn.h"
@@ -70,6 +79,14 @@ const int isHadamardConv = 26;
 const int isGLA = 27;
 const int isChirpFilter = 28;
 const int isBoxcarMax = 29;
+const int isLogPower = 30;
+const int isTokenMeanPool = 31;
+const int isSlice = 32;
+const int isCompressedL2 = 33;
+const int isTokenMaxPool = 34;
+const int isMelPower = 35;
+const int isTimeFreqConv = 36;
+const int isInterleave = 37;
 
 const int isUnknown = INT_MAX;
 
@@ -91,6 +108,13 @@ const int isUnknown = INT_MAX;
 	X(TriangFourier,       isTrianFourier,   RestoreTriangFourier) \
 	X(Pad,                 isPad,            RestorePad)          \
 	X(MeanPool,            isMeanPool,       RestoreMeanPool)     \
+	X(TokenMeanPool,       isTokenMeanPool,  RestoreTokenMeanPool) \
+	X(TokenMaxPool,        isTokenMaxPool,   RestoreTokenMaxPool) \
+	X(MelPower,            isMelPower,       RestoreMelPower)     \
+	X(TimeFreqConv,        isTimeFreqConv,   RestoreTimeFreqConv) \
+	X(Interleave,          isInterleave,     RestoreInterleave)   \
+	X(Slice,               isSlice,          RestoreSlice)        \
+	X(CompressedL2,        isCompressedL2,   RestoreCompressedL2) \
 	X(Residual,            isResidual,       RestoreResidual)     \
 	X(CrossEntropy,        isCrossEntropy,   RestoreCrossEntropy) \
 	X(L2Out,               isL2Out,          RestoreL2Out)        \
@@ -98,6 +122,7 @@ const int isUnknown = INT_MAX;
 	X(CRelu,               isCrelu,          RestoreRelu)         \
 	X(CGelu,               isGelu,           RestoreGelu)         \
 	X(CModulus2,           isModulus2,       RestoreModulus2)     \
+	X(CLogPower,           isLogPower,       RestoreLogPower)     \
 	X(CPower,              isPower,          RestorePower)         \
 	X(SequenceCrossEntropy, isSeqCrossEntropy, RestoreSequenceCrossEntropy) \
 	X(BornAttention,       isBornAttention,  RestoreBornAttention)       \

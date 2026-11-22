@@ -1,5 +1,6 @@
 #ifndef GPU_BASE64_H_
 #define GPU_BASE64_H_
+#include <cstdint>
 
 #include <string>
 

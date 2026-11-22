@@ -1,5 +1,9 @@
 #ifndef IMPL_SEQCROSSENT_H_
 #define IMPL_SEQCROSSENT_H_
+#include <cassert>
+#include <cmath>
+#include <complex>
+#include <string>
 
 #include <cfloat>
 #include <vector>

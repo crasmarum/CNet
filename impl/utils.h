@@ -1,5 +1,8 @@
 #ifndef IMPL_UTILS_H_
 #define IMPL_UTILS_H_
+#include <cassert>
+#include <cstdlib>
+#include <vector>
 
 #include <algorithm>
 #include <complex>

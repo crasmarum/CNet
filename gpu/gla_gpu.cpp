@@ -7,6 +7,9 @@
 //   S <- exp(LC) S + sum_j exp(LC - L_j) conj(K_j) V_j^T
 // Backward sweeps chunks in reverse with the suffix state G = sum_{k later} (decay) q_k g_k^T and
 // Gb the same with conj(q_k) gb_k; see the derivation in impl/gla.h and the comments below.
+#include <cmath>
+#include <cstdint>
+#include <string>
 #include <cstdlib>
 #include <cstdio>
 #include <vector>
@@ -480,6 +483,16 @@ void GatedLinearAttentionGpu::resetCarry() {
 	if (carry_S_) {
 		const size_t state = (size_t) gl_B_ * gl_H_ * 2 * gl_dh_ * gl_dh_;
 		gpuErrchk(cudaMemset(carry_S_, 0, sizeof(float) * state));
+	}
+#endif
+}
+
+// The state planes are [bh][2][dh][dh] with bh = clone*H + h (stateP above), so slot `slot` owns H*2*dh*dh floats.
+void GatedLinearAttentionGpu::resetCarry(int slot) {
+#ifdef __CUDACC__
+	if (carry_S_ && slot >= 0 && slot < gl_B_) {
+		const size_t per = (size_t) gl_H_ * 2 * gl_dh_ * gl_dh_;
+		gpuErrchk(cudaMemset(carry_S_ + (size_t) slot * per, 0, sizeof(float) * per));
 	}
 #endif
 }

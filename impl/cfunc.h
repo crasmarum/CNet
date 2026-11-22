@@ -5,6 +5,11 @@
 #include "vars.h"
 #include "../gpu/gpuvars.h"
 #include "../utils/myrand.h"
+#include <cassert>
+#include <cmath>
+#include <complex>
+#include <cstdint>
+#include <string>
 
 #include <vector>
 #include <iostream>
