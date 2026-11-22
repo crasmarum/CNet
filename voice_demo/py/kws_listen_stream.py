@@ -29,7 +29,7 @@ def main():
     ap.add_argument('--min-prob', type=float, default=0.65)
     ap.add_argument('--high-prob', type=float, default=0.95, help='a word at or above this posterior is printed in CAPITALS')
     ap.add_argument('--smooth', type=int, default=5, help='hops averaged before a decision (5 = 50 ms)')
-    ap.add_argument('--cooldown-ms', type=int, default=800)
+    ap.add_argument('--cooldown-ms', type=int, default=1000, help='hold after a detection (1000 ms = the paper setting and the kws_stream default)')
     ap.add_argument('--print-every', type=int, default=0, help='also print the running arg-max every N hops')
     ap.add_argument('--extra', default='', help='extra kws_stream flags, e.g. "-input_gain 50 -stft_hop 160"')
     ap.add_argument('--device', default=None, help='sounddevice input device (name or index)')

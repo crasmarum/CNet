@@ -2,7 +2,7 @@
 
 A self-contained demo of two small speech models built with Born attention in CNet and run as constant-state
 streams: a command spotter (35 words, 123k complex parameters) and a noise remover (721k parameters). The
-three-page deck in `presentation/voice_demo.pdf` says the same as this page for a non-technical reader.
+four-page deck in `presentation/voice_demo.pdf` says the same as this page for a non-technical reader.
 
 ## 1. The technology in one page
 
@@ -42,7 +42,8 @@ numbers built in), then rebuilt as streams and run on a plain CPU.
   2.5 points of the best published results, which train four to five times longer or start from large pretrained
   models. A separate rejection-trained model, r21 (17 classes: 15 commands, unknown, silence), detected 114 of
   143 commands with six false accepts in a 15.2-minute synthetic stream at 20 dB SNR; `listen.sh` runs r28
-  filtered to seven words, `listen.sh --robot` runs r21.
+  filtered to seven words; `listen.sh --robot` runs r21 with that evaluation's decision rule (threshold 0.8,
+  five-hop smoothing, one-second hold).
 - **Noise remover**, VoiceBank-DEMAND: speech quality score (PESQ, 1 to 4.5) from 1.97 to 2.60 and a 9.3 dB
   improvement in SI-SDR (the signal-to-distortion ratio); the stream matches the offline version within 0.02 of
   the PESQ score. Those scores use a fixed input gain; `denoise.sh` streams with a causal running gain, the
@@ -88,7 +89,7 @@ The scripts work from the public CNet repository (this folder next to the Makefi
 | `models/s8_e49.mod` | the noise remover (run s8) |
 | `py/kws_listen_stream.py`, `py/kws_mic.py`, `py/se_mic.py` | microphone scripts (copies of `src/data/`) |
 | `clips/clip2_noisy.wav` | a seven-second VoiceBank-DEMAND test recording (CC BY 4.0), see `clips/README.md` |
-| `presentation/voice_demo.tex`, `voice_demo.pdf` | the three-page deck |
+| `presentation/voice_demo.tex`, `voice_demo.pdf` | the four-page deck (the picture below is its first page) |
 | `presentation/streaming_overview.svg`, `.png`, `.pdf` | the one-picture explanation of the stream (above) |
 
 The programs are `examples/kws_stream.cpp`, `examples/se_stream.cpp` (the streaming twins), `examples/kws_infer.cpp`

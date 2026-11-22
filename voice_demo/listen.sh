@@ -5,7 +5,8 @@
 #   ./listen.sh                    r28, the 35-word benchmark model (95.1% clip accuracy), listening for the
 #                                  robot's seven commands: stop, go, left, right, forward, backward, follow
 #   ./listen.sh --robot            r21, the 17-class model trained with unknown and silence classes: the one
-#                                  behind the continuous-audio numbers (80% recall, 6 false accepts in 15 min)
+#                                  behind the continuous-audio numbers (80% recall, 6 false accepts in 15 min),
+#                                  at that evaluation's decision rule: threshold 0.8, 5-hop smoothing, 1 s hold
 #   ./listen.sh --all              r28 on any of its 35 words
 #   ./listen.sh --ptt              push-to-talk: press Enter, say a word, see r28's top guesses (clip classifier)
 #   ./listen.sh --words yes,no     your own subset; other kws_listen_stream.py options pass through
@@ -30,4 +31,4 @@ if [ -n "$WORDS" ]; then
 	set -- --words "$WORDS" "$@"
 fi
 exec .venv/bin/python py/kws_listen_stream.py --bin bin/kws_stream --model $MODEL --labels $LABELS \
-	--min-prob 0.8 --high-prob 0.8 --print-every 50 "$@"
+	--min-prob 0.8 --high-prob 0.8 --cooldown-ms 1000 --print-every 50 "$@"

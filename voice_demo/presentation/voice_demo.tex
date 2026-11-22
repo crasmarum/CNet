@@ -1,10 +1,10 @@
-% Three pages for a non-technical reader: what the streaming voice technology is, what it achieved in two days,
-% and how to run the demo from GitHub. Build: latexmk -pdf voice_demo.tex
+% Four pages for a non-technical reader: the stream in one picture, what the technology is, what it achieved in
+% two days, and how to run the demo from GitHub. Build: latexmk -pdf voice_demo.tex
 \documentclass[aspectratio=169,10pt]{beamer}
 \usetheme{default}
 \usecolortheme{seagull}
 \setbeamertemplate{navigation symbols}{}
-\setbeamertemplate{footline}{\hspace*{1.2em}\tiny Phasefield \textperiodcentered\ Marcel Crasmaru \textperiodcentered\ 22 November 2026 \textperiodcentered\ github.com/crasmarum/CNet \hfill \insertframenumber/3\hspace*{1.2em}\vspace*{0.5em}}
+\setbeamertemplate{footline}{\hspace*{1.2em}\tiny Phasefield \textperiodcentered\ Marcel Crasmaru \textperiodcentered\ 22 November 2026 \textperiodcentered\ github.com/crasmarum/CNet \hfill \insertframenumber/\inserttotalframenumber\hspace*{1.2em}\vspace*{0.5em}}
 \setbeamertemplate{itemize items}[circle]
 \setbeamerfont{frametitle}{size=\large,series=\bfseries}
 \setbeamercolor{frametitle}{fg=black!85}
@@ -18,7 +18,14 @@
 
 \begin{document}
 
-% ------------------------------------------------------------------ page 1
+% ------------------------------------------------------------------ page 1: the picture
+\begin{frame}[plain]
+\vspace*{2mm}
+\centering
+\includegraphics[width=0.95\paperwidth]{streaming_overview.pdf}
+\end{frame}
+
+% ------------------------------------------------------------------ page 2
 \begin{frame}{Voice AI that listens all the time, on a tiny processor}
 \small
 \begin{columns}[T]
@@ -58,7 +65,7 @@ model file & 1.4 MB & 6.8 MB \\
 \end{columns}
 \end{frame}
 
-% ------------------------------------------------------------------ page 2
+% ------------------------------------------------------------------ page 3
 \begin{frame}{Two models in two days (20--22 November 2026)}
 \small
 \begin{columns}[T]
@@ -93,7 +100,7 @@ model file & 1.4 MB & 6.8 MB \\
 \end{columns}
 \end{frame}
 
-% ------------------------------------------------------------------ page 3
+% ------------------------------------------------------------------ page 4
 \begin{frame}[fragile]{Try it yourself: ten minutes from GitHub to your microphone}
 \small
 \begin{columns}[T]
