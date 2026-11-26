@@ -92,7 +92,7 @@ model file & 1.4 MB & 6.8 MB \\
 \begin{itemize}
 \item Built for a Raspberry-Pi-class processor, measured so far on one Apple M3 Max core: no cloud, nothing leaves the device, constant cost per second.
 \item One stack from training to deployment: a 0.4 MB program plus the model file, no runtime dependencies.
-\item Reproducible: 36 documented runs, matched-pair comparisons, a 23-page technical report including the failures.
+\item Reproducible: 36 documented runs, matched-pair comparisons, a 23-page technical report including the failures: \href{https://zenodo.org/records/24557236}{\texttt{zenodo.org/records/24557236}}.
 \end{itemize}
 \medskip
 \textbf{Next.} Measure on the robot's processor; train the spotter on continuous audio; the extra loss term for the noise remover; repeat the key comparisons over several random seeds.
@@ -133,7 +133,10 @@ cd CNet/voice_demo
 \textbf{Variants.} \texttt{listen.sh --robot} (r21, the model behind the continuous-audio numbers), \texttt{--all}, \texttt{--ptt}; \texttt{denoise.sh --file your.wav}, \texttt{--offline} (the setting of the published scores).
 
 \medskip
-\textbf{In the folder.} \texttt{models/} (two spotters, one noise remover), \texttt{py/}, \texttt{clips/}, this deck; the technical report is in the repository.
+\textbf{In the folder.} \texttt{models/} (two spotters, one noise remover), \texttt{py/}, \texttt{clips/}, this deck.
+
+\medskip
+\textbf{Technical report} (23 pages, with the failures): \href{https://zenodo.org/records/24557236}{\texttt{zenodo.org/records/24557236}}
 \end{column}
 \end{columns}
 \end{frame}
